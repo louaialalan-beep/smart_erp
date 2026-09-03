@@ -101,15 +101,34 @@ if (!empty($to_date)) {
     $where[] = "j.entry_date <= ?";
     $params[] = $to_date;
 }
-if (!empty($filter_account)) {
-    $where[] = "j.account_id = ?";
-    $params[] = $filter_account;
-}
 if (!empty($search)) {
     $where[] = "(j.entry_number LIKE ? OR j.reference LIKE ? OR j.description LIKE ?)";
     $params[] = "%$search%";
     $params[] = "%$search%";
     $params[] = "%$search%";
+}
+
+// تصحيح جوهري: فلتر الحساب لم يعد يقتصر على "سطر هذا الحساب فقط" (وهو ما كان يجعل كل قيد يظهر
+// وكأنه غير متوازن/غير مكتمل زوراً، لأن سطره الآخر يُستبعَد من العرض بينما هو موجود فعلاً في القاعدة).
+// الآن: يُحدَّد أولاً أي أرقام قيود (entry_number) تخص هذا الحساب (بنفس فلاتر التاريخ/البحث)، ثم تُجلَب
+// كل أسطر تلك القيود كاملة — فتظهر البطاقة متوازنة وصحيحة، لكن القائمة تبقى مُصفَّاة لتشمل فقط القيود
+// التي تلمس هذا الحساب تحديداً.
+if (!empty($filter_account)) {
+    $where_acc = $where;
+    $params_acc = $params;
+    $where_acc[] = "j.account_id = ?";
+    $params_acc[] = $filter_account;
+    $stmt_find_en = $conn->prepare("SELECT DISTINCT j.entry_number FROM journal_entries j WHERE " . implode(" AND ", $where_acc));
+    $stmt_find_en->execute($params_acc);
+    $matching_entry_numbers = $stmt_find_en->fetchAll(PDO::FETCH_COLUMN);
+
+    if (count($matching_entry_numbers) > 0) {
+        $en_placeholders = implode(',', array_fill(0, count($matching_entry_numbers), '?'));
+        $where[] = "j.entry_number IN ({$en_placeholders})";
+        $params = array_merge($params, $matching_entry_numbers);
+    } else {
+        $where[] = "1=0";
+    }
 }
 
 // استعلام جلب القيود مع الحسابات المرتبطة وتفاصيل العملة والصرف التاريخي

@@ -57,6 +57,7 @@ $settings_raw = $conn->query("SELECT * FROM system_settings")->fetchAll(PDO::FET
 <div style="background: white; border: 1px solid #e3e6f0; border-radius: 8px; padding: 25px; max-width: 700px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
     <!-- ملاحظة هامة: تمت إضافة enctype="multipart/form-data" لتمكين رفع الملفات والصور -->
     <form method="POST" action="" enctype="multipart/form-data">
+<?php csrfField(); ?>
         <input type="hidden" name="update_settings" value="1">
 
         <div style="margin-bottom: 15px;">

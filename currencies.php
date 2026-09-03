@@ -13,12 +13,23 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_currency'])) {
 
     if (!empty($code) && !empty($name)) {
         try {
-            $stmt = $conn->prepare("INSERT INTO currencies (currency_code, currency_name, is_base, status) VALUES (?, ?, 0, 1)");
-            $stmt->execute([$code, $name]);
+            // تصحيح: الجدول الفعلي في بعض التثبيتات لا يحتوي عمود status إطلاقاً (يحتوي بدلاً منه
+            // exchange_rate وupdated_at من نسخة أقدم من التصميم)، فكان أي إدراج يفشل بخطأ "عمود غير
+            // موجود" ويظهر برسالة مضلِّلة "العملة موجودة مسبقاً". الآن نتحقق من الأعمدة الفعلية ديناميكياً.
+            $cur_cols = $conn->query("SHOW COLUMNS FROM currencies")->fetchAll(PDO::FETCH_COLUMN);
+            $cols_to_insert = ['currency_code', 'currency_name', 'is_base'];
+            $vals = [$code, $name, 0];
+            if (in_array('status', $cur_cols)) { $cols_to_insert[] = 'status'; $vals[] = 1; }
+            if (in_array('exchange_rate', $cur_cols)) { $cols_to_insert[] = 'exchange_rate'; $vals[] = 1; }
+
+            $placeholders = implode(',', array_fill(0, count($cols_to_insert), '?'));
+            $col_names = implode(',', $cols_to_insert);
+            $stmt = $conn->prepare("INSERT INTO currencies ({$col_names}) VALUES ({$placeholders})");
+            $stmt->execute($vals);
             logAudit($conn, 'INSERT', 'إدارة العملات', "إضافة عملة جديدة: $code - $name");
             $msg = "تم إضافة العملة ($code) بنجاح.";
         } catch (Exception $e) {
-            $error = "خطأ: العملة موجودة مسبقاً أو حدث مشكلة في الإضافة.";
+            $error = "خطأ أثناء إضافة العملة: " . $e->getMessage();
         }
     } else {
         $error = "الرجاء إدخال رمز ورسم العملة بشكل صحيح.";
@@ -83,6 +94,25 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['set_base']) && !empty(
         } catch (Exception $e) {
             $conn->rollBack();
             $error = "فشل تحديث العملة الأساسية.";
+        }
+    }
+}
+
+// 4. حذف عملة مُضافة بالخطأ (مثل كتابة رمز خاطئ SYR بدل SYP) — لم تكن هذه الميزة موجودة إطلاقاً
+// سابقاً، فلا توجد وسيلة لتصحيح رمز عملة أُدخل خطأً سوى حذفه وإعادة إضافته بالرمز الصحيح.
+// محمية: لا يمكن حذف العملة الأساسية الحالية (SYP) حتى لا يبقى النظام بلا عملة أساسية إطلاقاً.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_currency'])) {
+    $del_code = trim($_POST['delete_currency']);
+    if ($del_code === 'SYP') {
+        $error = "لا يمكن حذف العملة الأساسية للنظام (SYP).";
+    } else {
+        try {
+            $conn->prepare("DELETE FROM currencies WHERE currency_code = ? AND is_base = 0")->execute([$del_code]);
+            $conn->prepare("DELETE FROM exchange_rates WHERE currency_code = ?")->execute([$del_code]);
+            logAudit($conn, 'DELETE', 'إدارة العملات', "حذف العملة: $del_code");
+            $msg = "تم حذف العملة ($del_code) وسجل أسعار صرفها بنجاح.";
+        } catch (Exception $e) {
+            $error = "خطأ أثناء حذف العملة: " . $e->getMessage();
         }
     }
 }
@@ -215,10 +245,27 @@ $exchange_rates_history = $rates_stmt->fetchAll(PDO::FETCH_ASSOC);
                             <?php endif; ?>
                         </td>
                         <td style="padding: 10px; text-align: left;">
-                            <?php if ($cur['is_base'] == 0 && $cur['currency_code'] !== 'SYP'): ?>
+                            <?php if ($cur['is_base'] == 0 && $cur['currency_code'] === 'SYP'): ?>
+                                <form method="POST" style="display:inline;">
+<?php csrfField(); ?>
+                                    <input type="hidden" name="set_base" value="SYP">
+                                    <button type="submit" style="background:#1cc88a; color:white; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px;">
+                                        <i class="fas fa-star"></i> تعيين كأساسية
+                                    </button>
+                                </form>
+                            <?php elseif ($cur['is_base'] == 0): ?>
                                 <span style="color: #aaa; font-size: 12px;" title="غير مدعوم حالياً — راجع التنبيه أعلى الصفحة">
                                     <i class="fas fa-lock"></i> تعيين كأساسية (غير متاح)
                                 </span>
+                            <?php endif; ?>
+                            <?php if ($cur['is_base'] == 0): ?>
+                                <form method="POST" style="display:inline;" onsubmit="return confirm('حذف العملة (<?php echo htmlspecialchars($cur['currency_code'], ENT_QUOTES); ?>) وكل سجل أسعار صرفها نهائياً؟');">
+<?php csrfField(); ?>
+                                    <input type="hidden" name="delete_currency" value="<?php echo htmlspecialchars($cur['currency_code']); ?>">
+                                    <button type="submit" style="background:#e74a3b; color:white; border:none; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:12px; margin-right:6px;">
+                                        <i class="fas fa-trash"></i> حذف
+                                    </button>
+                                </form>
                             <?php endif; ?>
                         </td>
                     </tr>

@@ -20,6 +20,36 @@ $products_cols_stmt = $conn->query("SHOW COLUMNS FROM products");
 $products_existing_cols = $products_cols_stmt->fetchAll(PDO::FETCH_COLUMN);
 $has_purchased_quantity_col = in_array('purchased_quantity', $products_existing_cols);
 
+// التأكد من وجود جدول التصنيفات (بنفس أسلوب الإنشاء الذاتي المعتمد في بقية صفحات النظام)
+$conn->exec("CREATE TABLE IF NOT EXISTS categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    category_name VARCHAR(150) NOT NULL
+)");
+
+// 0. إضافة تصنيف جديد — لم تكن هذه الميزة موجودة إطلاقاً سابقاً، القائمة المنسدلة كانت تعرض فقط
+// التصنيفات الموجودة أصلاً في القاعدة دون أي وسيلة لإضافة تصنيف جديد منها.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_category'])) {
+    $new_category_name = trim($_POST['category_name'] ?? '');
+    if (empty($new_category_name)) {
+        $error = "خطأ: اسم التصنيف لا يمكن أن يكون فارغاً.";
+    } else {
+        try {
+            $check_cat = $conn->prepare("SELECT id FROM categories WHERE category_name = ?");
+            $check_cat->execute([$new_category_name]);
+            if ($check_cat->rowCount() > 0) {
+                $error = "خطأ: يوجد تصنيف بنفس هذا الاسم مسبقاً.";
+            } else {
+                $conn->prepare("INSERT INTO categories (category_name) VALUES (?)")->execute([$new_category_name]);
+                $new_cat_id = $conn->lastInsertId();
+                logAudit($conn, 'INSERT', 'التصنيفات', "إضافة تصنيف جديد: $new_category_name", $new_cat_id);
+                $msg = "تمت إضافة التصنيف \"$new_category_name\" بنجاح.";
+            }
+        } catch (PDOException $e) {
+            $error = "خطأ في قاعدة البيانات أثناء إضافة التصنيف: " . $e->getMessage();
+        }
+    }
+}
+
 // 1. معالجة إضافة منتج جديد مع حماية كاملة للمدخلات
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_product'])) {
     // التحقق من رمز التحقق CSRF إذا وجد أو تنظيف المدخلات بصرامة
@@ -139,6 +169,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_product'])) {
 $search           = trim($_GET['search'] ?? '');
 $filter_category  = $_GET['category_id'] ?? '';
 $filter_supplier  = $_GET['supplier_id'] ?? '';
+$filter_source    = $_GET['source'] ?? ''; // 'supplier' أو 'office' أو فارغ = الكل
 
 $where  = ["1=1"];
 $params = [];
@@ -156,6 +187,23 @@ if (!empty($filter_supplier)) {
     $where[]  = "p.supplier_id = ?";
     $params[] = $filter_supplier;
 }
+if ($filter_source === 'supplier') {
+    $where[] = "p.supplier_id IS NOT NULL";
+} elseif ($filter_source === 'office') {
+    $where[] = "p.supplier_id IS NULL";
+}
+
+// إحصائيات "منتجات الموردين" مقابل "منتجات المكتب" (بلا مورد — بضاعة أُدخلت مباشرة كأصل جرد مكتبي)
+// بغض النظر عن فلاتر البحث/التصنيف الحالية، لتبقى الأرقام مرجعية ثابتة يمكن الضغط عليها للتصفية.
+$stmt_src_counts = $conn->query("
+    SELECT
+        SUM(CASE WHEN supplier_id IS NOT NULL THEN 1 ELSE 0 END) AS supplier_products_count,
+        SUM(CASE WHEN supplier_id IS NOT NULL THEN current_quantity ELSE 0 END) AS supplier_products_qty,
+        SUM(CASE WHEN supplier_id IS NULL THEN 1 ELSE 0 END) AS office_products_count,
+        SUM(CASE WHEN supplier_id IS NULL THEN current_quantity ELSE 0 END) AS office_products_qty
+    FROM products
+");
+$src_counts = $stmt_src_counts->fetch(PDO::FETCH_ASSOC);
 
 // 4. استعلام جلب المنتجات مع التصنيفات والموردين (Prepared Statements)
 $sql = "SELECT p.*, c.category_name, s.supplier_name 
@@ -172,6 +220,16 @@ $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
 // جلب التصنيفات والموردين للقوائم المنسدلة
 $categories = $conn->query("SELECT id, category_name FROM categories ORDER BY category_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY supplier_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+
+// توليد الباركود/SKU التالي تلقائياً — يتبع نمط "PRD-XXX" الموجود أصلاً في القاعدة، برقم تسلسلي
+// أكبر رقم حالي + 1. حقل الإدخال يبقى قابلاً للتعديل يدوياً إن أراد المستخدم رمزاً مختلفاً.
+$stmt_next_sku = $conn->query("SELECT sku FROM products WHERE sku LIKE 'PRD-%' ORDER BY CAST(SUBSTRING(sku, 5) AS UNSIGNED) DESC LIMIT 1");
+$last_sku = $stmt_next_sku->fetchColumn();
+$next_sku_number = 1;
+if ($last_sku && preg_match('/PRD-(\d+)/', $last_sku, $m)) {
+    $next_sku_number = intval($m[1]) + 1;
+}
+$auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
 ?>
 
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -198,6 +256,24 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
     </div>
 <?php endif; ?>
 
+<!-- بطاقتا "منتجات الموردين" و"منتجات المكتب" — إحصاء + فلتر بالضغط -->
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px;">
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['source' => $filter_source === 'supplier' ? '' : 'supplier'])); ?>" style="text-decoration: none;">
+        <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px; <?php echo $filter_source === 'supplier' ? 'box-shadow: 0 0 0 2px #4e73df inset;' : ''; ?>">
+            <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;"><i class="fas fa-truck"></i> منتجات الموردين (مشتراة)</div>
+            <div style="font-size: 22px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo intval($src_counts['supplier_products_count']); ?> <span style="font-size: 12px; font-weight: normal;">صنف</span></div>
+            <div style="font-size: 12.5px; color: #2c4e9c; font-family: monospace; margin-top: 3px;">إجمالي الكمية بالمخزون: <?php echo rtrim(rtrim(number_format($src_counts['supplier_products_qty'], 2), '0'), '.'); ?></div>
+        </div>
+    </a>
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['source' => $filter_source === 'office' ? '' : 'office'])); ?>" style="text-decoration: none;">
+        <div style="background: #eafaf1; border-right: 4px solid #1cc88a; padding: 15px; border-radius: 6px; <?php echo $filter_source === 'office' ? 'box-shadow: 0 0 0 2px #1cc88a inset;' : ''; ?>">
+            <div style="color: #1a8f5f; font-size: 13px; font-weight: bold;"><i class="fas fa-building"></i> منتجات المكتب (جرد مباشر بلا مورد)</div>
+            <div style="font-size: 22px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;"><?php echo intval($src_counts['office_products_count']); ?> <span style="font-size: 12px; font-weight: normal;">صنف</span></div>
+            <div style="font-size: 12.5px; color: #1a8f5f; font-family: monospace; margin-top: 3px;">إجمالي الكمية بالمخزون: <?php echo rtrim(rtrim(number_format($src_counts['office_products_qty'], 2), '0'), '.'); ?></div>
+        </div>
+    </a>
+</div>
+
 <!-- شريط البحث والفلترة الاحترافي -->
 <div style="background: #f8f9fc; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #e3e6f0; box-shadow: 0 0.15rem 1rem 0 rgba(58, 59, 69, 0.05);">
     <form method="GET" action="" style="display: flex; gap: 15px; flex-wrap: wrap; align-items: flex-end;">
@@ -207,14 +283,17 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
         </div>
         <div style="flex: 1; min-width: 160px;">
             <label style="font-size: 13px; font-weight: bold; color: #4e73df;">التصنيف:</label>
-            <select name="category_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; margin-top: 5px; background: #fff;">
-                <option value="">-- كافة التصنيفات --</option>
-                <?php foreach ($categories as $cat): ?>
-                    <option value="<?php echo $cat['id']; ?>" <?php echo $filter_category == $cat['id'] ? 'selected' : ''; ?>>
-                        <?php echo htmlspecialchars($cat['category_name']); ?>
-                    </option>
-                <?php endforeach; ?>
-            </select>
+            <div style="display: flex; gap: 6px; margin-top: 5px;">
+                <select name="category_id" style="flex: 1; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
+                    <option value="">-- كافة التصنيفات --</option>
+                    <?php foreach ($categories as $cat): ?>
+                        <option value="<?php echo $cat['id']; ?>" <?php echo $filter_category == $cat['id'] ? 'selected' : ''; ?>>
+                            <?php echo htmlspecialchars($cat['category_name']); ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+                <button type="button" onclick="openAddCategoryModal()" title="إضافة تصنيف جديد" style="background: #1cc88a; color: white; border: none; width: 38px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 16px;">+</button>
+            </div>
         </div>
         <div style="flex: 1; min-width: 160px;">
             <label style="font-size: 13px; font-weight: bold; color: #4e73df;">المورد الأساسي:</label>
@@ -320,19 +399,22 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
                 </div>
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">الباركود / SKU: <span style="color: red;">*</span></label>
-                    <input type="text" name="sku" required placeholder="مثال: PRD-1001" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                    <input type="text" name="sku" required value="<?php echo htmlspecialchars($auto_sku); ?>" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
                 </div>
             </div>
 
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التصنيف أو الفئة:</label>
-                    <select name="category_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
-                        <option value="">-- اختر التصنيف --</option>
-                        <?php foreach ($categories as $cat): ?>
-                            <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['category_name']); ?></option>
-                        <?php endforeach; ?>
-                    </select>
+                    <div style="display: flex; gap: 6px;">
+                        <select name="category_id" style="flex: 1; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
+                            <option value="">-- اختر التصنيف --</option>
+                            <?php foreach ($categories as $cat): ?>
+                                <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['category_name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <button type="button" onclick="openAddCategoryModal()" title="إضافة تصنيف جديد" style="background: #1cc88a; color: white; border: none; width: 38px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 16px;">+</button>
+                    </div>
                 </div>
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">المورد الأساسي:</label>
@@ -409,12 +491,15 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التصنيف أو الفئة:</label>
-                    <select name="category_id" id="edit_category_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
-                        <option value="">-- اختر التصنيف --</option>
-                        <?php foreach ($categories as $cat): ?>
-                            <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['category_name']); ?></option>
-                        <?php endforeach; ?>
-                    </select>
+                    <div style="display: flex; gap: 6px;">
+                        <select name="category_id" id="edit_category_id" style="flex: 1; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
+                            <option value="">-- اختر التصنيف --</option>
+                            <?php foreach ($categories as $cat): ?>
+                                <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['category_name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <button type="button" onclick="openAddCategoryModal()" title="إضافة تصنيف جديد" style="background: #1cc88a; color: white; border: none; width: 38px; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 16px;">+</button>
+                    </div>
                 </div>
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">المورد الأساسي:</label>
@@ -481,6 +566,14 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
         document.getElementById('editProductModal').style.display = show ? 'flex' : 'none';
     }
 
+    function openAddCategoryModal() {
+        document.getElementById('addCategoryModal').style.display = 'flex';
+    }
+
+    function closeAddCategoryModal() {
+        document.getElementById('addCategoryModal').style.display = 'none';
+    }
+
     function openEditProductModal(prod) {
         document.getElementById('edit_product_id').value = prod.id;
         document.getElementById('edit_product_name').value = prod.product_name;
@@ -496,5 +589,27 @@ $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY sup
         toggleEditProductModal(true);
     }
 </script>
+
+<!-- نافذة إضافة تصنيف جديد -->
+<div id="addCategoryModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1100; justify-content: center; align-items: center;">
+    <div style="background: white; width: 400px; max-width: 95%; border-radius: 8px; padding: 25px; box-shadow: 0 5px 25px rgba(0,0,0,0.2);">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e3e6f0; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #1cc88a;"><i class="fas fa-tag"></i> إضافة تصنيف جديد</h3>
+            <button type="button" onclick="closeAddCategoryModal()" style="background: none; border: none; font-size: 22px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <form method="POST" action="">
+<?php csrfField(); ?>
+            <input type="hidden" name="add_category" value="1">
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">اسم التصنيف: <span style="color: red;">*</span></label>
+                <input type="text" name="category_name" required autofocus placeholder="مثال: مواد غذائية / إلكترونيات..." style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px;">
+            </div>
+            <div style="text-align: left; border-top: 1px solid #e3e6f0; padding-top: 15px;">
+                <button type="button" onclick="closeAddCategoryModal()" style="background: #e2e8f0; color: #333; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-weight: bold;">إلغاء</button>
+                <button type="submit" style="background: #1cc88a; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ التصنيف</button>
+            </div>
+        </form>
+    </div>
+</div>
 
 <?php include 'footer.php'; ?>

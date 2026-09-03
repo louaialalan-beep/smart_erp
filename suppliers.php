@@ -6,6 +6,31 @@ require_once __DIR__ . '/includes/system_helpers.php';
 $msg = "";
 $error = "";
 
+// فحص/ترحيل دفاعي لنفس الأعمدة المستخدَمة في supplier_view.php (payment_status على الفواتير،
+// opening_balance_usd على الموردين) — ضروري هنا لأن هذه الصفحة قد تُفتح أولاً قبل تلك الصفحة.
+try {
+    $pi_cols_chk2 = $conn->query("SHOW COLUMNS FROM purchase_invoices")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('payment_status', $pi_cols_chk2)) {
+        $conn->exec("ALTER TABLE purchase_invoices ADD COLUMN payment_status ENUM('Paid','Unpaid') NOT NULL DEFAULT 'Unpaid'");
+    }
+    $sup_cols_chk2 = $conn->query("SHOW COLUMNS FROM suppliers")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('opening_balance_usd', $sup_cols_chk2)) {
+        $conn->exec("ALTER TABLE suppliers ADD COLUMN opening_balance_usd DECIMAL(15,2) DEFAULT 0");
+    }
+    $sales_cols_chk3 = $conn->query("SHOW COLUMNS FROM sales")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('delivered_at', $sales_cols_chk3)) {
+        $conn->exec("ALTER TABLE sales ADD COLUMN delivered_at DATE NULL");
+    }
+    $conn->exec("CREATE TABLE IF NOT EXISTS supplier_discounts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        supplier_id INT NOT NULL,
+        amount_usd DECIMAL(15,2) NOT NULL,
+        discount_date DATE NOT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )");
+} catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+
 // معالجة إضافة مورد جديد
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_supplier'])) {
     $supplier_name = trim($_POST['supplier_name']);
@@ -58,17 +83,119 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_supplier'])) {
     }
 }
 
+// ============================================================
+// فلتر يومي/أسبوعي لحركة الموردين مجتمعين (إجمالي المشتريات/المدفوعات/المردودات/صافي حركة الفترة)
+// ============================================================
+$sf_period = $_GET['sf_period'] ?? 'today';
+$today_str2 = date('Y-m-d');
+if ($sf_period === 'week') {
+    $sf_from = date('Y-m-d', strtotime('monday this week'));
+    $sf_to = date('Y-m-d', strtotime('sunday this week'));
+} elseif ($sf_period === 'custom' && !empty($_GET['sf_from']) && !empty($_GET['sf_to'])) {
+    $sf_from = $_GET['sf_from'];
+    $sf_to = $_GET['sf_to'];
+} else {
+    $sf_period = 'today';
+    $sf_from = $today_str2;
+    $sf_to = $today_str2;
+}
+
+// تصحيح: توحيد منهجية بطاقات الفلتر مع منهجية الجدول أدناه تماماً — كانت بطاقات الفترة تشمل الفواتير
+// النقدية (Paid) ضمن "إجمالي المشتريات" (رغم أنها لا تُنشئ التزاماً وتُستبعَد دائماً في الجدول)، ولا
+// تشمل الخصومات المُسجَّلة (supplier_discounts) ضمن "المردودات/الخصم" — ما كان يجعل الرقمين مختلفين
+// عن نظيريهما في الجدول لنفس الفترة، رغم أنهما يُفترَض أن يقيسا نفس الشيء بمنهجية موحَّدة.
+$stmt_sf_purchases = $conn->prepare("
+    SELECT COALESCE(SUM(pi.total_amount_usd), 0)
+    FROM purchase_invoices pi
+    WHERE pi.invoice_date BETWEEN ? AND ? AND pi.payment_status != 'Paid'
+");
+$stmt_sf_purchases->execute([$sf_from, $sf_to]);
+$sf_total_purchases = floatval($stmt_sf_purchases->fetchColumn());
+
+$stmt_sf_payments = $conn->prepare("SELECT COALESCE(SUM(amount_usd), 0) FROM supplier_payments WHERE payment_date BETWEEN ? AND ?");
+$stmt_sf_payments->execute([$sf_from, $sf_to]);
+$sf_total_payments = floatval($stmt_sf_payments->fetchColumn());
+
+$stmt_sf_returns = $conn->prepare("
+    SELECT COALESCE(SUM(pr.total_amount_usd), 0)
+    FROM purchase_returns pr
+    INNER JOIN purchase_invoices pi ON pr.purchase_invoice_id = pi.id
+    WHERE pr.return_date BETWEEN ? AND ? AND pi.payment_status != 'Paid'
+");
+$stmt_sf_returns->execute([$sf_from, $sf_to]);
+$sf_total_purchase_returns_only = floatval($stmt_sf_returns->fetchColumn());
+
+$stmt_sf_disc = $conn->prepare("SELECT COALESCE(SUM(amount_usd), 0) FROM supplier_discounts WHERE discount_date BETWEEN ? AND ?");
+$stmt_sf_disc->execute([$sf_from, $sf_to]);
+$sf_total_discounts_logged = floatval($stmt_sf_disc->fetchColumn());
+
+$sf_total_returns = $sf_total_purchase_returns_only + $sf_total_discounts_logged;
+
+// صافي حركة الفترة (وليس الرصيد التراكمي المستحق — ذاك يظهر لكل مورد على حدة في الجدول أدناه)
+$sf_net_movement = $sf_total_purchases - $sf_total_payments - $sf_total_returns;
+
+// تكلفة البضائع المباعة (COGS) — مُسلَّمة فعلياً، لكل الموردين مجتمعين ضمن نفس الفترة (مصروف حقيقي
+// مُرحَّل بالفعل في اليومية، محسوب بتاريخ التسليم الفعلي delivered_at وليس تاريخ إصدار الفاتورة)
+$stmt_sf_cogs = $conn->prepare("
+    SELECT COALESCE(SUM(si.quantity * si.cost_price_usd_at_sale), 0)
+    FROM sale_items si
+    INNER JOIN sales s ON si.sale_id = s.id
+    WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+");
+$stmt_sf_cogs->execute([$sf_from, $sf_to]);
+$sf_total_cogs_delivered = floatval($stmt_sf_cogs->fetchColumn());
+
+// إجمالي الرصيد الافتتاحي لكل الموردين مجتمعين — رقم إجمالي دائم بلا فلتر زمني (ليس حركة فترة، بل
+// رصيد ثابت مُدخَل مرة واحدة لكل مورد)
+$stmt_sf_opening = $conn->prepare("SELECT COALESCE(SUM(opening_balance_usd), 0) FROM suppliers");
+$stmt_sf_opening->execute();
+$sf_total_opening_balance = floatval($stmt_sf_opening->fetchColumn());
+
 // استعلام جلب الموردين مع الحسابات التلقائية
-// تصحيح: استُخدم purchased_quantity (الكمية الأصلية المشتراة) بدلاً من current_quantity
-// (الكمية المتبقية بالمخزون) لتطابق نفس منطق الحساب المستخدم في supplier_view.php تماماً.
-// اعتماد current_quantity هنا كان يجعل "إجمالي المشتريات" في هذه القائمة يتناقص مع كل عملية بيع
-// ويختلف عن القيمة الصحيحة الثابتة الظاهرة في الملف التفصيلي لنفس المورد.
+// تصحيح شامل: كانت هذه القائمة تستخدم منهجاً قديماً مختلفاً تماماً عن supplier_view.php (المبني على
+// products.purchased_quantity فقط، بلا استبعاد الفواتير النقدية، وبلا طرح مرتجعات المشتريات، وبلا
+// الرصيد الافتتاحي) — ما كان يجعل "صافي الحساب" هنا يختلف عن الملف التفصيلي لنفس المورد. الآن مطابق
+// تماماً لنفس منهج supplier_view.php: فواتير الشراء غير النقدية (purchase_invoice_items) + رصيد تكميلي
+// للكميات القديمة غير المُغطاة بفواتير، ناقص مرتجعات الفواتير غير النقدية، زائد الرصيد الافتتاحي.
 $sql = "SELECT s.*, 
-        (SELECT COALESCE(SUM(COALESCE(p.purchased_quantity, p.current_quantity) * p.cost_price_usd), 0) FROM products p WHERE p.supplier_id = s.id) AS total_purchases,
-        (SELECT COALESCE(SUM(sp.amount_usd), 0) FROM supplier_payments sp WHERE sp.supplier_id = s.id) AS total_payments
+        (
+            (SELECT COALESCE(SUM(pii.total_cost_usd), 0)
+                FROM purchase_invoice_items pii
+                INNER JOIN purchase_invoices pi ON pii.purchase_invoice_id = pi.id
+                WHERE pi.supplier_id = s.id AND pi.payment_status != 'Paid')
+            + (SELECT COALESCE(SUM(
+                    GREATEST(0, p.purchased_quantity - COALESCE((SELECT SUM(pii2.quantity) FROM purchase_invoice_items pii2 WHERE pii2.product_id = p.id), 0))
+                    * p.cost_price_usd
+                ), 0)
+                FROM products p WHERE p.supplier_id = s.id)
+        ) AS total_purchases,
+        (SELECT COALESCE(SUM(sp.amount_usd), 0) FROM supplier_payments sp WHERE sp.supplier_id = s.id) AS total_payments,
+        (SELECT COALESCE(SUM(pr.total_amount_usd), 0)
+            FROM purchase_returns pr
+            INNER JOIN purchase_invoices pi3 ON pr.purchase_invoice_id = pi3.id
+            WHERE pi3.supplier_id = s.id AND pi3.payment_status != 'Paid') AS total_purchase_returns,
+        (SELECT COALESCE(SUM(sd.amount_usd), 0) FROM supplier_discounts sd WHERE sd.supplier_id = s.id) AS total_discounts_logged
         FROM suppliers s 
         ORDER BY s.id DESC";
 $suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+
+// إجمالي صافي أرصدة كل الموردين مجتمعين — يُحسب مسبقاً هنا لعرضه كبطاقة، بنفس معادلة صافي الحساب
+// المستخدمة لكل مورد على حدة أدناه في الجدول. هذا الرقم هو ما يجب أن يطابق "ذمم الموردين" في
+// القوائم المالية الرسمية (financial_statements.php) إن كانت كل الحسابات متسقة.
+$grand_total_net_balance = 0;
+$grand_total_purchases_col = 0;
+$grand_total_payments_col = 0;
+$grand_total_returns_col = 0;
+$grand_total_opening_col = 0;
+foreach ($suppliers as $sup_pre) {
+    $pre_opening = floatval($sup_pre['opening_balance_usd'] ?? 0);
+    $pre_returns = floatval($sup_pre['returns_discounts']) + floatval($sup_pre['total_purchase_returns']) + floatval($sup_pre['total_discounts_logged']);
+    $grand_total_net_balance += $sup_pre['total_purchases'] - $sup_pre['total_payments'] - $pre_returns + $pre_opening;
+    $grand_total_purchases_col += floatval($sup_pre['total_purchases']);
+    $grand_total_payments_col += floatval($sup_pre['total_payments']);
+    $grand_total_returns_col += $pre_returns;
+    $grand_total_opening_col += $pre_opening;
+}
 ?>
 
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -90,6 +217,57 @@ $suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
     <div style="background: #f8d7da; color: #721c24; padding: 12px; border-radius: 6px; margin-bottom: 15px;"><?php echo $error; ?></div>
 <?php endif; ?>
 
+<!-- فلتر حركة الموردين اليومي/الأسبوعي -->
+<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 18px 20px; margin-bottom: 20px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
+    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 15px;">
+        <h3 style="margin: 0; color: #4e73df; font-size: 16px;"><i class="fas fa-chart-line"></i> حركة الموردين حسب الفترة (كل الموردين مجتمعين)</h3>
+        <form method="GET" action="" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <a href="?sf_period=today" style="text-decoration: none;">
+                <span style="padding: 7px 14px; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; background: <?php echo $sf_period === 'today' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $sf_period === 'today' ? '#fff' : '#4e73df'; ?>;">اليوم</span>
+            </a>
+            <a href="?sf_period=week" style="text-decoration: none;">
+                <span style="padding: 7px 14px; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; background: <?php echo $sf_period === 'week' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $sf_period === 'week' ? '#fff' : '#4e73df'; ?>;">هذا الأسبوع</span>
+            </a>
+            <input type="hidden" name="sf_period" value="custom">
+            <input type="date" name="sf_from" value="<?php echo htmlspecialchars($sf_from); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <span style="color: #888;">إلى</span>
+            <input type="date" name="sf_to" value="<?php echo htmlspecialchars($sf_to); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <button type="submit" style="background: #6f42c1; color: white; border: none; padding: 7px 14px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold;">تطبيق</button>
+        </form>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px;">
+        <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+            <div style="color: #a33636; font-size: 13px; font-weight: bold;">إجمالي المشتريات</div>
+            <div style="font-size: 22px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_total_purchases, 2); ?></div>
+        </div>
+        <div style="background: #eafaf1; border-right: 4px solid #1cc88a; padding: 15px; border-radius: 6px;">
+            <div style="color: #1a8f5f; font-size: 13px; font-weight: bold;">إجمالي المدفوعات</div>
+            <div style="font-size: 22px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_total_payments, 2); ?></div>
+        </div>
+        <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
+            <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="مرتجعات فواتير غير نقدية + خصومات مُسجَّلة ضمن هذه الفترة">المردودات / الخصم</div>
+            <div style="font-size: 22px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_total_returns, 2); ?></div>
+        </div>
+        <div style="background: #eef1fc; border-right: 4px solid #2e59d9; padding: 15px; border-radius: 6px;">
+            <div style="color: #2e59d9; font-size: 13px; font-weight: bold;">صافي حركة الفترة</div>
+            <div style="font-size: 22px; font-weight: bold; color: #2e59d9; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_net_movement, 2); ?></div>
+        </div>
+        <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+            <div style="color: #a33636; font-size: 13px; font-weight: bold;" title="مصروف حقيقي مُرحَّل فعلياً في اليومية، لكل الموردين مجتمعين">تكلفة البضائع المباعة (COGS) — مُسلَّمة</div>
+            <div style="font-size: 22px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_total_cogs_delivered, 2); ?></div>
+        </div>
+        <div style="background: #f3eefc; border-right: 4px solid #6f42c1; padding: 15px; border-radius: 6px;">
+            <div style="color: #4a2f7a; font-size: 13px; font-weight: bold;" title="رصيد إجمالي ثابت لكل الموردين مجتمعين — ليس حركة ضمن الفترة المحددة أعلاه">إجمالي الرصيد الافتتاحي (كل الموردين)</div>
+            <div style="font-size: 22px; font-weight: bold; color: #6f42c1; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sf_total_opening_balance, 2); ?></div>
+        </div>
+        <div style="background: #eaf1fc; border-right: 4px solid #2e59d9; padding: 15px; border-radius: 6px;">
+            <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="مجموع صافي الحساب لكل الموردين — يجب أن يطابق بطاقة «ذمم الموردين» في القوائم المالية الرسمية">إجمالي صافي أرصدة كل الموردين</div>
+            <div style="font-size: 22px; font-weight: bold; color: #2e59d9; font-family: monospace; margin-top: 5px;">$<?php echo number_format($grand_total_net_balance, 2); ?></div>
+        </div>
+    </div>
+    <p style="color: #999; font-size: 12px; margin: 12px 0 0 0;">هذه أرقام <strong>حركة الفترة المحددة فقط</strong> (فواتير/دفعات/مرتجعات بتاريخ ضمن الفترة) لكل الموردين مجتمعين — وليست الرصيد التراكمي المستحق حالياً، والذي يظهر بشكل صحيح لكل مورد على حدة في عمود "صافي الحساب" بالجدول أدناه.</p>
+</div>
+
 <!-- جدول الموردين الرئيسي -->
 <div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
     <div style="overflow-x: auto;">
@@ -103,15 +281,19 @@ $suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
                     <th style="padding: 12px 15px; color: #e74a3b;">إجمالي المشتريات</th>
                     <th style="padding: 12px 15px; color: #1cc88a;">إجمالي المدفوعات</th>
                     <th style="padding: 12px 15px; color: #f6c23e;">المردودات / الخصم</th>
-                    <th style="padding: 12px 15px; color: #2e59d9;">صافي الحساب</th>
+                    <th style="padding: 12px 15px; color: #6f42c1;">الرصيد الافتتاحي</th>
+                    <th style="padding: 12px 15px; color: #2e59d9;">صافي الحساب الباقي</th>
                     <th style="padding: 12px 15px; text-align: center;">الإجراءات</th>
                 </tr>
             </thead>
             <tbody>
                 <?php if (count($suppliers) > 0): ?>
                     <?php foreach ($suppliers as $sup): 
-                        // صافي الحساب = إجمالي المشتريات - إجمالي المدفوعات - المردودات والخصومات
-                        $net_balance = $sup['total_purchases'] - $sup['total_payments'] - $sup['returns_discounts'];
+                        // صافي الحساب = إجمالي المشتريات - إجمالي المدفوعات - المردودات والخصومات اليدوية
+                        // - مرتجعات المشتريات الفعلية + الرصيد الافتتاحي — نفس معادلة supplier_view.php بالضبط
+                        $sup_opening_balance = floatval($sup['opening_balance_usd'] ?? 0);
+                        $sup_total_returns = floatval($sup['returns_discounts']) + floatval($sup['total_purchase_returns']) + floatval($sup['total_discounts_logged']);
+                        $net_balance = $sup['total_purchases'] - $sup['total_payments'] - $sup_total_returns + $sup_opening_balance;
                     ?>
                         <tr style="border-bottom: 1px solid #f1f1f1;">
                             <td style="padding: 12px 15px; font-weight: 600; color: #333;"><?php echo htmlspecialchars($sup['supplier_name']); ?></td>
@@ -120,7 +302,8 @@ $suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
                             <td style="padding: 12px 15px; color: #666; font-size: 13px;"><?php echo htmlspecialchars($sup['payment_terms']); ?></td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;">$<?php echo number_format($sup['total_purchases'], 2); ?></td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a; font-weight: bold;">$<?php echo number_format($sup['total_payments'], 2); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e; font-weight: bold;">$<?php echo number_format($sup['returns_discounts'], 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e; font-weight: bold;" title="خصومات يدوية: $<?php echo number_format($sup['returns_discounts'], 2); ?> + خصومات مُسجَّلة: $<?php echo number_format($sup['total_discounts_logged'], 2); ?> + مرتجعات فعلية: $<?php echo number_format($sup['total_purchase_returns'], 2); ?>">$<?php echo number_format($sup_total_returns, 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #6f42c1; font-weight: bold;">$<?php echo number_format($sup_opening_balance, 2); ?></td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9; font-weight: bold;">$<?php echo number_format($net_balance, 2); ?></td>
                             <td style="padding: 12px 15px; text-align: center; white-space: nowrap;">
                                 <a href="supplier_view.php?id=<?php echo $sup['id']; ?>" style="background: #4e73df; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 4px;">
@@ -134,10 +317,23 @@ $suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="9" style="padding: 30px; text-align: center; color: #777;">لا توجد أي موردين مسجلين حالياً.</td>
+                        <td colspan="10" style="padding: 30px; text-align: center; color: #777;">لا توجد أي موردين مسجلين حالياً.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>
+            <?php if (count($suppliers) > 0): ?>
+            <tfoot>
+                <tr style="background: #f8f9fc; border-top: 2px solid #e3e6f0; font-weight: bold;">
+                    <td style="padding: 12px 15px;" colspan="4">الإجمالي (كل الموردين)</td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b;">$<?php echo number_format($grand_total_purchases_col, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a;">$<?php echo number_format($grand_total_payments_col, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e;">$<?php echo number_format($grand_total_returns_col, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #6f42c1;">$<?php echo number_format($grand_total_opening_col, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9;">$<?php echo number_format($grand_total_net_balance, 2); ?></td>
+                    <td></td>
+                </tr>
+            </tfoot>
+            <?php endif; ?>
         </table>
     </div>
 </div>

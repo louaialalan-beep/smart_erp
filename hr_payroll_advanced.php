@@ -314,6 +314,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_variable_item'])) 
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_payroll'])) {
     requireRole($conn, ['admin', 'accountant']);
     $target_month = $_POST['target_month'];
+    $salary_type = ($_POST['salary_type'] ?? 'شهري') === 'أسبوعي' ? 'أسبوعي' : 'شهري';
+
+    // عمود نوع الراتب (شهري/أسبوعي) لكل سطر — يُحدَّد لكل مسير/موظف على حدة، ويُستخدَم لحساب الراتب
+    // الأساسي الفعلي المستحق: الراتب الأسبوعي = الراتب الشهري المسجَّل للموظف ÷ 4 تقريباً.
+    try {
+        $pd_cols_chk = $conn->query("SHOW COLUMNS FROM payroll_details")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('salary_type', $pd_cols_chk)) {
+            $conn->exec("ALTER TABLE payroll_details ADD COLUMN salary_type ENUM('شهري','أسبوعي') NOT NULL DEFAULT 'شهري'");
+        }
+    } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
 
     if (isDateInClosedPeriod($conn, date('Y-m-d'))) {
         $error = getPeriodLockErrorMessage(date('Y-m-d'));
@@ -340,6 +350,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_payroll'])) {
         foreach ($employees as $emp) {
             $emp_id = $emp['id'];
             $base_salary = $emp['base_salary'];
+            if ($salary_type === 'أسبوعي') { $base_salary = round($base_salary / 4, 2); }
 
             // أ. الأقساط
             $inst_stmt = $conn->prepare("SELECT SUM(amount) as total_inst, GROUP_CONCAT(id) as inst_ids FROM advance_installments WHERE employee_id = ? AND installment_month = ? AND is_paid = 0");
@@ -368,8 +379,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_payroll'])) {
             $total_penalties += $penalties;
             $total_advances_recovered += $deducted_advances;
 
-            $stmt_det = $conn->prepare("INSERT INTO payroll_details (payroll_run_id, employee_id, base_salary, deducted_advances, penalties, bonuses, net_salary) VALUES (?, ?, ?, ?, ?, ?, ?)");
-            $stmt_det->execute([$payroll_run_id, $emp_id, $base_salary, $deducted_advances, $penalties, $bonuses, $net_salary]);
+            $stmt_det = $conn->prepare("INSERT INTO payroll_details (payroll_run_id, employee_id, base_salary, deducted_advances, penalties, bonuses, net_salary, salary_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            $stmt_det->execute([$payroll_run_id, $emp_id, $base_salary, $deducted_advances, $penalties, $bonuses, $net_salary, $salary_type]);
 
             if (!empty($inst_ids)) {
                 $conn->query("UPDATE advance_installments SET is_paid = 1 WHERE id IN ($inst_ids)");
@@ -421,6 +432,184 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_payroll'])) {
         $conn->rollBack();
         $error = "خطأ في المعالجة: " . $e->getMessage();
     }
+    }
+}
+
+// دالة مساعدة مشتركة: تُعيد حساب مجاميع مسير رواتب كامل من كل سطوره الحالية في payroll_details،
+// وتُعيد ترحيل القيد المحاسبي المُجمَّع للمسير بالكامل من الصفر (عكس القديم بحذفه، ثم إعادة الترحيل).
+// تُستخدَم عند إضافة موظف واحد لمسير قائم، أو تعديل سطر موظف واحد فيه — بدل حساب جزئي غير دقيق.
+function recomputeAndPostPayrollJournal($conn, $payroll_run_id, $target_month) {
+    $stmt_sum = $conn->prepare("SELECT COALESCE(SUM(base_salary),0) AS s_base, COALESCE(SUM(bonuses),0) AS s_bonus, COALESCE(SUM(penalties),0) AS s_pen, COALESCE(SUM(deducted_advances),0) AS s_adv, COALESCE(SUM(net_salary),0) AS s_net FROM payroll_details WHERE payroll_run_id = ?");
+    $stmt_sum->execute([$payroll_run_id]);
+    $sums = $stmt_sum->fetch(PDO::FETCH_ASSOC);
+
+    $conn->prepare("UPDATE payroll_runs SET total_payroll_amount = ? WHERE id = ?")->execute([$sums['s_net'], $payroll_run_id]);
+
+    $entry_num = "JE-PAYROLL-" . $payroll_run_id;
+    $conn->prepare("DELETE FROM journal_entries WHERE entry_number = ?")->execute([$entry_num]);
+
+    $desc = "إثبات مسير الرواتب والأجور لشهر: $target_month";
+    $today = date('Y-m-d');
+    $salaries_expense_id = findOrCreateAccount($conn, ['رواتب', 'أجور', 'salaries'], 'الرواتب والأجور');
+    $cash_id              = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+    $bonus_expense_id     = findOrCreateAccount($conn, ['مصروف حوافز', 'مكافآت الموظفين'], 'مصروف حوافز ومكافآت الموظفين');
+    $penalty_income_id    = findOrCreateAccount($conn, ['جزاءات وخصومات', 'جزاءات الموظفين'], 'جزاءات وخصومات الموظفين');
+    $advances_asset_id    = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين');
+
+    if ($salaries_expense_id && $cash_id) {
+        if ($sums['s_base'] > 0) { insertJournalLine($conn, $salaries_expense_id, $sums['s_base'], 0, $entry_num, $today, $desc, 'Payroll'); }
+        if ($sums['s_bonus'] > 0 && $bonus_expense_id) { insertJournalLine($conn, $bonus_expense_id, $sums['s_bonus'], 0, $entry_num, $today, $desc, 'Payroll'); }
+        if ($sums['s_adv'] > 0 && $advances_asset_id) { insertJournalLine($conn, $advances_asset_id, 0, $sums['s_adv'], $entry_num, $today, $desc, 'Payroll'); }
+        if ($sums['s_pen'] > 0 && $penalty_income_id) { insertJournalLine($conn, $penalty_income_id, 0, $sums['s_pen'], $entry_num, $today, $desc, 'Payroll'); }
+        if ($sums['s_net'] > 0) { insertJournalLine($conn, $cash_id, 0, $sums['s_net'], $entry_num, $today, $desc, 'Payroll'); }
+    }
+}
+
+// معالجة صرف راتب لموظف واحد فقط — تُنشئ مسير الشهر إن لم يكن موجوداً، أو تضيف هذا الموظف لمسير
+// قائم إن لم يكن قد صُرِف له فيه مسبقاً. تُعيد حساب القيد المُجمَّع لكل المسير من جديد بعد الإضافة.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_single_payroll'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $target_month = $_POST['single_target_month'];
+    $emp_id = intval($_POST['single_employee_id']);
+    $single_salary_type = ($_POST['single_salary_type'] ?? 'شهري') === 'أسبوعي' ? 'أسبوعي' : 'شهري';
+    $week_start = $_POST['single_week_start'] ?? '';
+    $week_end = $_POST['single_week_end'] ?? '';
+
+    try {
+        $pd_cols_chk2 = $conn->query("SHOW COLUMNS FROM payroll_details")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('salary_type', $pd_cols_chk2)) {
+            $conn->exec("ALTER TABLE payroll_details ADD COLUMN salary_type ENUM('شهري','أسبوعي') NOT NULL DEFAULT 'شهري'");
+        }
+        if (!in_array('week_start_date', $pd_cols_chk2)) {
+            $conn->exec("ALTER TABLE payroll_details ADD COLUMN week_start_date DATE NULL");
+        }
+        if (!in_array('week_end_date', $pd_cols_chk2)) {
+            $conn->exec("ALTER TABLE payroll_details ADD COLUMN week_end_date DATE NULL");
+        }
+    } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+
+    if (isDateInClosedPeriod($conn, date('Y-m-d'))) {
+        $error = getPeriodLockErrorMessage(date('Y-m-d'));
+    } else {
+        try {
+            $conn->beginTransaction();
+
+            $stmt_run = $conn->prepare("SELECT id FROM payroll_runs WHERE salary_month = ?");
+            $stmt_run->execute([$target_month]);
+            $payroll_run_id = $stmt_run->fetchColumn();
+            if (!$payroll_run_id) {
+                $conn->prepare("INSERT INTO payroll_runs (salary_month, total_payroll_amount) VALUES (?, 0)")->execute([$target_month]);
+                $payroll_run_id = $conn->lastInsertId();
+            }
+
+            $stmt_exists = $conn->prepare("SELECT id FROM payroll_details WHERE payroll_run_id = ? AND employee_id = ?");
+            $stmt_exists->execute([$payroll_run_id, $emp_id]);
+            if ($stmt_exists->fetch()) { throw new Exception("راتب هذا الموظف لشهر $target_month مصروف مسبقاً — استخدم زر التعديل بدلاً من الصرف مرة أخرى."); }
+
+            $stmt_emp = $conn->prepare("SELECT * FROM employees WHERE id = ?");
+            $stmt_emp->execute([$emp_id]);
+            $emp = $stmt_emp->fetch(PDO::FETCH_ASSOC);
+            if (!$emp) { throw new Exception("الموظف غير موجود."); }
+            $base_salary = $emp['base_salary'];
+
+            // === حساب دقيق للراتب الأسبوعي: السعر اليومي (الأساسي ÷ 30) × عدد الأيام الفعلية في
+            // الفترة المحددة (من/إلى) — وليس قسمة تقريبية ثابتة على 4. يدعم أي طول أسبوع فعلي (6، 7، ...).
+            $days_in_period = null;
+            if ($single_salary_type === 'أسبوعي') {
+                if (!empty($week_start) && !empty($week_end)) {
+                    $d1 = new DateTime($week_start);
+                    $d2 = new DateTime($week_end);
+                    if ($d2 < $d1) { throw new Exception("تاريخ نهاية الأسبوع يجب أن يكون بعد تاريخ البداية."); }
+                    $days_in_period = $d1->diff($d2)->days + 1; // شامل يومَي البداية والنهاية معاً
+                    $daily_rate = $base_salary / 30;
+                    $base_salary = round($daily_rate * $days_in_period, 2);
+                } else {
+                    // لا تواريخ محددة: تراجع للقسمة التقريبية القديمة على 4 كحل احتياطي فقط
+                    $base_salary = round($base_salary / 4, 2);
+                }
+            } else {
+                $week_start = null; $week_end = null;
+            }
+
+            $inst_stmt = $conn->prepare("SELECT SUM(amount) as total_inst, GROUP_CONCAT(id) as inst_ids FROM advance_installments WHERE employee_id = ? AND installment_month = ? AND is_paid = 0");
+            $inst_stmt->execute([$emp_id, $target_month]);
+            $inst_res = $inst_stmt->fetch(PDO::FETCH_ASSOC);
+            $deducted_advances = floatval($inst_res['total_inst'] ?? 0);
+            $inst_ids = $inst_res['inst_ids'] ?? '';
+
+            $pen_stmt = $conn->prepare("SELECT SUM(amount) as total_pen FROM employee_variable_items WHERE employee_id = ? AND target_month = ? AND item_type = 'penalty'");
+            $pen_stmt->execute([$emp_id, $target_month]);
+            $penalties = floatval($pen_stmt->fetch(PDO::FETCH_ASSOC)['total_pen'] ?? 0);
+
+            $bon_stmt = $conn->prepare("SELECT SUM(amount) as total_bon FROM employee_variable_items WHERE employee_id = ? AND target_month = ? AND item_type = 'bonus'");
+            $bon_stmt->execute([$emp_id, $target_month]);
+            $bonuses = floatval($bon_stmt->fetch(PDO::FETCH_ASSOC)['total_bon'] ?? 0);
+
+            $net_salary = $base_salary - $deducted_advances - $penalties + $bonuses;
+            if ($net_salary < 0) { $net_salary = 0; }
+
+            $conn->prepare("INSERT INTO payroll_details (payroll_run_id, employee_id, base_salary, deducted_advances, penalties, bonuses, net_salary, salary_type, week_start_date, week_end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+                 ->execute([$payroll_run_id, $emp_id, $base_salary, $deducted_advances, $penalties, $bonuses, $net_salary, $single_salary_type, $week_start ?: null, $week_end ?: null]);
+
+            if (!empty($inst_ids)) {
+                $conn->query("UPDATE advance_installments SET is_paid = 1 WHERE id IN ($inst_ids)");
+            }
+
+            recomputeAndPostPayrollJournal($conn, $payroll_run_id, $target_month);
+
+            $conn->commit();
+            $period_note = ($single_salary_type === 'أسبوعي' && $days_in_period) ? " (عن $days_in_period يوم: من $week_start إلى $week_end)" : " ($single_salary_type)";
+            $msg = "تم صرف راتب الموظف (" . htmlspecialchars($emp['full_name']) . ") لشهر $target_month{$period_note} بصافي " . number_format($net_salary, 2) . " ل.س، وتحديث القيد المحاسبي للمسير بالكامل.";
+            logAudit($conn, 'INSERT', 'مسيرات الرواتب', "صرف راتب فردي ($single_salary_type) للموظف #$emp_id لشهر $target_month بصافي " . number_format($net_salary, 2) . " ل.س", $payroll_run_id);
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ: " . $e->getMessage();
+        }
+    }
+}
+
+// معالجة تعديل راتب موظف واحد مصروف بالفعل ضمن مسير — تُعيد حساب صافي راتبه والقيد المُجمَّع للمسير بالكامل
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payroll_detail'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $detail_id = intval($_POST['detail_id']);
+    try {
+        $pd_cols_chk3 = $conn->query("SHOW COLUMNS FROM payroll_details")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('salary_type', $pd_cols_chk3)) {
+            $conn->exec("ALTER TABLE payroll_details ADD COLUMN salary_type ENUM('شهري','أسبوعي') NOT NULL DEFAULT 'شهري'");
+        }
+    } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+    $new_base = floatval($_POST['edit_base_salary']);
+    $new_adv = floatval($_POST['edit_deducted_advances']);
+    $new_pen = floatval($_POST['edit_penalties']);
+    $new_bonus = floatval($_POST['edit_bonuses']);
+    $new_salary_type = ($_POST['edit_salary_type'] ?? 'شهري') === 'أسبوعي' ? 'أسبوعي' : 'شهري';
+
+    $stmt_det = $conn->prepare("SELECT pd.*, pr.salary_month FROM payroll_details pd JOIN payroll_runs pr ON pd.payroll_run_id = pr.id WHERE pd.id = ?");
+    $stmt_det->execute([$detail_id]);
+    $detail = $stmt_det->fetch(PDO::FETCH_ASSOC);
+
+    if (!$detail) {
+        $error = "سجل الراتب غير موجود.";
+    } elseif (isDateInClosedPeriod($conn, date('Y-m-d'))) {
+        $error = getPeriodLockErrorMessage(date('Y-m-d'));
+    } else {
+        try {
+            $conn->beginTransaction();
+            $new_net = $new_base - $new_adv - $new_pen + $new_bonus;
+            if ($new_net < 0) { $new_net = 0; }
+
+            $conn->prepare("UPDATE payroll_details SET base_salary = ?, deducted_advances = ?, penalties = ?, bonuses = ?, net_salary = ?, salary_type = ? WHERE id = ?")
+                 ->execute([$new_base, $new_adv, $new_pen, $new_bonus, $new_net, $new_salary_type, $detail_id]);
+
+            recomputeAndPostPayrollJournal($conn, $detail['payroll_run_id'], $detail['salary_month']);
+
+            $conn->commit();
+            $msg = "تم تحديث راتب الموظف والقيد المحاسبي المُجمَّع للمسير بالكامل بنجاح!";
+            logAudit($conn, 'UPDATE', 'مسيرات الرواتب', "تعديل راتب فردي #$detail_id ضمن مسير شهر " . $detail['salary_month'] . " — صافي جديد: " . number_format($new_net, 2) . " ل.س", $detail_id);
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ: " . $e->getMessage();
+        }
     }
 }
 
@@ -486,6 +675,7 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
         <button onclick="openModal('advanceModal')" style="background: #f6c23e; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 5px;"><i class="fas fa-hand-holding-usd"></i> سلفة مقسطة</button>
         <button onclick="openModal('varModal')" style="background: #36b9cc; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 5px;"><i class="fas fa-plus-circle"></i> جزاء / مكافأة</button>
         <button onclick="openModal('payrollModal')" style="background: #4e73df; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 5px;"><i class="fas fa-calculator"></i> توليد مسير راتب</button>
+        <button onclick="openModal('singlePayrollModal')" style="background: #1cc88a; color: white; border: none; padding: 8px 14px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 5px;"><i class="fas fa-user-check"></i> صرف راتب موظف واحد</button>
     </div>
 </div>
 
@@ -521,11 +711,13 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
                 <tr style="background: #f8f9fc; color: #4e73df; border-bottom: 2px solid #e3e6f0;">
                     <th style="padding: 12px 15px;">الموظف</th>
                     <th style="padding: 12px 15px;">القسم / المسمى</th>
+                    <th style="padding: 12px 15px;">نوع الراتب</th>
                     <th style="padding: 12px 15px;">الأساسي</th>
                     <th style="padding: 12px 15px;">خصم الأقساط</th>
                     <th style="padding: 12px 15px;">الجزاءات</th>
                     <th style="padding: 12px 15px;">المكافآت</th>
                     <th style="padding: 12px 15px;">الصافي المستحق</th>
+                    <th style="padding: 12px 15px; text-align: center;">الإجراءات</th>
                 </tr>
             </thead>
             <tbody>
@@ -533,14 +725,24 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
                     <tr style="border-bottom: 1px solid #f1f1f1;">
                         <td style="padding: 12px 15px; font-weight: bold; color: #333;"><?php echo htmlspecialchars($det['emp_name']); ?></td>
                         <td style="padding: 12px 15px; color: #666;"><?php echo htmlspecialchars($det['department'] . ' - ' . $det['position']); ?></td>
+                        <td style="padding: 12px 15px;">
+                            <span class="status-badge" style="background: <?php echo ($det['salary_type'] ?? 'شهري') === 'أسبوعي' ? '#eaf1fc' : '#eafaf1'; ?>; color: <?php echo ($det['salary_type'] ?? 'شهري') === 'أسبوعي' ? '#2c4e9c' : '#1a8f5f'; ?>;">
+                                <?php echo htmlspecialchars($det['salary_type'] ?? 'شهري'); ?>
+                            </span>
+                        </td>
                         <td style="padding: 12px 15px; font-family: monospace;"><?php echo number_format($det['base_salary'], 2); ?></td>
                         <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b;"><?php echo number_format($det['deducted_advances'], 2); ?></td>
                         <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b;"><?php echo number_format($det['penalties'], 2); ?></td>
                         <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a;"><?php echo number_format($det['bonuses'], 2); ?></td>
                         <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #2e59d9;"><?php echo number_format($det['net_salary'], 2); ?> ل.س</td>
+                        <td style="padding: 12px 15px; text-align: center;">
+                            <button onclick='openEditPayrollDetailModal(<?php echo json_encode($det, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)' style="background: #f6c23e; color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">
+                                <i class="fas fa-edit"></i> تعديل
+                            </button>
+                        </td>
                     </tr>
                 <?php endforeach; else: ?>
-                    <tr><td colspan="7" style="padding: 30px; text-align: center; color: #777;">لا يوجد مسير رواتب مسجل لهذا الشهر (<?php echo htmlspecialchars($selected_filter_month); ?>).</td></tr>
+                    <tr><td colspan="9" style="padding: 30px; text-align: center; color: #777;">لا يوجد مسير رواتب مسجل لهذا الشهر (<?php echo htmlspecialchars($selected_filter_month); ?>).</td></tr>
                 <?php endif; ?>
             </tbody>
         </table>
@@ -901,6 +1103,13 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
                 <label style="font-weight: bold; display: block; margin-bottom: 5px;">اختر شهر الاستحقاق:</label>
                 <input type="month" name="target_month" value="<?php echo date('Y-m'); ?>" required style="width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 15px;">
             </div>
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 5px;">نوع الراتب لكل موظفي هذا المسير:</label>
+                <select name="salary_type" style="width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="شهري">شهري (الراتب الأساسي كاملاً)</option>
+                    <option value="أسبوعي">أسبوعي (الراتب الأساسي ÷ 4)</option>
+                </select>
+            </div>
             <p style="font-size: 13px; color: #e74a3b; background: #fff3f3; padding: 10px; border-radius: 4px; line-height: 1.5;">
                 <b>محرك الرواتب:</b> يقوم النظام بحساب الصافي لكل موظف بعد خصم الأقساط والجزاءات وإضافة المكافآت، وإنشاء القيد المحاسبي المزدوج.
             </p>
@@ -908,6 +1117,95 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
         </form>
     </div>
 </div>
+
+<!-- 4-ب. نافذة صرف راتب لموظف واحد فقط -->
+<div id="singlePayrollModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; width: 450px; padding: 25px; border-radius: 8px;">
+        <h3 style="margin-top: 0; color: #1cc88a;">صرف راتب لموظف واحد فقط</h3>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="process_single_payroll" value="1">
+            <div style="margin-bottom: 12px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 5px;">الموظف:</label>
+                <select name="single_employee_id" required style="width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="">-- اختر الموظف --</option>
+                    <?php foreach ($employees_list as $emp_opt): ?>
+                        <option value="<?php echo $emp_opt['id']; ?>"><?php echo htmlspecialchars($emp_opt['full_name']); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 5px;">شهر الاستحقاق:</label>
+                <input type="month" name="single_target_month" value="<?php echo date('Y-m'); ?>" required style="width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="font-weight: bold; display: block; margin-bottom: 5px;">نوع الراتب:</label>
+                <select name="single_salary_type" id="single_salary_type_select" onchange="toggleWeekFields()" style="width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="شهري">شهري (الراتب الأساسي كاملاً)</option>
+                    <option value="أسبوعي">أسبوعي (سعر اليوم × عدد الأيام الفعلية)</option>
+                </select>
+            </div>
+            <div id="weekFieldsWrap" style="display: none; margin-bottom: 15px; background: #f8f9fc; padding: 12px; border-radius: 6px; border: 1px solid #e3e6f0;">
+                <label style="font-weight: bold; display: block; margin-bottom: 5px; font-size: 13px;">فترة الأسبوع الفعلية (من / إلى):</label>
+                <div style="display: flex; gap: 8px;">
+                    <input type="date" name="single_week_start" style="flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                    <input type="date" name="single_week_end" style="flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                </div>
+                <p style="font-size: 11.5px; color: #888; margin: 6px 0 0 0;">السعر اليومي = الراتب الأساسي ÷ 30، والمبلغ المستحق = السعر اليومي × عدد أيام هذه الفترة (شاملة اليومين). اتركهما فارغَين للرجوع لقسمة تقريبية على 4.</p>
+            </div>
+            <p style="font-size: 12.5px; color: #1a8f5f; background: #eafaf1; padding: 10px; border-radius: 4px; line-height: 1.5;">
+                يُنشئ (أو يُلحق بـ) مسير هذا الشهر لهذا الموظف فقط، دون التأثير على أي موظف آخر — مفيد لصرف راتب متأخر أو استثنائي بمعزل عن باقي الفريق.
+            </p>
+            <div style="text-align: left; margin-top: 10px;"><button type="button" onclick="closeModal('singlePayrollModal')" style="background: none; border: none; padding: 8px; cursor: pointer;">إلغاء</button><button type="submit" style="background: #1cc88a; color: white; border: none; padding: 9px 20px; border-radius: 4px; font-weight: bold;">صرف الراتب</button></div>
+        </form>
+    </div>
+</div>
+
+<script>
+    function toggleWeekFields() {
+        var sel = document.getElementById('single_salary_type_select');
+        document.getElementById('weekFieldsWrap').style.display = (sel.value === 'أسبوعي') ? 'block' : 'none';
+    }
+</script>
+
+<!-- 4-ج. نافذة تعديل راتب موظف مصروف بالفعل -->
+<div id="editPayrollDetailModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; width: 450px; padding: 25px; border-radius: 8px;">
+        <h3 style="margin-top: 0; color: #f6c23e;">تعديل راتب موظف</h3>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="edit_payroll_detail" value="1">
+            <input type="hidden" name="detail_id" id="epd_id">
+            <div id="epd_emp_name" style="font-weight: bold; color: #333; margin-bottom: 12px;"></div>
+            <div style="margin-bottom: 10px;">
+                <label>نوع الراتب:</label>
+                <select name="edit_salary_type" id="epd_salary_type" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option value="شهري">شهري</option>
+                    <option value="أسبوعي">أسبوعي</option>
+                </select>
+            </div>
+            <div style="margin-bottom: 10px;"><label>الراتب الأساسي:</label><input type="number" step="0.01" name="edit_base_salary" id="epd_base" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;"></div>
+            <div style="margin-bottom: 10px;"><label>خصم الأقساط:</label><input type="number" step="0.01" name="edit_deducted_advances" id="epd_adv" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;"></div>
+            <div style="margin-bottom: 10px;"><label>الجزاءات:</label><input type="number" step="0.01" name="edit_penalties" id="epd_pen" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;"></div>
+            <div style="margin-bottom: 15px;"><label>المكافآت:</label><input type="number" step="0.01" name="edit_bonuses" id="epd_bonus" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;"></div>
+            <p style="font-size: 12px; color: #856404; background: #fff3cd; padding: 10px; border-radius: 4px;">سيُعاد حساب القيد المحاسبي المُجمَّع لكل مسير هذا الشهر تلقائياً بعد الحفظ.</p>
+            <div style="text-align: left; margin-top: 10px;"><button type="button" onclick="closeModal('editPayrollDetailModal')" style="background: none; border: none; padding: 8px; cursor: pointer;">إلغاء</button><button type="submit" style="background: #f6c23e; color: white; border: none; padding: 9px 20px; border-radius: 4px; font-weight: bold;">حفظ التعديل</button></div>
+        </form>
+    </div>
+</div>
+
+<script>
+    function openEditPayrollDetailModal(det) {
+        document.getElementById('epd_id').value = det.id;
+        document.getElementById('epd_emp_name').innerText = det.emp_name;
+        document.getElementById('epd_salary_type').value = det.salary_type || 'شهري';
+        document.getElementById('epd_base').value = det.base_salary;
+        document.getElementById('epd_adv').value = det.deducted_advances;
+        document.getElementById('epd_pen').value = det.penalties;
+        document.getElementById('epd_bonus').value = det.bonuses;
+        document.getElementById('editPayrollDetailModal').style.display = 'flex';
+    }
+</script>
 
 <script>
     function switchTab(tabId) {

@@ -2,6 +2,7 @@
 session_start();
 include 'header.php';
 require_once __DIR__ . '/includes/system_helpers.php';
+require_once __DIR__ . '/functions.php';
 
 $as_of_date = $_GET['as_of_date'] ?? date('Y-m-d');
 $period_start = $_GET['period_start'] ?? date('Y-01-01');
@@ -99,6 +100,59 @@ $retained_data = $stmt_retained->fetch(PDO::FETCH_ASSOC);
 $retained_earnings = floatval($retained_data['rev']) - floatval($retained_data['exp']);
 $total_equity += $retained_earnings;
 
+// ============================================================
+// بطاقات سريعة إضافية: الصندوق الرئيسي، ذمم العملاء، ذمم الموردين (دولار وليرة)، مخزون المكتب
+// ============================================================
+$stmt_qcash = $conn->prepare("
+    SELECT COALESCE(SUM(j.debit) - SUM(j.credit), 0)
+    FROM journal_entries j JOIN accounts a ON j.account_id = a.id
+    WHERE a.account_name LIKE '%صندوق الرئيسي%' AND j.entry_date <= ?
+");
+$stmt_qcash->execute([$as_of_date]);
+$quick_cash = floatval($stmt_qcash->fetchColumn());
+
+$stmt_qar = $conn->prepare("
+    SELECT COALESCE(SUM(j.debit) - SUM(j.credit), 0)
+    FROM journal_entries j JOIN accounts a ON j.account_id = a.id
+    WHERE a.account_name LIKE '%ذمم العملاء%' AND j.entry_date <= ?
+");
+$stmt_qar->execute([$as_of_date]);
+$quick_ar = floatval($stmt_qar->fetchColumn());
+
+// ذمم الموردين بالليرة (العمود الأساسي debit/credit) وبالدولار (foreign_debit/foreign_credit إن وُجدا،
+// فهذه هي القيمة الحقيقية الأصلية التي رُحِّلت بها أغلب قيود الموردين في هذا النظام أساساً بالدولار)
+try {
+    $je_cols_fs = $conn->query("SHOW COLUMNS FROM journal_entries")->fetchAll(PDO::FETCH_COLUMN);
+    $has_foreign_cols = in_array('foreign_debit', $je_cols_fs) && in_array('foreign_credit', $je_cols_fs);
+} catch (Exception $e) { $has_foreign_cols = false; }
+
+$stmt_qap_syp = $conn->prepare("
+    SELECT COALESCE(SUM(j.credit) - SUM(j.debit), 0)
+    FROM journal_entries j JOIN accounts a ON j.account_id = a.id
+    WHERE a.account_name LIKE '%ذمم الموردين%' AND j.entry_date <= ?
+");
+$stmt_qap_syp->execute([$as_of_date]);
+$quick_ap_syp = floatval($stmt_qap_syp->fetchColumn());
+
+$quick_ap_usd = 0;
+if ($has_foreign_cols) {
+    $stmt_qap_usd = $conn->prepare("
+        SELECT COALESCE(SUM(j.foreign_credit) - SUM(j.foreign_debit), 0)
+        FROM journal_entries j JOIN accounts a ON j.account_id = a.id
+        WHERE a.account_name LIKE '%ذمم الموردين%' AND j.entry_date <= ?
+    ");
+    $stmt_qap_usd->execute([$as_of_date]);
+    $quick_ap_usd = floatval($stmt_qap_usd->fetchColumn());
+}
+
+// مخزون المكتب تحديداً (بلا مورد) — تقديري بسعر التكلفة الحالي، منفصل عن "المخزون" الإجمالي في
+// الميزانية العمومية (الذي يشمل بضاعة الموردين أيضاً ولا يمكن فصله من دفتر الأستاذ وحده)
+$stmt_office_inv = $conn->prepare("SELECT COALESCE(SUM(current_quantity * cost_price_usd), 0) FROM products WHERE supplier_id IS NULL");
+$stmt_office_inv->execute();
+$quick_office_inventory_usd = floatval($stmt_office_inv->fetchColumn());
+$exchange_rate_now = getExchangeRateForDate($conn, 'USD', $as_of_date);
+$quick_office_inventory_syp = $quick_office_inventory_usd * $exchange_rate_now;
+
 $total_liabilities_and_equity = $total_liabilities + $total_equity;
 $is_balanced = round($total_assets, 2) === round($total_liabilities_and_equity, 2);
 ?>
@@ -132,6 +186,30 @@ $is_balanced = round($total_assets, 2) === round($total_liabilities_and_equity, 
 </div>
 
 <div id="printArea">
+    <!-- بطاقات سريعة -->
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:15px; margin-bottom:20px;">
+        <div style="background:white; border-right:4px solid #1cc88a; padding:15px; border-radius:8px; box-shadow:0 0.1rem 0.75rem rgba(0,0,0,0.05);">
+            <div style="color:#888; font-size:12px; font-weight:bold;">الصندوق الرئيسي</div>
+            <div style="font-size:20px; font-weight:bold; color:#1cc88a; font-family:monospace; margin-top:5px;"><?php echo number_format($quick_cash, 2); ?> ل.س</div>
+        </div>
+        <div style="background:white; border-right:4px solid #4e73df; padding:15px; border-radius:8px; box-shadow:0 0.1rem 0.75rem rgba(0,0,0,0.05);">
+            <div style="color:#888; font-size:12px; font-weight:bold;">إجمالي ذمم العملاء</div>
+            <div style="font-size:20px; font-weight:bold; color:#4e73df; font-family:monospace; margin-top:5px;"><?php echo number_format($quick_ar, 2); ?> ل.س</div>
+        </div>
+        <div style="background:white; border-right:4px solid #e74a3b; padding:15px; border-radius:8px; box-shadow:0 0.1rem 0.75rem rgba(0,0,0,0.05);">
+            <div style="color:#888; font-size:12px; font-weight:bold;" title="بالليرة من الرصيد الأساسي، وبالدولار من القيمة الأجنبية الأصلية للقيود (إن وُجدت)">ذمم الموردين</div>
+            <div style="font-size:20px; font-weight:bold; color:#e74a3b; font-family:monospace; margin-top:5px;"><?php echo number_format($quick_ap_syp, 2); ?> ل.س</div>
+            <?php if ($has_foreign_cols): ?>
+                <div style="font-size:13px; color:#a33636; font-family:monospace; margin-top:3px;">≈ $<?php echo number_format($quick_ap_usd, 2); ?></div>
+            <?php endif; ?>
+        </div>
+        <div style="background:white; border-right:4px solid #8b5cf6; padding:15px; border-radius:8px; box-shadow:0 0.1rem 0.75rem rgba(0,0,0,0.05);">
+            <div style="color:#888; font-size:12px; font-weight:bold;" title="أصناف supplier_id فارغ فقط — جرد مكتبي مباشر بلا مورد، بسعر التكلفة الحالي. منفصل عن رقم المخزون الإجمالي في الميزانية (الذي يشمل بضاعة الموردين أيضاً)">مخزون المكتب (الجرد المباشر)</div>
+            <div style="font-size:20px; font-weight:bold; color:#8b5cf6; font-family:monospace; margin-top:5px;">$<?php echo number_format($quick_office_inventory_usd, 2); ?></div>
+            <div style="font-size:13px; color:#5b3a99; font-family:monospace; margin-top:3px;">≈ <?php echo number_format($quick_office_inventory_syp, 2); ?> ل.س</div>
+        </div>
+    </div>
+
     <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; align-items:start;">
 
         <!-- قائمة الدخل -->

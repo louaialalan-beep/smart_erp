@@ -191,8 +191,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['toggle_status']) && is
 // حساب مؤشرات لوحة القيادة (Dashboard Statistics)
 // قاعدة الترحيل الذكي: العمولات المستحقة تُحسب حصراً للفواتير التي تم تسليمها فعلياً (Delivered)
 // ملاحظة: نستخدم total_commissions (وهو العمود الفعلي في جدول sales الذي تكتبه صفحة الفواتير)
-$stmt_comm = $conn->prepare("SELECT COALESCE(SUM(total_commissions), 0) FROM sales WHERE representative_id = ? AND delivery_status = 'Delivered'");
-$stmt_comm->execute([$rep_id]);
+// تصحيح: يجب طرح العمولات المرتجعة (sales_returns.total_commission_reversed) من الإجمالي،
+// وإلا يبقى الرقم يعرض العمولة الإجمالية الأصلية حتى بعد إرجاع جزء أو كل الفاتورة.
+$stmt_comm = $conn->prepare("
+    SELECT COALESCE(SUM(s.total_commissions), 0) - COALESCE((
+        SELECT SUM(sr.total_commission_reversed)
+        FROM sales_returns sr
+        INNER JOIN sales s2 ON sr.sale_id = s2.id
+        WHERE s2.representative_id = ? AND s2.delivery_status = 'Delivered'
+    ), 0)
+    FROM sales s
+    WHERE s.representative_id = ? AND s.delivery_status = 'Delivered'
+");
+$stmt_comm->execute([$rep_id, $rep_id]);
 $total_earned_commissions = $stmt_comm->fetchColumn();
 
 // إجمالي الدفعات النقدية المسددة للمندوب
@@ -217,7 +228,15 @@ if (!empty($filter_delivery) && array_key_exists($filter_delivery, $delivery_lab
 if (!empty($filter_search)) { $sales_where[] = "(invoice_number LIKE ? OR customer_name LIKE ?)"; $sales_params[] = "%$filter_search%"; $sales_params[] = "%$filter_search%"; }
 
 // جلب فواتير المبيعات الخاصة بهذا المندوب (من نفس جدول ومخطط صفحة الفواتير)
-$stmt_sales = $conn->prepare("SELECT * FROM sales WHERE " . implode(' AND ', $sales_where) . " ORDER BY invoice_date DESC, id DESC");
+// تصحيح: نجلب أيضاً إجمالي العمولة المرتجعة لكل فاتورة (commission_reversed_total) لعرض صافي العمولة الفعلي بدل الإجمالي الخام
+$stmt_sales = $conn->prepare("
+    SELECT s.*, COALESCE((
+        SELECT SUM(sr.total_commission_reversed) FROM sales_returns sr WHERE sr.sale_id = s.id
+    ), 0) AS commission_reversed_total
+    FROM sales s
+    WHERE " . implode(' AND ', $sales_where) . "
+    ORDER BY s.invoice_date DESC, s.id DESC
+");
 $stmt_sales->execute($sales_params);
 $sales_list = $stmt_sales->fetchAll(PDO::FETCH_ASSOC);
 
@@ -230,6 +249,61 @@ if (!empty($filter_search)) { $pay_where[] = "notes LIKE ?"; $pay_params[] = "%$
 $stmt_payments_log = $conn->prepare("SELECT * FROM representative_payments WHERE " . implode(' AND ', $pay_where) . " ORDER BY payment_date DESC, id DESC");
 $stmt_payments_log->execute($pay_params);
 $payments_list = $stmt_payments_log->fetchAll(PDO::FETCH_ASSOC);
+
+// ============================================================
+// كشف حساب المندوب: قائمة زمنية موحّدة لكل الحركات (استحقاق عمولة / عكس عمولة بمرتجع / دفعة نقدية)
+// مع رصيد تراكمي. نجلب كل الحركات (بدون فلتر تاريخ) لحساب "الرصيد الافتتاحي" الصحيح لما قبل بداية
+// الفلتر، ثم نعرض فقط الحركات الواقعة ضمن الفلتر المُطبَّق أعلاه (نفس آلية كشوف الحساب البنكية).
+// ============================================================
+$stmt_ledger_earn = $conn->prepare("SELECT invoice_date AS event_date, id AS src_id, invoice_number AS ref, total_commissions AS amount FROM sales WHERE representative_id = ? AND delivery_status = 'Delivered' AND total_commissions > 0");
+$stmt_ledger_earn->execute([$rep_id]);
+$ledger_earn = $stmt_ledger_earn->fetchAll(PDO::FETCH_ASSOC);
+
+$stmt_ledger_rev = $conn->prepare("SELECT sr.return_date AS event_date, sr.id AS src_id, s.invoice_number AS ref, sr.total_commission_reversed AS amount FROM sales_returns sr INNER JOIN sales s ON sr.sale_id = s.id WHERE s.representative_id = ? AND sr.total_commission_reversed > 0");
+$stmt_ledger_rev->execute([$rep_id]);
+$ledger_rev = $stmt_ledger_rev->fetchAll(PDO::FETCH_ASSOC);
+
+$stmt_ledger_pay = $conn->prepare("SELECT payment_date AS event_date, id AS src_id, notes AS ref, amount_syp AS amount FROM representative_payments WHERE representative_id = ?");
+$stmt_ledger_pay->execute([$rep_id]);
+$ledger_pay = $stmt_ledger_pay->fetchAll(PDO::FETCH_ASSOC);
+
+$statement_entries = [];
+foreach ($ledger_earn as $r) {
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'earn', 'label' => 'استحقاق عمولة - فاتورة ' . $r['ref'], 'due' => floatval($r['amount']), 'settled' => 0];
+}
+foreach ($ledger_rev as $r) {
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'reversal', 'label' => 'عكس عمولة (مرتجع) - فاتورة ' . $r['ref'], 'due' => 0, 'settled' => floatval($r['amount'])];
+}
+foreach ($ledger_pay as $r) {
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'payment', 'label' => 'دفعة نقدية مسددة' . (!empty($r['ref']) ? ' - ' . $r['ref'] : ''), 'due' => 0, 'settled' => floatval($r['amount'])];
+}
+
+usort($statement_entries, function ($a, $b) {
+    $cmp = strcmp($a['date'], $b['date']);
+    if ($cmp !== 0) return $cmp;
+    return $a['src_id'] <=> $b['src_id'];
+});
+
+$statement_opening_balance = 0;
+$statement_rows = [];
+foreach ($statement_entries as $e) {
+    if (!empty($filter_start) && $e['date'] < $filter_start) {
+        $statement_opening_balance += $e['due'] - $e['settled'];
+        continue;
+    }
+    if (!empty($filter_end) && $e['date'] > $filter_end) {
+        continue;
+    }
+    $statement_rows[] = $e;
+}
+
+$statement_running_balance = $statement_opening_balance;
+foreach ($statement_rows as &$row) {
+    $statement_running_balance += $row['due'] - $row['settled'];
+    $row['balance'] = $statement_running_balance;
+}
+unset($row);
+$statement_closing_balance = $statement_running_balance;
 ?>
 
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -333,7 +407,7 @@ $payments_list = $stmt_payments_log->fetchAll(PDO::FETCH_ASSOC);
                             <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #4e73df;"><?php echo htmlspecialchars($sale['invoice_number']); ?></td>
                             <td style="padding: 12px 15px; font-weight: 600; color: #333;"><?php echo htmlspecialchars($sale['customer_name']); ?></td>
                             <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #2e59d9;"><?php echo number_format($sale['total_amount_syp'], 2); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #1cc88a;"><?php echo number_format($sale['total_commissions'], 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #1cc88a;"><?php echo number_format($sale['total_commissions'] - $sale['commission_reversed_total'], 2); ?></td>
                             <td style="padding: 12px 15px;">
                                 <?php echo htmlspecialchars($payment_labels[$sale['payment_status']] ?? $sale['payment_status']); ?>
                             </td>
@@ -414,7 +488,63 @@ $payments_list = $stmt_payments_log->fetchAll(PDO::FETCH_ASSOC);
     </div>
 </div>
 
-<!-- نافذة تسجيل دفعة نقدية (Modal) -->
+<!-- كشف حساب المندوب -->
+<div id="statement-print-area" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08); margin-bottom: 30px;">
+    <div style="background: #f8f9fc; padding: 15px 20px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #4e73df; display: flex; justify-content: space-between; align-items: center;">
+        <span><i class="fas fa-file-invoice"></i> كشف حساب المندوب<?php if (!empty($filter_start) || !empty($filter_end)): ?> (<?php echo htmlspecialchars($filter_start ?: 'البداية'); ?> إلى <?php echo htmlspecialchars($filter_end ?: 'اليوم'); ?>)<?php endif; ?></span>
+        <button onclick="window.print()" class="no-print" style="background: #4e73df; color: white; border: none; padding: 6px 16px; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 13px;">
+            <i class="fas fa-print"></i> طباعة الكشف
+        </button>
+    </div>
+    <div style="padding: 15px 20px; border-bottom: 1px solid #f1f1f1; font-weight: bold; color: #555;">
+        الرصيد الافتتاحي: <span style="font-family: monospace; color: #2e59d9;"><?php echo number_format($statement_opening_balance, 2); ?> ل.س</span>
+    </div>
+    <div style="overflow-x: auto;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
+            <thead>
+                <tr style="background: #fdfdfd; color: #555; border-bottom: 2px solid #e3e6f0;">
+                    <th style="padding: 12px 15px;">التاريخ</th>
+                    <th style="padding: 12px 15px;">البيان</th>
+                    <th style="padding: 12px 15px;">مستحق (+)</th>
+                    <th style="padding: 12px 15px;">مسدد/مرتجع (-)</th>
+                    <th style="padding: 12px 15px;">الرصيد التراكمي</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (count($statement_rows) > 0): ?>
+                    <?php foreach ($statement_rows as $row): ?>
+                        <tr style="border-bottom: 1px solid #f1f1f1;">
+                            <td style="padding: 10px 15px; font-family: monospace; color: #666;"><?php echo htmlspecialchars($row['date']); ?></td>
+                            <td style="padding: 10px 15px; color: #333;"><?php echo htmlspecialchars($row['label']); ?></td>
+                            <td style="padding: 10px 15px; font-family: monospace; color: #1cc88a;"><?php echo $row['due'] > 0 ? number_format($row['due'], 2) : '-'; ?></td>
+                            <td style="padding: 10px 15px; font-family: monospace; color: #e74a3b;"><?php echo $row['settled'] > 0 ? number_format($row['settled'], 2) : '-'; ?></td>
+                            <td style="padding: 10px 15px; font-family: monospace; font-weight: bold; color: #2e59d9;"><?php echo number_format($row['balance'], 2); ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php else: ?>
+                    <tr><td colspan="5" style="padding: 25px; text-align: center; color: #777;">لا توجد حركات ضمن الفترة المحددة.</td></tr>
+                <?php endif; ?>
+            </tbody>
+            <tfoot>
+                <tr style="background: #f8f9fc; border-top: 2px solid #e3e6f0;">
+                    <td colspan="4" style="padding: 12px 15px; font-weight: bold; color: #333; text-align: left;">الرصيد الختامي:</td>
+                    <td style="padding: 12px 15px; font-weight: bold; font-family: monospace; color: #2e59d9;"><?php echo number_format($statement_closing_balance, 2); ?> ل.س</td>
+                </tr>
+            </tfoot>
+        </table>
+    </div>
+</div>
+
+<style>
+@media print {
+    body * { visibility: hidden; }
+    #statement-print-area, #statement-print-area * { visibility: visible; }
+    #statement-print-area { position: absolute; left: 0; top: 0; width: 100%; box-shadow: none; border: none; }
+    #statement-print-area .no-print { display: none !important; }
+}
+</style>
+
+
 <div id="paymentModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1050; justify-content: center; align-items: center;">
     <div style="background: white; width: 450px; max-width: 95%; border-radius: 8px; padding: 25px; box-shadow: 0 5px 25px rgba(0,0,0,0.2);">
         <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e3e6f0; padding-bottom: 10px; margin-bottom: 15px;">

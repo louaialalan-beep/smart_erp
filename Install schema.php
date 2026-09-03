@@ -1,8 +1,13 @@
 <?php
 /**
- * أداة تثبيت شاملة لكل جداول النظام — Smart ERP
+ * أداة تثبيت شاملة لكل جداول النظام وشجرة الحسابات الأساسية — Smart ERP
  * تُنشئ كل جدول عبر CREATE TABLE IF NOT EXISTS: آمنة تماماً على قاعدة بيانات تحتوي بيانات فعلاً
  * (لن تحذف أو تُفرِّغ أي جدول موجود)، ومفيدة أيضاً لتثبيت النظام من الصفر على خادم جديد.
+ * تُعبِّئ أيضاً شجرة الحسابات الأساسية بالكود والنوع الصحيحين تلقائياً بعد إنشاء الجداول (بنفس منطق
+ * زر "إنشاء الحسابات الأساسية تلقائياً" في accounts.php)، فلا يبقى جدول accounts فارغاً بعد التثبيت.
+ * ملاحظة مهمة: هذا الملف يُعيد بناء البنية والشجرة الأساسية فقط — لا يستعيد أي بيانات فعلية (فواتير،
+ * قيود، أرصدة...). لاستعادة كاملة بلا فقدان بيانات بعد عطل أو تلف، استخدم النسخة الاحتياطية الحقيقية
+ * (زر "نسخة احتياطية" في advanced_features.php) بدل هذا الملف.
  * مستقلة عمداً عن header.php (لا تتطلب تسجيل دخول) لأنها قد تُشغَّل قبل وجود جدول users أصلاً.
  * يُنصَح بحذفها أو حماية الوصول إليها بعد الاستخدام الأول على خادم إنتاج فعلي.
  */
@@ -37,6 +42,7 @@ $schema = [
     account_name VARCHAR(150) NOT NULL,
     account_type ENUM('Asset','Liability','Equity','Revenue','Expense') NULL,
     parent_id INT NULL,
+    is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )",
 
@@ -176,6 +182,7 @@ $schema = [
     supplier_id INT NOT NULL,
     exchange_rate DECIMAL(15,4) DEFAULT 1,
     total_amount_usd DECIMAL(15,2) DEFAULT 0,
+    payment_status ENUM('Paid','Unpaid') NOT NULL DEFAULT 'Unpaid',
     invoice_date DATE NOT NULL,
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -420,6 +427,40 @@ $schema = [
 ];
 
 // ============================================================
+// شجرة الحسابات الأساسية — نفس القائمة الحرفية المستخدمة في accounts.php (زر "إنشاء الحسابات
+// الأساسية تلقائياً"). كانت هذه الشجرة تُعبَّأ فقط عبر تلك الصفحة كخطوة يدوية منفصلة بعد التثبيت؛
+// أُدرجت هنا أيضاً حتى يُعيد هذا الملف بناء الشجرة بكودها ونوعها الصحيحين تلقائياً ضمن خطوة واحدة،
+// بدل ترك جدول accounts فارغاً وتعريض النظام لنفس مشكلة "الحسابات المُنشأة تلقائياً بلا نوع أو كود"
+// عند أول عملية بيع/شراء تُشغَّل بعد التثبيت مباشرة.
+$account_seed_list = [
+    ['name' => 'الصندوق الرئيسي',              'type' => 'Asset',     'code' => '1111'],
+    ['name' => 'ذمم العملاء',                   'type' => 'Asset',     'code' => '1121'],
+    ['name' => 'سلف الموظفين',                  'type' => 'Asset',     'code' => '1131'],
+    ['name' => 'المخزون',                       'type' => 'Asset',     'code' => '1141'],
+    ['name' => 'إيرادات مؤجلة',                  'type' => 'Liability', 'code' => '2141'],
+    ['name' => 'إيرادات المبيعات',              'type' => 'Revenue',   'code' => '4111'],
+    ['name' => 'عمولات المندوبين المستحقة',     'type' => 'Liability', 'code' => '2111'],
+    ['name' => 'ذمم الموردين',                  'type' => 'Liability', 'code' => '2121'],
+    ['name' => 'مصروفات مستحقة الدفع',          'type' => 'Liability', 'code' => '2131'],
+    ['name' => 'الرواتب والأجور',                'type' => 'Expense',   'code' => '5111'],
+    ['name' => 'مصروف حوافز ومكافآت الموظفين',   'type' => 'Expense',   'code' => '5112'],
+    ['name' => 'جزاءات وخصومات الموظفين',        'type' => 'Revenue',   'code' => '4121'],
+    ['name' => 'تكلفة البضائع المباعة (COGS)',  'type' => 'Expense',   'code' => '5121'],
+    ['name' => 'مصروف عمولات المندوبين',        'type' => 'Expense',   'code' => '5131'],
+];
+
+function installGetNextAvailableCode($conn, $preferred_code) {
+    $code = $preferred_code;
+    $stmt = $conn->prepare("SELECT COUNT(*) FROM accounts WHERE account_code = ?");
+    for ($i = 0; $i < 50; $i++) {
+        $stmt->execute([$code]);
+        if ($stmt->fetchColumn() == 0) { return $code; }
+        $code = (string)(intval($code) + 1);
+    }
+    return $preferred_code . '-' . substr(uniqid(), -4);
+}
+
+// ============================================================
 // التنفيذ: إنشاء كل جدول، مع تسجيل النتيجة لكل واحد على حدة
 // ============================================================
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['run_install'])) {
@@ -433,6 +474,35 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['run_install'])) {
         }
     }
     $msg = "تم تنفيذ فحص/إنشاء " . count($schema) . " جدولاً.";
+
+    // تعبئة/إكمال شجرة الحسابات الأساسية تلقائياً — بنفس منطق زر "إنشاء الحسابات الأساسية تلقائياً"
+    // في accounts.php حرفياً، حتى لا يبقى جدول accounts فارغاً بعد هذا التثبيت.
+    $accounts_created = 0; $accounts_completed = 0; $accounts_skipped = 0;
+    try {
+        foreach ($account_seed_list as $item) {
+            $stmt_find = $conn->prepare("SELECT id, account_code, account_type FROM accounts WHERE account_name = ? LIMIT 1");
+            $stmt_find->execute([$item['name']]);
+            $existing = $stmt_find->fetch(PDO::FETCH_ASSOC);
+
+            if ($existing) {
+                if (empty($existing['account_code']) || empty($existing['account_type'])) {
+                    $code = !empty($existing['account_code']) ? $existing['account_code'] : installGetNextAvailableCode($conn, $item['code']);
+                    $type = !empty($existing['account_type']) ? $existing['account_type'] : $item['type'];
+                    $conn->prepare("UPDATE accounts SET account_code = ?, account_type = ? WHERE id = ?")->execute([$code, $type, $existing['id']]);
+                    $accounts_completed++;
+                } else {
+                    $accounts_skipped++;
+                }
+            } else {
+                $code = installGetNextAvailableCode($conn, $item['code']);
+                $conn->prepare("INSERT INTO accounts (account_code, account_name, account_type) VALUES (?, ?, ?)")->execute([$code, $item['name'], $item['type']]);
+                $accounts_created++;
+            }
+        }
+        $msg .= " كما تمت تعبئة شجرة الحسابات: إنشاء {$accounts_created} حساب جديد، إكمال {$accounts_completed} حساب ناقص، وتخطي {$accounts_skipped} حساب مكتمل مسبقاً.";
+    } catch (Exception $e) {
+        $msg .= " (تعذّرت تعبئة شجرة الحسابات: " . htmlspecialchars($e->getMessage()) . " — يمكن تشغيلها يدوياً لاحقاً من صفحة شجرة الحسابات)";
+    }
 }
 ?>
 <!DOCTYPE html>
@@ -456,10 +526,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['run_install'])) {
 </head>
 <body>
 <div class="container">
-    <h2>🛠 تثبيت شامل لكل جداول النظام (<?php echo count($schema); ?> جدولاً)</h2>
+    <h2>🛠 تثبيت شامل لكل جداول النظام وشجرة الحسابات (<?php echo count($schema); ?> جدولاً + <?php echo count($account_seed_list); ?> حساباً أساسياً)</h2>
     <div class="warn">
         ⚠ هذه الأداة <strong>آمنة على البيانات الموجودة</strong> — تستخدم <code>CREATE TABLE IF NOT EXISTS</code>
-        فلا تحذف ولا تُفرِّغ أي جدول موجود فعلاً بأي بيانات. تُنشئ فقط الجداول <strong>الغائبة</strong>.
+        فلا تحذف ولا تُفرِّغ أي جدول موجود فعلاً بأي بيانات، وتُكمل فقط الحسابات الأساسية الناقصة (بلا كود
+        أو نوع) دون تكرارها إن كانت موجودة ومكتملة أصلاً. تُنشئ فقط الجداول والحسابات <strong>الغائبة</strong>.
+        <br>هذا الملف يُعيد <strong>البنية والشجرة الأساسية فقط</strong> — لا يستعيد أي بيانات (فواتير، قيود،
+        أرصدة). للاستعادة الكاملة بلا فقدان بيانات، استخدم زر "نسخة احتياطية" في الميزات المتقدمة بدل هذا الملف.
         يُنصَح بحذف هذا الملف من الخادم بعد الاستخدام الأول.
     </div>
 
@@ -483,6 +556,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['run_install'])) {
         <p>سيتم فحص/إنشاء الجداول التالية:</p>
         <ul style="columns: 3; font-size: 13px; font-family: monospace; color: #555;">
             <?php foreach (array_keys($schema) as $t): ?><li><?php echo htmlspecialchars($t); ?></li><?php endforeach; ?>
+        </ul>
+        <p>وتعبئة/إكمال شجرة الحسابات الأساسية التالية (بكودها ونوعها الصحيحين):</p>
+        <ul style="columns: 3; font-size: 13px; color: #555;">
+            <?php foreach ($account_seed_list as $acc): ?><li><?php echo htmlspecialchars($acc['code'] . ' - ' . $acc['name']); ?></li><?php endforeach; ?>
         </ul>
         <form method="POST">
             <input type="hidden" name="run_install" value="1">

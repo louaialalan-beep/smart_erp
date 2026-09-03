@@ -24,6 +24,14 @@ $conn->exec("CREATE TABLE IF NOT EXISTS purchase_invoice_items (
     unit_cost_usd DECIMAL(15,4) NOT NULL,
     total_cost_usd DECIMAL(15,2) NOT NULL
 )");
+
+// حقل حالة الدفع (نقداً/آجل) لفاتورة الشراء — يُضاف بأثر رجعي لأي تثبيت سابق للجدول لا يحتوي عليه بعد
+try {
+    $pi_cols = $conn->query("SHOW COLUMNS FROM purchase_invoices")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('payment_status', $pi_cols)) {
+        $conn->exec("ALTER TABLE purchase_invoices ADD COLUMN payment_status ENUM('Paid','Unpaid') NOT NULL DEFAULT 'Unpaid'");
+    }
+} catch (Exception $e) { /* يُتجاهل إن تعذّر (صلاحيات محدودة) */ }
 $conn->exec("CREATE TABLE IF NOT EXISTS purchase_returns (
     id INT AUTO_INCREMENT PRIMARY KEY,
     purchase_invoice_id INT NOT NULL,
@@ -68,6 +76,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_purchase'])) {
     $exchange_rate = floatval($_POST['exchange_rate']);
     $invoice_date = $_POST['invoice_date'];
     $notes = trim($_POST['notes']);
+    $payment_status = trim($_POST['payment_status'] ?? 'Unpaid');
+    if (!in_array($payment_status, ['Paid', 'Unpaid'])) { $payment_status = 'Unpaid'; }
     $product_ids = $_POST['product_id'] ?? [];
     $quantities = $_POST['quantity'] ?? [];
     $unit_costs = $_POST['unit_cost_usd'] ?? [];
@@ -92,8 +102,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_purchase'])) {
                 }
             }
 
-            $stmt = $conn->prepare("INSERT INTO purchase_invoices (invoice_number, supplier_id, exchange_rate, total_amount_usd, invoice_date, notes) VALUES (?, ?, ?, ?, ?, ?)");
-            $stmt->execute([$invoice_number, $supplier_id, $exchange_rate, $total_usd, $invoice_date, $notes]);
+            $stmt = $conn->prepare("INSERT INTO purchase_invoices (invoice_number, supplier_id, exchange_rate, total_amount_usd, invoice_date, notes, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$invoice_number, $supplier_id, $exchange_rate, $total_usd, $invoice_date, $notes, $payment_status]);
             $purchase_id = $conn->lastInsertId();
 
             foreach ($items as $it) {
@@ -110,13 +120,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_purchase'])) {
             $stmt_sup->execute([$supplier_id]);
             $supplier_name = $stmt_sup->fetchColumn() ?: "مورد #$supplier_id";
 
-            // قيد مزدوج: مدين المخزون (أصل) / دائن ذمم الموردين (التزام) — بالدولار
+            // قيد مزدوج: مدين المخزون (أصل) / دائن — حسب حالة الدفع: الصندوق إن كانت نقداً، أو ذمم الموردين إن كانت آجلاً
             $entry_num = "JE-PUR-" . $purchase_id;
-            $desc = "فاتورة شراء رقم $invoice_number من المورد: $supplier_name";
+            $desc = "فاتورة شراء رقم $invoice_number من المورد: $supplier_name" . ($payment_status === 'Paid' ? " (نقداً)" : " (آجل)");
             $base_amount = $total_usd * $exchange_rate;
 
             $debit_account_id = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون');
-            $credit_account_id = findOrCreateAccount($conn, ['ذمم', 'مورد', 'payable'], 'ذمم الموردين');
+            $credit_account_id = ($payment_status === 'Paid')
+                ? findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي')
+                : findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
 
             if ($debit_account_id && $credit_account_id) {
                 insertJournalLine($conn, $debit_account_id, $base_amount, 0, $entry_num, $invoice_date, $desc, 'Purchase', 'USD', $exchange_rate, $total_usd, 0);
@@ -145,12 +157,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
     $invoice_date = $_POST['invoice_date'];
     $notes = trim($_POST['notes']);
     $item_ids = $_POST['edit_item_id'] ?? [];
+    $new_product_ids = $_POST['edit_product_id'] ?? [];
     $new_quantities = $_POST['edit_quantity'] ?? [];
     $new_costs = $_POST['edit_unit_cost_usd'] ?? [];
 
     $stmt_check = $conn->prepare("SELECT * FROM purchase_invoices WHERE id = ?");
     $stmt_check->execute([$purchase_id]);
     $purchase = $stmt_check->fetch(PDO::FETCH_ASSOC);
+
+    $payment_status = trim($_POST['payment_status'] ?? ($purchase['payment_status'] ?? 'Unpaid'));
+    if (!in_array($payment_status, ['Paid', 'Unpaid'])) { $payment_status = $purchase['payment_status'] ?? 'Unpaid'; }
 
     if (!$purchase) {
         $error = "فاتورة الشراء غير موجودة.";
@@ -177,12 +193,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
                 $old_item = $stmt_old_item->fetch(PDO::FETCH_ASSOC);
                 if (!$old_item) { continue; }
 
-                $qty_delta = $new_qty - floatval($old_item['quantity']);
-                $stock_adjustments[$old_item['product_id']] = ($stock_adjustments[$old_item['product_id']] ?? 0) + $qty_delta;
+                // تصحيح: يمكن الآن تغيير الصنف نفسه لكل سطر، وليس فقط الكمية/التكلفة. عند تغيير الصنف،
+                // يُطرَح الأثر الكامل عن المنتج القديم ويُضاف الأثر الجديد على المنتج الجديد بشكل منفصل
+                // (فيتحيّد الفرق تلقائياً بالجمع لو بقي نفس المنتج، أو يُوزَّع بشكل صحيح لو تغيّر).
+                $new_product_id = intval($new_product_ids[$i] ?? $old_item['product_id']);
+                if ($new_product_id <= 0) { $new_product_id = intval($old_item['product_id']); }
+
+                $stock_adjustments[intval($old_item['product_id'])] = ($stock_adjustments[intval($old_item['product_id'])] ?? 0) - floatval($old_item['quantity']);
+                $stock_adjustments[$new_product_id] = ($stock_adjustments[$new_product_id] ?? 0) + $new_qty;
 
                 $new_line_total = $new_qty * $new_cost;
                 $new_total_usd += $new_line_total;
-                $updated_items[] = ['id' => $item_id, 'product_id' => $old_item['product_id'], 'qty' => $new_qty, 'cost' => $new_cost, 'total' => $new_line_total];
+                $updated_items[] = ['id' => $item_id, 'product_id' => $new_product_id, 'qty' => $new_qty, 'cost' => $new_cost, 'total' => $new_line_total];
             }
 
             // التحقق أن أي تخفيض في الكمية لن يُنقص المخزون الحالي تحت الصفر (أي أن جزءاً من الكمية بيع بالفعل)
@@ -197,10 +219,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
                 }
             }
 
-            // تطبيق التعديلات: تحديث سطور الفاتورة + المخزون + التكلفة الحالية
+            // تطبيق التعديلات: تحديث سطور الفاتورة (بما فيها الصنف نفسه إن تغيّر) + المخزون + التكلفة الحالية
             foreach ($updated_items as $it) {
-                $conn->prepare("UPDATE purchase_invoice_items SET quantity = ?, unit_cost_usd = ?, total_cost_usd = ? WHERE id = ?")
-                     ->execute([$it['qty'], $it['cost'], $it['total'], $it['id']]);
+                $conn->prepare("UPDATE purchase_invoice_items SET product_id = ?, quantity = ?, unit_cost_usd = ?, total_cost_usd = ? WHERE id = ?")
+                     ->execute([$it['product_id'], $it['qty'], $it['cost'], $it['total'], $it['id']]);
             }
             foreach ($stock_adjustments as $pid => $delta) {
                 if ($delta != 0) {
@@ -213,8 +235,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
                 $conn->prepare("UPDATE products SET cost_price_usd = ? WHERE id = ?")->execute([$it['cost'], $it['product_id']]);
             }
 
-            $conn->prepare("UPDATE purchase_invoices SET invoice_number = ?, exchange_rate = ?, total_amount_usd = ?, invoice_date = ?, notes = ? WHERE id = ?")
-                 ->execute([$invoice_number, $exchange_rate, $new_total_usd, $invoice_date, $notes, $purchase_id]);
+            $conn->prepare("UPDATE purchase_invoices SET invoice_number = ?, exchange_rate = ?, total_amount_usd = ?, invoice_date = ?, notes = ?, payment_status = ? WHERE id = ?")
+                 ->execute([$invoice_number, $exchange_rate, $new_total_usd, $invoice_date, $notes, $payment_status, $purchase_id]);
 
             // القيد المحاسبي: عكس القيد الأصلي بالكامل + ترحيل قيد جديد صحيح بالقيمة المُحدَّثة
             $stmt_sup = $conn->prepare("SELECT supplier_name FROM suppliers WHERE id = ?");
@@ -222,22 +244,45 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
             $supplier_name = $stmt_sup->fetchColumn() ?: "مورد #" . $purchase['supplier_id'];
 
             $original_entry_num = "JE-PUR-" . $purchase_id;
+
+            // نجلب آخر قيد "نشط" لهذه الفاتورة (الأصلي، أو آخر قيد تصحيحي CORR إن وُجد نتيجة تعديل سابق)
+            // وليس القيد الأصلي دائماً — لتفادي عكس نفس القيد الأصلي أكثر من مرة عند تعديل الفاتورة
+            // أكثر من مرة، وهو ما كان يُنتج قيود عكس مكرَّرة (duplicate -REV-) على نفس الفاتورة، وقد يعكس
+            // حساباً خاطئاً كلياً (صندوق/ذمم موردين) إن تغيّرت حالة الدفع بين تعديلين متتاليين.
+            $stmt_active = $conn->prepare(
+                "SELECT entry_number FROM journal_entries
+                 WHERE entry_number = ? OR entry_number LIKE ?
+                 ORDER BY id DESC LIMIT 1"
+            );
+            $stmt_active->execute([$original_entry_num, $original_entry_num . "-CORR-%"]);
+            $active_entry_num = $stmt_active->fetchColumn() ?: $original_entry_num;
+
             $stmt_je = $conn->prepare("SELECT account_id, debit, credit FROM journal_entries WHERE entry_number = ?");
-            $stmt_je->execute([$original_entry_num]);
+            $stmt_je->execute([$active_entry_num]);
             $je_lines = $stmt_je->fetchAll(PDO::FETCH_ASSOC);
 
             if (count($je_lines) > 0) {
                 $today = date('Y-m-d');
                 $rev_entry_num = $original_entry_num . "-REV-" . time();
                 $new_entry_num = $original_entry_num . "-CORR-" . time();
-                $rev_desc = "عكس تلقائي لفاتورة شراء معدَّلة (الأصل: $original_entry_num) من المورد: $supplier_name";
-                $new_desc = "فاتورة شراء رقم $invoice_number معدَّلة من المورد: $supplier_name";
+                $rev_desc = "عكس تلقائي لفاتورة شراء معدَّلة (عكس القيد: $active_entry_num) من المورد: $supplier_name";
+                $new_desc = "فاتورة شراء رقم $invoice_number معدَّلة من المورد: $supplier_name" . ($payment_status === 'Paid' ? " (نقداً)" : " (آجل)");
                 $new_base_amount = $new_total_usd * $exchange_rate;
 
+                // تصحيح: لا نُعيد استخدام حساب الطرف الدائن للقيد الأصلي تلقائياً — إن تغيّرت حالة الدفع
+                // (نقداً/آجل) عند التعديل، يجب أن يُرحَّل القيد الجديد على الحساب الصحيح الحالي (الصندوق
+                // أو ذمم الموردين)، وليس بالضرورة نفس حساب القيد القديم. المدين (المخزون) لا يتغيّر أبداً.
+                $new_debit_account_id = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون');
+                $new_credit_account_id = ($payment_status === 'Paid')
+                    ? findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي')
+                    : findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
+
                 foreach ($je_lines as $line) {
+                    // العكس يستخدم حساب القيد الأصلي بالضبط (لتصفيره تماماً كما كان)
                     insertJournalLine($conn, $line['account_id'], floatval($line['credit']), floatval($line['debit']), $rev_entry_num, $today, $rev_desc, 'Purchase Reversal', 'USD', $exchange_rate);
                     $is_debit_line = floatval($line['debit']) > 0;
-                    insertJournalLine($conn, $line['account_id'], $is_debit_line ? $new_base_amount : 0, $is_debit_line ? 0 : $new_base_amount, $new_entry_num, $invoice_date, $new_desc, 'Purchase', 'USD', $exchange_rate, $is_debit_line ? $new_total_usd : 0, $is_debit_line ? 0 : $new_total_usd);
+                    $target_account_id = $is_debit_line ? $new_debit_account_id : $new_credit_account_id;
+                    insertJournalLine($conn, $target_account_id, $is_debit_line ? $new_base_amount : 0, $is_debit_line ? 0 : $new_base_amount, $new_entry_num, $invoice_date, $new_desc, 'Purchase', 'USD', $exchange_rate, $is_debit_line ? $new_total_usd : 0, $is_debit_line ? 0 : $new_total_usd);
                 }
             }
 
@@ -382,14 +427,19 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_purchase_return'])
             $stmt_sup->execute([$purchase['supplier_id']]);
             $supplier_name = $stmt_sup->fetchColumn() ?: "مورد #" . $purchase['supplier_id'];
 
-            // القيد المحاسبي: عكس جزئي لأثر الشراء الأصلي — مدين ذمم الموردين (يُخفِّض الالتزام تجاهه)
-            // / دائن المخزون (يُخفِّض قيمة الأصل، لأن البضاعة خرجت فعلياً وعادت للمورد)
-            $debit_account_id = findOrCreateAccount($conn, ['ذمم', 'مورد', 'payable'], 'ذمم الموردين');
+            // القيد المحاسبي: عكس جزئي لأثر الشراء الأصلي — دائن المخزون (يُخفِّض قيمة الأصل، لأن البضاعة
+            // خرجت فعلياً وعادت للمورد) دائماً. الطرف المدين يعتمد على حالة الفاتورة الأصلية (نفس المبدأ
+            // المعتمد في مرتجعات المبيعات بـ sales.php): إن كانت الفاتورة "آجل"، فالمرتجع يُخفِّض الالتزام
+            // (ذمم الموردين). إن كانت "نقداً"، فلا يوجد التزام لنخفِّضه أصلاً — المرتجع يُعيد نقداً للصندوق.
+            $original_was_paid = ($purchase['payment_status'] ?? 'Unpaid') === 'Paid';
+            $debit_account_id = $original_was_paid
+                ? findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي')
+                : findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
             $credit_account_id = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون');
 
             if ($debit_account_id && $credit_account_id) {
                 $entry_num = "JE-PURRET-" . $return_id;
-                $desc = "مرتجع للمورد على فاتورة شراء رقم: " . $purchase['invoice_number'] . " (" . $supplier_name . ")" . (!empty($ret_notes) ? " - $ret_notes" : "");
+                $desc = "مرتجع للمورد على فاتورة شراء رقم: " . $purchase['invoice_number'] . " (" . $supplier_name . ")" . ($original_was_paid ? " - استرداد نقدي" : "") . (!empty($ret_notes) ? " - $ret_notes" : "");
                 $base_amount = $total_return_usd * floatval($purchase['exchange_rate']);
 
                 insertJournalLine($conn, $debit_account_id, $base_amount, 0, $entry_num, $return_date, $desc, 'Purchase Return', 'USD', $purchase['exchange_rate'], $total_return_usd, 0);
@@ -406,7 +456,28 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_purchase_return'])
     }
 }
 
-$purchases_list = $conn->query("SELECT p.*, s.supplier_name FROM purchase_invoices p LEFT JOIN suppliers s ON p.supplier_id = s.id ORDER BY p.id DESC")->fetchAll(PDO::FETCH_ASSOC);
+// ============================================================
+// فلاتر قائمة فواتير الشراء: فواتير اليوم / تاريخ محدد / قابلة للإرجاع فقط
+// ============================================================
+$pf_date_filter = $_GET['pf_date_filter'] ?? 'all';
+if (!in_array($pf_date_filter, ['today', 'specific'])) { $pf_date_filter = 'all'; }
+$pf_specific_date = $_GET['pf_specific_date'] ?? date('Y-m-d');
+$pf_returnable_only = isset($_GET['pf_returnable']) && $_GET['pf_returnable'] === '1';
+
+$pf_where = [];
+$pf_params = [];
+if ($pf_date_filter === 'today') {
+    $pf_where[] = "p.invoice_date = ?";
+    $pf_params[] = date('Y-m-d');
+} elseif ($pf_date_filter === 'specific') {
+    $pf_where[] = "p.invoice_date = ?";
+    $pf_params[] = $pf_specific_date;
+}
+$pf_where_sql = count($pf_where) > 0 ? ('WHERE ' . implode(' AND ', $pf_where)) : '';
+
+$stmt_purchases_list = $conn->prepare("SELECT p.*, s.supplier_name FROM purchase_invoices p LEFT JOIN suppliers s ON p.supplier_id = s.id {$pf_where_sql} ORDER BY p.id DESC");
+$stmt_purchases_list->execute($pf_params);
+$purchases_list = $stmt_purchases_list->fetchAll(PDO::FETCH_ASSOC);
 $suppliers_list = $conn->query("SELECT * FROM suppliers ORDER BY supplier_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 $products_list = $conn->query("SELECT * FROM products ORDER BY product_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 $default_rate = getExchangeRateForDate($conn, 'USD', date('Y-m-d'));
@@ -424,6 +495,18 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
     $row['returnable'] = min(floatval($row['quantity']) - floatval($row['already_returned']), floatval($row['product_current_qty']));
     $items_by_purchase[$row['purchase_invoice_id']][] = $row;
 }
+
+// تطبيق فلتر "قابلة للإرجاع فقط" — يعتمد على نفس بيانات returnable المحسوبة أعلاه لكل صنف،
+// فاتورة تُعتبر قابلة للإرجاع إن كان لصنف واحد فيها على الأقل رصيد قابل للإرجاع أكبر من صفر.
+if ($pf_returnable_only) {
+    $purchases_list = array_values(array_filter($purchases_list, function ($inv) use ($items_by_purchase) {
+        $items = $items_by_purchase[$inv['id']] ?? [];
+        foreach ($items as $it) {
+            if (floatval($it['returnable']) > 0) { return true; }
+        }
+        return false;
+    }));
+}
 ?>
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
     <div>
@@ -436,12 +519,37 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
 <?php if ($msg): ?><div style="background:#d4edda; color:#155724; padding:12px; border-radius:6px; margin-bottom:15px;"><?php echo htmlspecialchars($msg); ?></div><?php endif; ?>
 <?php if ($error): ?><div style="background:#f8d7da; color:#721c24; padding:12px; border-radius:6px; margin-bottom:15px;"><?php echo htmlspecialchars($error); ?></div><?php endif; ?>
 
+<!-- شريط فلاتر فواتير الشراء -->
+<div style="background:#fff; border:1px solid #e3e6f0; border-radius:8px; padding:15px 20px; margin-bottom:15px;">
+    <form method="GET" action="" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <label style="font-size:13px; font-weight:bold; color:#555;"><i class="fas fa-filter"></i> فلترة:</label>
+        <a href="?pf_date_filter=all<?php echo $pf_returnable_only ? '&pf_returnable=1' : ''; ?>" style="text-decoration:none;">
+            <span style="padding:7px 14px; border-radius:5px; font-size:13px; font-weight:bold; background:<?php echo $pf_date_filter === 'all' ? '#4e73df' : '#f1f3f9'; ?>; color:<?php echo $pf_date_filter === 'all' ? '#fff' : '#4e73df'; ?>;">كل الفواتير</span>
+        </a>
+        <a href="?pf_date_filter=today<?php echo $pf_returnable_only ? '&pf_returnable=1' : ''; ?>" style="text-decoration:none;">
+            <span style="padding:7px 14px; border-radius:5px; font-size:13px; font-weight:bold; background:<?php echo $pf_date_filter === 'today' ? '#4e73df' : '#f1f3f9'; ?>; color:<?php echo $pf_date_filter === 'today' ? '#fff' : '#4e73df'; ?>;">فواتير اليوم</span>
+        </a>
+        <input type="hidden" name="pf_date_filter" value="specific">
+        <?php if ($pf_returnable_only): ?><input type="hidden" name="pf_returnable" value="1"><?php endif; ?>
+        <input type="date" name="pf_specific_date" value="<?php echo $pf_date_filter === 'specific' ? htmlspecialchars($pf_specific_date) : ''; ?>" style="padding:6px; border:1px solid #ccc; border-radius:4px; font-family:monospace; font-size:13px;">
+        <button type="submit" style="background:#6f42c1; color:white; border:none; padding:6px 14px; border-radius:5px; cursor:pointer; font-size:12.5px; font-weight:bold;">تطبيق تاريخ محدد</button>
+        <span style="width:1px; height:24px; background:#e3e6f0;"></span>
+        <a href="?pf_date_filter=<?php echo $pf_date_filter; ?><?php echo $pf_date_filter === 'specific' ? '&pf_specific_date=' . htmlspecialchars($pf_specific_date) : ''; ?>&pf_returnable=<?php echo $pf_returnable_only ? '0' : '1'; ?>" style="text-decoration:none;">
+            <span style="padding:7px 14px; border-radius:5px; font-size:13px; font-weight:bold; background:<?php echo $pf_returnable_only ? '#e74a3b' : '#f1f3f9'; ?>; color:<?php echo $pf_returnable_only ? '#fff' : '#e74a3b'; ?>;"><i class="fas fa-rotate-left"></i> قابلة للإرجاع فقط</span>
+        </a>
+        <?php if ($pf_date_filter !== 'all' || $pf_returnable_only): ?>
+            <a href="?" style="font-size:12.5px; color:#e74a3b; text-decoration:none;"><i class="fas fa-times"></i> إلغاء الفلاتر</a>
+        <?php endif; ?>
+        <span style="font-size:12.5px; color:#888; margin-right:auto;">النتائج: <strong style="color:#4e73df;"><?php echo count($purchases_list); ?></strong> فاتورة</span>
+    </form>
+</div>
+
 <div style="background:white; border:1px solid #e3e6f0; border-radius:8px; overflow:hidden;">
     <table style="width:100%; border-collapse:collapse; font-size:14px; text-align:right;">
         <thead>
             <tr style="background:#f8f9fc; color:#4e73df; border-bottom:2px solid #e3e6f0;">
                 <th style="padding:10px 15px;">رقم الفاتورة</th><th style="padding:10px 15px;">المورد</th>
-                <th style="padding:10px 15px;">القيمة (USD)</th><th style="padding:10px 15px;">سعر الصرف</th><th style="padding:10px 15px;">التاريخ</th>
+                <th style="padding:10px 15px;">القيمة (USD)</th><th style="padding:10px 15px;">سعر الصرف</th><th style="padding:10px 15px;">التاريخ</th><th style="padding:10px 15px;">حالة الدفع</th>
                 <th style="padding:10px 15px; text-align:center;">الإجراءات</th>
             </tr>
         </thead>
@@ -460,6 +568,13 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
                     <td style="padding:10px 15px; font-family:monospace; color:#e74a3b; font-weight:bold;">$<?php echo number_format($p['total_amount_usd'], 2); ?></td>
                     <td style="padding:10px 15px; font-family:monospace;"><?php echo number_format($p['exchange_rate'], 2); ?></td>
                     <td style="padding:10px 15px; font-family:monospace; color:#666;"><?php echo htmlspecialchars($p['invoice_date']); ?></td>
+                    <td style="padding:10px 15px;">
+                        <?php if (($p['payment_status'] ?? 'Unpaid') === 'Paid'): ?>
+                            <span style="background:#d4edda; color:#155724; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:bold;">نقداً</span>
+                        <?php else: ?>
+                            <span style="background:#fff3cd; color:#856404; padding:3px 10px; border-radius:12px; font-size:12px; font-weight:bold;">آجل</span>
+                        <?php endif; ?>
+                    </td>
                     <td style="padding:10px 15px; text-align:center; white-space:nowrap;">
                         <button onclick='openEditPurchaseModal(<?php echo json_encode($p, JSON_HEX_APOS | JSON_HEX_QUOT); ?>, <?php echo json_encode($p_items, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)' style="background:#f6c23e; color:white; border:none; padding:5px 10px; border-radius:4px; cursor:pointer; font-size:12px; font-weight:bold;">
                             <i class="fas fa-edit"></i> تعديل
@@ -484,7 +599,7 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
                     </td>
                 </tr>
             <?php endforeach; else: ?>
-                <tr><td colspan="6" style="padding:25px; text-align:center; color:#777;">لا توجد فواتير شراء مسجلة بعد.</td></tr>
+                <tr><td colspan="7" style="padding:25px; text-align:center; color:#777;"><?php echo ($pf_date_filter !== 'all' || $pf_returnable_only) ? 'لا توجد فواتير مطابقة للفلاتر المحددة.' : 'لا توجد فواتير شراء مسجلة بعد.'; ?></td></tr>
             <?php endif; ?>
         </tbody>
     </table>
@@ -508,6 +623,13 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
                 <div><label>سعر الصرف:</label><input type="number" step="0.0001" name="exchange_rate" value="<?php echo htmlspecialchars($default_rate); ?>" required style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;"></div>
                 <div><label>تاريخ الفاتورة:</label><input type="date" name="invoice_date" value="<?php echo date('Y-m-d'); ?>" required style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;"></div>
+            </div>
+            <div style="margin-bottom:12px;">
+                <label>حالة الدفع:</label>
+                <div style="display:flex; gap:18px; padding:8px 0;">
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="payment_status" value="Unpaid" checked> آجل (ذمة له - مستحق للمورد)</label>
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="payment_status" value="Paid"> نقداً (من الصندوق)</label>
+                </div>
             </div>
             <h4 style="color:#4e73df;">الأصناف</h4>
             <div id="itemsContainer">
@@ -546,17 +668,29 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
         document.getElementById('edit_exchange_rate').value = purchase.exchange_rate;
         document.getElementById('edit_invoice_date').value = purchase.invoice_date;
         document.getElementById('edit_notes').value = purchase.notes || '';
+        document.getElementById('edit_payment_status_paid').checked = (purchase.payment_status === 'Paid');
+        document.getElementById('edit_payment_status_unpaid').checked = (purchase.payment_status !== 'Paid');
 
         var tbody = document.getElementById('editItemsBody');
         tbody.innerHTML = '';
         items.forEach(function (it) {
             var tr = document.createElement('tr');
-            tr.innerHTML =
-                '<td style="padding:8px;">' + (it.product_name || '') + '</td>' +
+            var productTd = document.createElement('td');
+            productTd.style.padding = '8px';
+            var sourceSelect = document.querySelector('#itemsContainer .pur-row select[name="product_id[]"]');
+            var select = sourceSelect ? sourceSelect.cloneNode(true) : document.createElement('select');
+            select.name = 'edit_product_id[]';
+            select.required = true;
+            select.style.cssText = 'width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;';
+            select.value = String(it.product_id);
+            productTd.appendChild(select);
+            tr.appendChild(productTd);
+            tr.insertAdjacentHTML('beforeend',
                 '<td style="padding:8px;"><input type="hidden" name="edit_item_id[]" value="' + it.id + '">' +
                 '<input type="number" step="0.0001" min="0.0001" name="edit_quantity[]" value="' + it.quantity + '" required style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;"></td>' +
                 '<td style="padding:8px;"><input type="number" step="0.0001" min="0" name="edit_unit_cost_usd[]" value="' + it.unit_cost_usd + '" required style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;"></td>' +
-                '<td style="padding:8px; font-family:monospace; color:#666;">' + it.product_current_qty + '</td>';
+                '<td style="padding:8px; font-family:monospace; color:#666;">' + it.product_current_qty + '</td>'
+            );
             tbody.appendChild(tr);
         });
         document.getElementById('editPurchaseModal').style.display = 'flex';
@@ -606,6 +740,13 @@ foreach ($stmt_all_pi_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
                 <div><label>سعر الصرف:</label><input type="number" step="0.0001" name="exchange_rate" id="edit_exchange_rate" required style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;"></div>
             </div>
             <div style="margin-bottom:12px;"><label>تاريخ الفاتورة:</label><input type="date" name="invoice_date" id="edit_invoice_date" required style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;"></div>
+            <div style="margin-bottom:15px;">
+                <label>حالة الدفع:</label>
+                <div style="display:flex; gap:18px; padding:8px 0;">
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="payment_status" id="edit_payment_status_unpaid" value="Unpaid"> آجل (ذمة له - مستحق للمورد)</label>
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="payment_status" id="edit_payment_status_paid" value="Paid"> نقداً (من الصندوق)</label>
+                </div>
+            </div>
 
             <h4 style="color:#4e73df;">الأصناف (الكمية والتكلفة قابلتان للتعديل)</h4>
             <table style="width:100%; border-collapse:collapse; font-size:13px; text-align:right; margin-bottom:15px;">

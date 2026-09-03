@@ -21,6 +21,15 @@ $total_supplier_payables_syp = 0;
 $expenses_breakdown = [];
 $error_msg = '';
 
+// فحص/ترحيل دفاعي لعمود حالة الدفع في فواتير الشراء (مطابق لنفس الفحص في Purchases.php وsupplier_view.php)
+// ضروري هنا لأن استعلام ذمم الموردين أدناه يشترط هذا العمود مباشرة في جملة WHERE.
+try {
+    $pi_cols_chk = $conn->query("SHOW COLUMNS FROM purchase_invoices")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('payment_status', $pi_cols_chk)) {
+        $conn->exec("ALTER TABLE purchase_invoices ADD COLUMN payment_status ENUM('Paid','Unpaid') NOT NULL DEFAULT 'Unpaid'");
+    }
+} catch (Exception $e) { /* يُتجاهل إن تعذّر (مثلاً الجدول نفسه غير موجود بعد) */ }
+
 // 2. إعداد الفلاتر الزمنية (يومي، أسبوعي، شهري، مخصص)
 $filter_type = $_GET['filter_type'] ?? 'monthly';
 $start_date  = $_GET['start_date'] ?? date('Y-m-01');
@@ -39,18 +48,28 @@ if ($filter_type == 'daily') {
 
 // 3. استخراج البيانات من البنية الفعلية للجداول (مطابقة لـ sales.php وexpenses.php وsupplier_view.php)
 try {
+    // ضمان وجود عمود تاريخ التسليم الفعلي (نفس العمود المُستخدَم في sales.php)
+    $sales_cols_chk_frx = $conn->query("SHOW COLUMNS FROM sales")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('delivered_at', $sales_cols_chk_frx)) {
+        $conn->exec("ALTER TABLE sales ADD COLUMN delivered_at DATE NULL");
+    }
+
     // أ) إجمالي الإيرادات: فقط الفواتير المسلَّمة فعلياً (نفس قاعدة الترحيل الذكي المعتمدة في كامل النظام)
     // تصحيح: خصم قيمة أي مرتجع حدث على هذه الفواتير — وإلا يبقى الإيراد المعروض هنا أعلى من الإيراد
     // الحقيقي المُسجَّل في القيود (والذي يُخفَّض فعلياً بقيد عكسي عند كل مرتجع في sales.php)
+    // تصحيح إضافي جوهري: التصفية الآن بـ delivered_at (تاريخ التسليم الفعلي — لحظة تحويل الحالة
+    // فعلياً) بدل invoice_date (تاريخ إصدار الفاتورة الأصلي) — وإلا فاتورة صدرت الشهر الماضي "قيد
+    // الانتظار" ثم أُكِّد تسليمها اليوم لن تظهر في تقرير اليوم إطلاقاً رغم أن الإيراد اعتُرِف به اليوم
+    // فعلياً. الفواتير القديمة قبل هذا التصحيح (delivered_at فارغة) تعود احتياطياً لـ invoice_date.
     $stmt_rev = $conn->prepare("
         SELECT COALESCE(SUM(s.total_amount_syp), 0) - COALESCE((
             SELECT SUM(sr.total_amount_syp)
             FROM sales_returns sr
             JOIN sales s2 ON sr.sale_id = s2.id
-            WHERE s2.delivery_status = 'Delivered' AND s2.invoice_date BETWEEN ? AND ?
+            WHERE s2.delivery_status = 'Delivered' AND COALESCE(s2.delivered_at, s2.invoice_date) BETWEEN ? AND ?
         ), 0) AS net_revenue
         FROM sales s
-        WHERE s.delivery_status = 'Delivered' AND s.invoice_date BETWEEN ? AND ?
+        WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
     ");
     $stmt_rev->execute([$start_date, $end_date, $start_date, $end_date]);
     $total_revenue = floatval($stmt_rev->fetchColumn());
@@ -79,7 +98,7 @@ try {
         FROM sale_items si
         JOIN sales s ON si.sale_id = s.id
         JOIN products p ON si.product_id = p.id
-        WHERE s.delivery_status = 'Delivered' AND s.invoice_date BETWEEN ? AND ?
+        WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
     ");
     $stmt_cogs->execute([$start_date, $end_date]);
     $cogs_data = $stmt_cogs->fetch(PDO::FETCH_ASSOC);
@@ -93,10 +112,10 @@ try {
             SELECT SUM(sr.total_commission_reversed)
             FROM sales_returns sr
             JOIN sales s2 ON sr.sale_id = s2.id
-            WHERE s2.delivery_status = 'Delivered' AND s2.invoice_date BETWEEN ? AND ?
+            WHERE s2.delivery_status = 'Delivered' AND COALESCE(s2.delivered_at, s2.invoice_date) BETWEEN ? AND ?
         ), 0) AS net_commissions
         FROM sales s
-        WHERE s.delivery_status = 'Delivered' AND s.invoice_date BETWEEN ? AND ?
+        WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
     ");
     $stmt_comm->execute([$start_date, $end_date, $start_date, $end_date]);
     $total_commissions = floatval($stmt_comm->fetchColumn());
@@ -110,17 +129,48 @@ try {
     $stmt_exp_details->execute([$start_date, $end_date]);
     $expenses_breakdown = $stmt_exp_details->fetchAll(PDO::FETCH_ASSOC);
 
+    // ج-2) تكلفة الشحن: بند مستقل ضمن "العمولات والمصاريف" — يُحسب من كل فواتير المبيعات ضمن الفترة
+    // بغض النظر عن حالة تسليمها (يُرحَّل محاسبياً فور إصدار الفاتورة في sales.php، وليس عند التسليم).
+    try {
+        $sales_cols_chk_fr = $conn->query("SHOW COLUMNS FROM sales")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('shipping_cost_syp', $sales_cols_chk_fr)) {
+            $conn->exec("ALTER TABLE sales ADD COLUMN shipping_cost_syp DECIMAL(15,2) DEFAULT 0");
+        }
+    } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+    $stmt_ship = $conn->prepare("SELECT COALESCE(SUM(shipping_cost_syp), 0) FROM sales WHERE invoice_date BETWEEN ? AND ?");
+    $stmt_ship->execute([$start_date, $end_date]);
+    $total_shipping = floatval($stmt_ship->fetchColumn());
+
     // هـ) صافي الربح الحقيقي
-    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses);
+    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses + $total_shipping);
 
     // و) ذمم الموردين والخصوم: لا يوجد رصيد مخزَّن، يُحسب لحظياً بنفس منطق supplier_view.php
     // (إجمالي المشتريات - إجمالي المدفوعات - المردودات/الخصومات)، وهو رصيد إجمالي حالي غير مرتبط
     // بفترة التقرير الزمنية لأنه التزام قائم لحظة عرض التقرير.
+    // تصحيح: تمت مواءمة هذا الاستعلام مع منطق supplier_view.php تماماً بعد نقطتين كانتا ناقصتين هنا:
+    // 1) المشتريات كانت تُحسب فقط من products.purchased_quantity * cost_price_usd (قيمة حالية متغيرة
+    //    مع كل عملية شراء لاحقة)، بدل الاعتماد على purchase_invoice_items (القيمة الفعلية وقت كل فاتورة)
+    //    مع احتساب الفارق القديم غير المُغطَّى بفواتير فقط كرصيد تكميلي (نفس أسلوب supplier_view.php).
+    // 2) مرتجعات المشتريات الفعلية (جدول purchase_returns) لم تكن تُطرَح إطلاقاً من الذمة.
+    // 3) فواتير "نقداً" وأي مرتجع عليها مُستبعدان الآن من هذا الحساب بالكامل — لا يُضافان للذمة
+    //    ولا يُطرَحان منها، لأنهما لا يُنشئان أي التزام تجاه المورد أصلاً (استرداد نقدي مباشر).
     $stmt_sup = $conn->query("
         SELECT COALESCE(SUM(
-            (SELECT COALESCE(SUM(p.purchased_quantity * p.cost_price_usd), 0) FROM products p WHERE p.supplier_id = s.id)
+            (SELECT COALESCE(SUM(pii.total_cost_usd), 0)
+                FROM purchase_invoice_items pii
+                INNER JOIN purchase_invoices pi ON pii.purchase_invoice_id = pi.id
+                WHERE pi.supplier_id = s.id AND pi.payment_status != 'Paid')
+            + (SELECT COALESCE(SUM(
+                    GREATEST(0, p.purchased_quantity - COALESCE((SELECT SUM(pii2.quantity) FROM purchase_invoice_items pii2 WHERE pii2.product_id = p.id), 0))
+                    * p.cost_price_usd
+                ), 0)
+                FROM products p WHERE p.supplier_id = s.id)
             - (SELECT COALESCE(SUM(sp.amount_usd), 0) FROM supplier_payments sp WHERE sp.supplier_id = s.id)
             - COALESCE(s.returns_discounts, 0)
+            - (SELECT COALESCE(SUM(pr.total_amount_usd), 0)
+                FROM purchase_returns pr
+                INNER JOIN purchase_invoices pi2 ON pr.purchase_invoice_id = pi2.id
+                WHERE pi2.supplier_id = s.id AND pi2.payment_status != 'Paid')
         ), 0) AS total_payables_usd
         FROM suppliers s
     ");
@@ -202,8 +252,8 @@ try {
 
     <div style="background: white; padding: 20px; border-radius: 8px; border-right: 4px solid #f6c23e; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
         <span style="color: #6c757d; font-size: 13px; font-weight: bold;"><i class="fas fa-handshake"></i> العمولات والمصاريف</span>
-        <h3 style="color: #f6c23e; margin: 8px 0 0; font-family: monospace; font-size: 22px;"><?php echo number_format($total_commissions + $total_expenses, 2); ?> <span style="font-size: 12px;">ل.س</span></h3>
-        <span style="font-size: 11px; color: #888;">(عمولات: <?php echo number_format($total_commissions, 0); ?> | مصاريف: <?php echo number_format($total_expenses, 0); ?>)</span>
+        <h3 style="color: #f6c23e; margin: 8px 0 0; font-family: monospace; font-size: 22px;"><?php echo number_format($total_commissions + $total_expenses + $total_shipping, 2); ?> <span style="font-size: 12px;">ل.س</span></h3>
+        <span style="font-size: 11px; color: #888;">(عمولات: <?php echo number_format($total_commissions, 0); ?> | مصاريف: <?php echo number_format($total_expenses, 0); ?> | شحن: <?php echo number_format($total_shipping, 0); ?>)</span>
     </div>
 
     <div style="background: white; padding: 20px; border-radius: 8px; border-right: 4px solid #1cc88a; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">

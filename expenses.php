@@ -85,6 +85,57 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_expense'])) {
     } else { $error = "يرجى تعبئة الحقول الأساسية ومبلغ أكبر من الصفر."; }
 }
 
+// 1-ب. معالجة تعديل مصروف فوري موجود — لم تكن هذه الميزة موجودة إطلاقاً سابقاً (إضافة/حذف فقط).
+// يعكس القيد القديم بالكامل ويعيد ترحيله بالقيم الجديدة، بنفس مبدأ عدم تعديل القيود المرحَّلة مباشرة.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_expense'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $expense_id = intval($_POST['expense_id']);
+    $category = trim($_POST['category']);
+    $amount = floatval($_POST['amount']);
+    $cost_center = trim($_POST['cost_center']);
+    $expense_date = $_POST['expense_date'];
+    $notes = trim($_POST['notes']);
+
+    $stmt_old_exp = $conn->prepare("SELECT * FROM operational_expenses WHERE id = ?");
+    $stmt_old_exp->execute([$expense_id]);
+    $old_exp = $stmt_old_exp->fetch(PDO::FETCH_ASSOC);
+
+    if (!$old_exp) {
+        $error = "المصروف غير موجود.";
+    } elseif (empty($category) || $amount <= 0) {
+        $error = "يرجى تعبئة الحقول الأساسية ومبلغ أكبر من الصفر.";
+    } elseif (isDateInClosedPeriod($conn, $old_exp['expense_date']) || isDateInClosedPeriod($conn, $expense_date)) {
+        $error = getPeriodLockErrorMessage($expense_date);
+    } else {
+        try {
+            $conn->beginTransaction();
+
+            $conn->prepare("UPDATE operational_expenses SET category = ?, amount = ?, cost_center = ?, expense_date = ?, notes = ? WHERE id = ?")
+                 ->execute([$category, $amount, $cost_center, $expense_date, $notes, $expense_id]);
+
+            // عكس القيد القديم بالكامل (بنفس رقمه) وإعادة ترحيله بالقيم الجديدة
+            $entry_num = "JE-EXP-" . $expense_id;
+            $conn->prepare("DELETE FROM journal_entries WHERE entry_number = ?")->execute([$entry_num]);
+
+            $desc = "مصروف تشغيلي: $category" . (!empty($cost_center) ? " (مركز التكلفة: $cost_center)" : "") . " (مُعدَّل)";
+            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category);
+            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+
+            if ($debit_account_id && $credit_account_id) {
+                insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
+                insertJournalLine($conn, $credit_account_id, 0, $amount, $entry_num, $expense_date, $desc, 'Operational Expense');
+            }
+
+            $conn->commit();
+            $msg = "تم تحديث المصروف والقيد المحاسبي المرتبط به بنجاح!";
+            logAudit($conn, 'UPDATE', 'المصاريف التشغيلية', "تعديل مصروف #$expense_id: $category بقيمة " . number_format($amount, 2) . " ل.س", $expense_id);
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ: " . $e->getMessage();
+        }
+    }
+}
+
 // 2. إضافة قالب مصروف متكرر (إيجار شهري، رواتب شهرية...) يُستخدم لاحقاً في توليد الاستحقاق اليومي
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_template'])) {
     $t_name = trim($_POST['t_name']);
@@ -288,6 +339,7 @@ try {
                 <th style="padding: 12px 15px;">المبلغ (ل.س)</th>
                 <th style="padding: 12px 15px;">مركز التكلفة</th>
                 <th style="padding: 12px 15px;">ملاحظات</th>
+                <th style="padding: 12px 15px; text-align: center;">الإجراءات</th>
             </tr>
         </thead>
         <tbody>
@@ -298,13 +350,72 @@ try {
                     <td style="padding: 12px 15px; font-family: monospace; font-weight: bold; color: #e74a3b;"><?php echo number_format($exp['amount'], 2); ?> ل.س</td>
                     <td style="padding: 12px 15px; color: #4e73df; font-weight: 500;"><?php echo htmlspecialchars($exp['cost_center'] ?: 'عام'); ?></td>
                     <td style="padding: 12px 15px; color: #777;"><?php echo htmlspecialchars($exp['notes'] ?: '-'); ?></td>
+                    <td style="padding: 12px 15px; text-align: center;">
+                        <button onclick='openEditExpModal(<?php echo json_encode($exp, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)' style="background: #f6c23e; color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">
+                            <i class="fas fa-edit"></i> تعديل
+                        </button>
+                    </td>
                 </tr>
             <?php endforeach; else: ?>
-                <tr><td colspan="5" style="padding: 25px; text-align: center; color: #777;">لا توجد مصاريف مسجلة.</td></tr>
+                <tr><td colspan="6" style="padding: 25px; text-align: center; color: #777;">لا توجد مصاريف مسجلة.</td></tr>
             <?php endif; ?>
         </tbody>
     </table>
 </div>
+
+<!-- Modal: تعديل مصروف تشغيلي -->
+<div id="editExpModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; width: 450px; max-width: 95%; padding: 25px; border-radius: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #f6c23e;"><i class="fas fa-edit"></i> تعديل مصروف تشغيلي</h3>
+            <button onclick="closeEditExpModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="edit_expense" value="1">
+            <input type="hidden" name="expense_id" id="edit_exp_id">
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">بند المصروف:</label>
+                <input type="text" name="category" id="edit_exp_category" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">المبلغ (ل.س):</label>
+                <input type="number" step="0.01" min="0.01" name="amount" id="edit_exp_amount" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">مركز التكلفة:</label>
+                <input type="text" name="cost_center" id="edit_exp_cost_center" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">تاريخ المصروف:</label>
+                <input type="date" name="expense_date" id="edit_exp_date" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">ملاحظات:</label>
+                <textarea name="notes" id="edit_exp_notes" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; height: 55px;"></textarea>
+            </div>
+            <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px;">
+                <button type="button" onclick="closeEditExpModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
+                <button type="submit" style="background: #f6c23e; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">تحديث المصروف</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+    function openEditExpModal(exp) {
+        document.getElementById('edit_exp_id').value = exp.id;
+        document.getElementById('edit_exp_category').value = exp.category;
+        document.getElementById('edit_exp_amount').value = exp.amount;
+        document.getElementById('edit_exp_cost_center').value = exp.cost_center || '';
+        document.getElementById('edit_exp_date').value = exp.expense_date;
+        document.getElementById('edit_exp_notes').value = exp.notes || '';
+        document.getElementById('editExpModal').style.display = 'flex';
+    }
+    function closeEditExpModal() {
+        document.getElementById('editExpModal').style.display = 'none';
+    }
+</script>
 
 <!-- Modal: تسجيل مصروف فوري (نقدي) -->
 <div id="expModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">

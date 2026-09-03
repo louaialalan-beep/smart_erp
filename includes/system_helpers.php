@@ -215,7 +215,23 @@ if (!function_exists('recognizeSaleRevenue')) {
         if ($check->fetchColumn() > 0) return; // مُعترَف به بالفعل — لا تكرار
 
         $today = date('Y-m-d');
-        $revenue_id = findOrCreateAccount($conn, ['مبيعات', 'إيراد', 'revenue', 'sales'], 'إيرادات المبيعات');
+
+        // تصحيح: تُسجَّل الآن تاريخ التسليم الفعلي (لحظة تأكيد التسليم، وليس تاريخ إصدار الفاتورة الأصلي)
+        // في عمود مستقل، حتى تعتمد عليه التقارير/الإحصائيات المبنية على "متى سُلِّمت البضاعة فعلياً" —
+        // القيود المحاسبية نفسها كانت تُرحَّل بتاريخ اليوم أصلاً (لا تغيير هناك)، لكن لم يكن هناك عمود
+        // مخزَّن يعكس هذا التاريخ على مستوى الفاتورة نفسها لأغراض التقارير والفلاتر.
+        try {
+            $sales_cols_rsr = $conn->query("SHOW COLUMNS FROM sales")->fetchAll(PDO::FETCH_COLUMN);
+            if (!in_array('delivered_at', $sales_cols_rsr)) {
+                $conn->exec("ALTER TABLE sales ADD COLUMN delivered_at DATE NULL");
+            }
+        } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+        $conn->prepare("UPDATE sales SET delivered_at = ? WHERE id = ?")->execute([$today, $sale_id]);
+
+        // تصحيح: الكلمة المفتاحية 'إيراد' (بلا "ات") كانت تُطابق أيضاً "إيرادات مؤجلة" كسلسلة فرعية
+        // (كلاهما يبدأ بـ"إيرادات")، فيرجع revenue_id لنفس حساب deferred_id عند وجود الأخير بمعرّف أصغر
+        // — ما يجعل كلا طرفي قيد الاعتراف بالإيراد يُرحَّلان لنفس الحساب فتتحيّد قيمتهما لصفر.
+        $revenue_id = findOrCreateAccount($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات');
         $deferred_id = findOrCreateAccount($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة');
 
         // إعادة تصنيف: إن كانت الفاتورة أُصدِرت أصلاً كـ"مؤجلة"، حوِّل مبلغها من التزام (إيراد مؤجل)
@@ -273,6 +289,11 @@ if (!function_exists('deferSaleRevenue')) {
         $stmt->execute([$sale_id]);
         $sale = $stmt->fetch(PDO::FETCH_ASSOC);
         if (!$sale) return;
+
+        // إلغاء تاريخ التسليم الفعلي المسجَّل — لم تعد الفاتورة "مُسلَّمة" فعلياً
+        try {
+            $conn->exec("UPDATE sales SET delivered_at = NULL WHERE id = " . intval($sale_id));
+        } catch (Exception $e) { /* يُتجاهل إن كان العمود غير موجود بعد لأي سبب */ }
 
         $today = date('Y-m-d');
         foreach (['-COGS', '-COMM', '-RECLASS'] as $suffix) {
