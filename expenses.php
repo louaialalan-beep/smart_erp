@@ -67,8 +67,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_expense'])) {
             // هذا مصروف مدفوع نقداً فوراً: مدين المصروف / دائن الصندوق
             $entry_num = "JE-EXP-" . $expense_id;
             $desc = "مصروف تشغيلي: $category" . (!empty($cost_center) ? " (مركز التكلفة: $cost_center)" : "");
-            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category);
-            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category, 'Expense');
+            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
             if ($debit_account_id && $credit_account_id) {
                 insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
@@ -118,8 +118,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_expense'])) {
             $conn->prepare("DELETE FROM journal_entries WHERE entry_number = ?")->execute([$entry_num]);
 
             $desc = "مصروف تشغيلي: $category" . (!empty($cost_center) ? " (مركز التكلفة: $cost_center)" : "") . " (مُعدَّل)";
-            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category);
-            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category, 'Expense');
+            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
             if ($debit_account_id && $credit_account_id) {
                 insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
@@ -205,8 +205,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && (isset($_POST['accrue_one']) || isse
             $expense_id = $conn->lastInsertId();
 
             $entry_num = "JE-ACCR-" . $expense_id;
-            $debit_account_id  = findOrCreateAccount($conn, [$tpl['category'], 'مصروفات تشغيلية'], $tpl['category']);
-            $credit_account_id = findOrCreateAccount($conn, ['مصروفات مستحقة', 'ذمم دائنة', 'accrued'], 'مصروفات مستحقة الدفع');
+            $debit_account_id  = findOrCreateAccount($conn, [$tpl['category'], 'مصروفات تشغيلية'], $tpl['category'], 'Expense');
+            $credit_account_id = findOrCreateAccount($conn, ['مصروفات مستحقة', 'ذمم دائنة', 'accrued'], 'مصروفات مستحقة الدفع', 'Liability');
 
             if ($debit_account_id && $credit_account_id) {
                 insertJournalLine($conn, $debit_account_id, $daily_amount, 0, $entry_num, $accrual_date, $note, 'Expense Accrual');

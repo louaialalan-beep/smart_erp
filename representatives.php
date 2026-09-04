@@ -43,9 +43,23 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_representative']))
 // تصحيح: total_commissions (وليس total_commission) هو العمود الفعلي في جدول sales
 // وقيمة delivery_status المخزنة هي 'Delivered' (بحرف D كبير حسب تعريف ENUM الفعلي في القاعدة)
 // وليست 'delivered' بأحرف صغيرة كما كان سابقاً، ما كان يجعل النتيجة صفراً دائماً.
+// تصحيح جوهري: كان هذا العمود يعرض SUM(total_commissions) الخام فقط — إجمالي كل عمولة كُسِبت
+// تاريخياً — بينما يوحي اسمه "المستحقة" بأنه المتبقي غير المدفوع. الملف التفصيلي (representative_profile.php)
+// يطرح منها العمولات المعكوسة بسبب المرتجعات (sales_returns.total_commission_reversed) والدفعات
+// المسددة فعلياً (representative_payments) — والآن هذه القائمة تستخدم نفس المعادلة بالضبط، فلا يظهر
+// رقم متضخم لمندوب سُدِّدت عمولاته بالفعل (نفس الإصلاح المطبَّق سابقاً بين suppliers.php وsupplier_view.php).
 $stmt = $conn->query("SELECT r.*, 
     (SELECT COUNT(s.id) FROM sales s WHERE s.representative_id = r.id) as total_sales_count,
-    (SELECT COALESCE(SUM(s.total_commissions), 0) FROM sales s WHERE s.representative_id = r.id AND s.delivery_status = 'Delivered') as total_commissions
+    (
+        COALESCE((SELECT SUM(s.total_commissions) FROM sales s WHERE s.representative_id = r.id AND s.delivery_status = 'Delivered'), 0)
+        - COALESCE((
+            SELECT SUM(sr.total_commission_reversed)
+            FROM sales_returns sr
+            INNER JOIN sales s2 ON sr.sale_id = s2.id
+            WHERE s2.representative_id = r.id AND s2.delivery_status = 'Delivered'
+        ), 0)
+        - COALESCE((SELECT SUM(rp.amount_syp) FROM representative_payments rp WHERE rp.representative_id = r.id), 0)
+    ) as total_commissions
     FROM representatives r ORDER BY r.id DESC");
 $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
 ?>

@@ -154,7 +154,10 @@ $exchange_rate_now = getExchangeRateForDate($conn, 'USD', $as_of_date);
 $quick_office_inventory_syp = $quick_office_inventory_usd * $exchange_rate_now;
 
 $total_liabilities_and_equity = $total_liabilities + $total_equity;
-$is_balanced = round($total_assets, 2) === round($total_liabilities_and_equity, 2);
+// مقارنة بالتسامح (tolerance) بدل === الصارمة على أرقام عائمة (float): جمع عشرات/مئات القيود
+// عبر SUM() قد ينتج فروقاً دقيقة جداً (أجزاء من القرش) بسبب دقة تمثيل الفاصلة العائمة، فتُظهر ===
+// "عدم توازن" زوراً حتى لو كانت الميزانية متوازنة فعلياً لآخر قرش. 0.01 = أقل من نصف قرش سوري.
+$is_balanced = abs($total_assets - $total_liabilities_and_equity) < 0.01;
 ?>
 <style>
     @media print {

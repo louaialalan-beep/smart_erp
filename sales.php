@@ -61,7 +61,7 @@ $delivery_labels = ['Delivered' => 'تم التسليم', 'Pending' => 'قيد �
 // 1. دالة عامة للبحث عن حساب محاسبي مطابق لكلمات مفتاحية محددة (صندوق / ذمم / إيرادات...)
 //    أو إنشائه تلقائياً إن لم يوجد، لضمان توفر حسابَين منفصلَين لطرفي القيد المزدوج (مدين/دائن)
 //    ومنع دمجهما في حساب واحد كما كان يحدث سابقاً (وهو ما كان يُسبب غياب طرف الدائن بالكامل).
-function findAccountId($conn, array $keywords, string $fallback_name) {
+function findAccountId($conn, array $keywords, string $fallback_name, ?string $account_type = null) {
     try {
         // معرفة أعمدة جدول accounts ديناميكياً
         $stmt_cols = $conn->query("SHOW COLUMNS FROM accounts");
@@ -83,13 +83,25 @@ function findAccountId($conn, array $keywords, string $fallback_name) {
             $stmt->execute($params);
             $acc_id = $stmt->fetchColumn();
             if ($acc_id) {
+                // تصحيح جوهري: نفس خلل account_type المكتشَف في findOrCreateAccount — حساب أُنشئ سابقاً
+                // بلا نوع محدَّد كان يختفي بصمت من قائمة الدخل/الميزانية العمومية رغم قيوده الصحيحة.
+                // نُصحِّحه الآن فور العثور عليه إن كان بلا نوع.
+                if ($account_type && in_array('account_type', $cols)) {
+                    $conn->prepare("UPDATE accounts SET account_type = ? WHERE id = ? AND (account_type IS NULL OR account_type = '')")
+                         ->execute([$account_type, $acc_id]);
+                }
                 return $acc_id;
             }
         }
 
         // إن لم يوجد: إنشاء الحساب تلقائياً بالاسم الاحتياطي المُمرَّر (منعاً لخطأ Foreign Key 1452)
         $target_col = $name_col ?: ($cols[1] ?? 'name');
-        $conn->exec("INSERT INTO accounts (`{$target_col}`) VALUES (" . $conn->quote($fallback_name) . ")");
+        if ($account_type && in_array('account_type', $cols)) {
+            $stmt_ins = $conn->prepare("INSERT INTO accounts (`{$target_col}`, account_type) VALUES (?, ?)");
+            $stmt_ins->execute([$fallback_name, $account_type]);
+        } else {
+            $conn->exec("INSERT INTO accounts (`{$target_col}`) VALUES (" . $conn->quote($fallback_name) . ")");
+        }
         return $conn->lastInsertId();
 
     } catch (Exception $e) {
@@ -224,9 +236,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
 
             // طرف المدين: نقدية (الصندوق) إن كانت الفاتورة مدفوعة فوراً، أو ذمم عملاء إن كانت آجلة/جزئية
             if ($payment_status === 'Paid') {
-                $debit_account_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                $debit_account_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
             } else {
-                $debit_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء');
+                $debit_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
             }
 
             // === إصلاح معماري جوهري: توقيت الاعتراف بالإيراد ===
@@ -236,9 +248,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
             //   ولا COGS ولا عمولة المندوب إلا لاحقاً عند تأكيد التسليم فعلياً (عبر recognizeSaleRevenue()).
             //   هذا يمنع تسجيل ربح غير محقق لفواتير قد تُرتجَع بالكامل قبل التسليم أصلاً.
             if ($delivery_status === 'Delivered') {
-                $credit_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات');
+                $credit_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
             } else {
-                $credit_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة');
+                $credit_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
             }
 
             if ($debit_account_id && $credit_account_id && in_array('account_id', $existing_cols)
@@ -287,7 +299,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
                 // منفصل تماماً عن قيد الفاتورة الرئيسي، برقم قيد خاص به لسهولة العكس عند التعديل لاحقاً.
                 if ($shipping_cost_syp > 0) {
                     $shipping_expense_id = ensureShippingExpenseAccount($conn);
-                    $shipping_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                    $shipping_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                     if ($shipping_expense_id && $shipping_cash_id) {
                         $ship_entry_num = "JE-" . $invoice_number . "-SHIP";
                         $ship_desc = "تكلفة شحن فاتورة مبيعات رقم: " . $invoice_number;
@@ -447,14 +459,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 $entry_num3 = "JE-" . $new_invoice_number;
 
                 if ($payment_status === 'Paid') {
-                    $debit_account_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                    $debit_account_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                 } else {
-                    $debit_account_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء');
+                    $debit_account_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
                 }
                 if ($delivery_status === 'Delivered') {
-                    $credit_account_id3 = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات');
+                    $credit_account_id3 = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
                 } else {
-                    $credit_account_id3 = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة');
+                    $credit_account_id3 = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
                 }
 
                 if ($debit_account_id3 && $credit_account_id3 && in_array('account_id', $existing_cols3)) {
@@ -475,7 +487,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
 
                     if ($shipping_cost_syp > 0) {
                         $shipping_expense_id3 = ensureShippingExpenseAccount($conn);
-                        $shipping_cash_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                        $shipping_cash_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                         if ($shipping_expense_id3 && $shipping_cash_id3) {
                             $ship_entry_num3 = "JE-" . $new_invoice_number . "-SHIP";
                             $ship_desc3 = "تكلفة شحن فاتورة مبيعات رقم: " . $new_invoice_number;
@@ -513,7 +525,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                         $stmt_cols2 = $conn->query("SHOW COLUMNS FROM journal_entries");
                         $existing_cols2 = $stmt_cols2->fetchAll(PDO::FETCH_COLUMN);
                         $shipping_expense_id = ensureShippingExpenseAccount($conn);
-                        $shipping_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                        $shipping_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                         if ($shipping_expense_id && $shipping_cash_id) {
                             $ship_desc = "تكلفة شحن فاتورة مبيعات رقم: " . $old_invoice_number . " (مُعدَّلة)";
                             $insertShippingLine2 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols2, $ship_entry_num, $inv_date, $ship_desc) {
@@ -543,8 +555,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 // sales فقط بلا أي أثر محاسبي — فلا يظهر المبلغ في "إجمالي المقبوضات" اليومي أبداً، رغم
                 // أن النقدية دخلت الصندوق فعلياً في يوم التعديل هذا (لا يوم إصدار الفاتورة الأصلي).
                 if ($old_payment_status !== 'Paid' && $payment_status === 'Paid') {
-                    $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
-                    $collect_recv_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء');
+                    $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+                    $collect_recv_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
                     if ($collect_cash_id && $collect_recv_id) {
                         $collect_entry_num = "JE-" . $old_invoice_number . "-COLLECT-" . time();
                         $collect_desc = "تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تغيير حالة الدفع إلى نقداً)";
@@ -553,8 +565,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                     }
                 } elseif ($old_payment_status === 'Paid' && $payment_status !== 'Paid') {
                     // عكس تحصيل بالخطأ: التراجع عن تعليم فاتورة كانت "مدفوعة" لتصبح "آجلة" مرة أخرى
-                    $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
-                    $collect_recv_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء');
+                    $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+                    $collect_recv_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
                     if ($collect_cash_id && $collect_recv_id) {
                         $collect_entry_num = "JE-" . $old_invoice_number . "-UNCOLLECT-" . time();
                         $collect_desc = "عكس تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تراجع عن حالة الدفع نقداً)";
@@ -709,14 +721,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
             // يعكس "الإيراد المؤجَّل" (الالتزام المؤقت)، وليس "إيرادات المبيعات" الحقيقية التي لم تُسجَّل
             // أصلاً بعد لهذه الفاتورة — وإلا سيظهر رصيد إيراد سالب وهمي مع بقاء الالتزام المؤجَّل متضخماً.
             if ($sale['delivery_status'] === 'Delivered') {
-                $revenue_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات');
+                $revenue_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
             } else {
-                $revenue_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة');
+                $revenue_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
             }
             if ($sale['payment_status'] === 'Paid') {
-                $other_account_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                $other_account_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
             } else {
-                $other_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء');
+                $other_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
             }
 
             if ($revenue_account_id && $other_account_id && in_array('account_id', $existing_cols)) {
@@ -749,8 +761,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
                         }
                     }
                     if ($total_cogs_reversed_syp > 0) {
-                        $cogs_expense_account_id = findAccountId($conn, ['تكلفة البضاعة', 'تكلفة البضائع', 'cogs'], 'تكلفة البضائع المباعة (COGS)');
-                        $inventory_account_id = findAccountId($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون');
+                        $cogs_expense_account_id = findAccountId($conn, ['تكلفة البضاعة', 'تكلفة البضائع', 'cogs'], 'تكلفة البضائع المباعة (COGS)', 'Expense');
+                        $inventory_account_id = findAccountId($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
                         if ($cogs_expense_account_id && $inventory_account_id) {
                             $insertReturnLine($inventory_account_id, $total_cogs_reversed_syp, 0);
                             $insertReturnLine($cogs_expense_account_id, 0, $total_cogs_reversed_syp);
@@ -759,8 +771,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
 
                     // مدين: عمولات مندوبين مستحقة الدفع (يُخفَّض الالتزام) / دائن: مصروف عمولات المندوبين (يُخفَّض المصروف)
                     if ($sale['representative_id'] > 0 && $commission_reversed > 0) {
-                        $commission_expense_account_id = findAccountId($conn, ['مصروف عمولات', 'عمولات مندوبين'], 'مصروف عمولات المندوبين');
-                        $commission_payable_account_id = findAccountId($conn, ['عمولات', 'مندوب'], 'عمولات المندوبين المستحقة');
+                        $commission_expense_account_id = findAccountId($conn, ['مصروف عمولات', 'عمولات مندوبين'], 'مصروف عمولات المندوبين', 'Expense');
+                        $commission_payable_account_id = findAccountId($conn, ['عمولات', 'مندوب'], 'عمولات المندوبين المستحقة', 'Liability');
                         if ($commission_expense_account_id && $commission_payable_account_id) {
                             $insertReturnLine($commission_payable_account_id, $commission_reversed, 0);
                             $insertReturnLine($commission_expense_account_id, 0, $commission_reversed);

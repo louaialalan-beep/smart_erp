@@ -257,7 +257,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
             $stmt_active->execute([$original_entry_num, $original_entry_num . "-CORR-%"]);
             $active_entry_num = $stmt_active->fetchColumn() ?: $original_entry_num;
 
-            $stmt_je = $conn->prepare("SELECT account_id, debit, credit FROM journal_entries WHERE entry_number = ?");
+            $stmt_je = $conn->prepare("SELECT account_id, debit, credit, foreign_debit, foreign_credit FROM journal_entries WHERE entry_number = ?");
             $stmt_je->execute([$active_entry_num]);
             $je_lines = $stmt_je->fetchAll(PDO::FETCH_ASSOC);
 
@@ -278,8 +278,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_purchase'])) {
                     : findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
 
                 foreach ($je_lines as $line) {
-                    // العكس يستخدم حساب القيد الأصلي بالضبط (لتصفيره تماماً كما كان)
-                    insertJournalLine($conn, $line['account_id'], floatval($line['credit']), floatval($line['debit']), $rev_entry_num, $today, $rev_desc, 'Purchase Reversal', 'USD', $exchange_rate);
+                    // تصحيح جوهري: العكس كان يعكس المبلغ بالليرة (debit/credit) فقط، ويترك foreign_debit/
+                    // foreign_credit (المبلغ بالدولار) بلا عكس إطلاقاً — لأن insertJournalLine كانت تُستدعى
+                    // بلا آخر معاملين. هذا كان يجعل "ذمم الموردين" بالدولار في القوائم المالية (المبنية من
+                    // SUM(foreign_credit)-SUM(foreign_debit)) تتضخّم بمقدار كل قيمة دولار قديمة (مُستبدَلة)
+                    // في كل مرة تُعدَّل فيها فاتورة شراء، رغم أن الرصيد بالليرة والرصيد الحقيقي المحسوب من
+                    // صفحة الموردين (مباشرة من purchase_invoice_items) كانا سليمين — وهو ما يفسّر بالضبط
+                    // الفارق الملحوظ بين البطاقة السريعة ($) وصفحة الموردين.
+                    insertJournalLine($conn, $line['account_id'], floatval($line['credit']), floatval($line['debit']), $rev_entry_num, $today, $rev_desc, 'Purchase Reversal', 'USD', $exchange_rate, floatval($line['foreign_credit'] ?? 0), floatval($line['foreign_debit'] ?? 0));
                     $is_debit_line = floatval($line['debit']) > 0;
                     $target_account_id = $is_debit_line ? $new_debit_account_id : $new_credit_account_id;
                     insertJournalLine($conn, $target_account_id, $is_debit_line ? $new_base_amount : 0, $is_debit_line ? 0 : $new_base_amount, $new_entry_num, $invoice_date, $new_desc, 'Purchase', 'USD', $exchange_rate, $is_debit_line ? $new_total_usd : 0, $is_debit_line ? 0 : $new_total_usd);

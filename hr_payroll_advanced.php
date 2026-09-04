@@ -174,8 +174,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_advance'])) {
             $desc = "صرف سلفة مقسطة للموظف: " . $emp_name;
             $today = date('Y-m-d');
 
-            $debit_account_id  = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين');
-            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+            $debit_account_id  = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين', 'Asset');
+            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
             if ($debit_account_id && $credit_account_id) {
                 insertJournalLine($conn, $debit_account_id, $total_amount, 0, $entry_num, $today, $desc, 'Employee Advance');
@@ -252,15 +252,23 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_advance'])) {
             $emp_name = $stmt_name->fetchColumn() ?: ('موظف #' . $employee_id);
 
             $original_entry_num = "JE-ADV-" . $advance_id;
+            $stmt_active = $conn->prepare(
+                "SELECT entry_number FROM journal_entries
+                 WHERE entry_number = ? OR entry_number LIKE ?
+                 ORDER BY id DESC LIMIT 1"
+            );
+            $stmt_active->execute([$original_entry_num, $original_entry_num . "-CORR-%"]);
+            $active_entry_num = $stmt_active->fetchColumn() ?: $original_entry_num;
+
             $stmt_je = $conn->prepare("SELECT id, account_id, debit, credit FROM journal_entries WHERE entry_number = ?");
-            $stmt_je->execute([$original_entry_num]);
+            $stmt_je->execute([$active_entry_num]);
             $je_lines = $stmt_je->fetchAll(PDO::FETCH_ASSOC);
 
             if (count($je_lines) > 0) {
                 $rev_entry_num = $original_entry_num . "-REV-" . time();
                 $new_entry_num = $original_entry_num . "-CORR-" . time();
                 $today = date('Y-m-d');
-                $rev_desc = "عكس تلقائي لقيد سلفة معدَّلة (الأصل: $original_entry_num) للموظف: $emp_name";
+                $rev_desc = "عكس تلقائي لقيد سلفة معدَّلة (عكس القيد: $active_entry_num) للموظف: $emp_name";
                 $new_desc = "صرف سلفة مقسطة معدَّلة للموظف: $emp_name";
 
                 foreach ($je_lines as $line) {
@@ -398,11 +406,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['process_payroll'])) {
         $desc = "إثبات مسير الرواتب والأجور لشهر: $target_month";
         $today = date('Y-m-d');
 
-        $salaries_expense_id = findOrCreateAccount($conn, ['رواتب', 'أجور', 'salaries'], 'الرواتب والأجور');
-        $cash_id             = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
-        $bonus_expense_id    = findOrCreateAccount($conn, ['مصروف حوافز', 'مكافآت الموظفين'], 'مصروف حوافز ومكافآت الموظفين');
-        $penalty_income_id   = findOrCreateAccount($conn, ['جزاءات وخصومات', 'جزاءات الموظفين'], 'جزاءات وخصومات الموظفين');
-        $advances_asset_id   = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين');
+        $salaries_expense_id = findOrCreateAccount($conn, ['رواتب', 'أجور', 'salaries'], 'الرواتب والأجور', 'Expense');
+        $cash_id             = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+        $bonus_expense_id    = findOrCreateAccount($conn, ['مصروف حوافز', 'مكافآت الموظفين'], 'مصروف حوافز ومكافآت الموظفين', 'Expense');
+        $penalty_income_id   = findOrCreateAccount($conn, ['جزاءات وخصومات', 'جزاءات الموظفين'], 'جزاءات وخصومات الموظفين', 'Revenue');
+        $advances_asset_id   = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين', 'Asset');
 
         if ($salaries_expense_id && $cash_id) {
             // مدين: الرواتب الأساسية (إجمالي المصروف قبل أي خصم/إضافة)
@@ -450,11 +458,11 @@ function recomputeAndPostPayrollJournal($conn, $payroll_run_id, $target_month) {
 
     $desc = "إثبات مسير الرواتب والأجور لشهر: $target_month";
     $today = date('Y-m-d');
-    $salaries_expense_id = findOrCreateAccount($conn, ['رواتب', 'أجور', 'salaries'], 'الرواتب والأجور');
-    $cash_id              = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
-    $bonus_expense_id     = findOrCreateAccount($conn, ['مصروف حوافز', 'مكافآت الموظفين'], 'مصروف حوافز ومكافآت الموظفين');
-    $penalty_income_id    = findOrCreateAccount($conn, ['جزاءات وخصومات', 'جزاءات الموظفين'], 'جزاءات وخصومات الموظفين');
-    $advances_asset_id    = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين');
+    $salaries_expense_id = findOrCreateAccount($conn, ['رواتب', 'أجور', 'salaries'], 'الرواتب والأجور', 'Expense');
+    $cash_id              = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+    $bonus_expense_id     = findOrCreateAccount($conn, ['مصروف حوافز', 'مكافآت الموظفين'], 'مصروف حوافز ومكافآت الموظفين', 'Expense');
+    $penalty_income_id    = findOrCreateAccount($conn, ['جزاءات وخصومات', 'جزاءات الموظفين'], 'جزاءات وخصومات الموظفين', 'Revenue');
+    $advances_asset_id    = findOrCreateAccount($conn, ['سلف', 'موظف'], 'سلف الموظفين', 'Asset');
 
     if ($salaries_expense_id && $cash_id) {
         if ($sums['s_base'] > 0) { insertJournalLine($conn, $salaries_expense_id, $sums['s_base'], 0, $entry_num, $today, $desc, 'Payroll'); }

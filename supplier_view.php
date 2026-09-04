@@ -96,7 +96,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['set_opening_balance'])
                     $equity_account_id = $conn->lastInsertId();
                 }
 
-                $payable_account_id = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
+                $payable_account_id = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
 
                 if ($equity_account_id && $payable_account_id) {
                     $journal_desc = "رصيد افتتاحي سابق للمورد: " . $supplier_name_for_entry . " (بلا تفاصيل فواتير)";
@@ -171,8 +171,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_payment'])) {
             $existing_cols = $stmt_cols->fetchAll(PDO::FETCH_COLUMN);
 
             if (in_array('account_id', $existing_cols) && in_array('debit', $existing_cols) && in_array('credit', $existing_cols)) {
-                $debit_account_id  = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
-                $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي');
+                $debit_account_id  = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
+                $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
                 if ($debit_account_id && $credit_account_id) {
                     $entry_num = "JE-SPAY-" . $payment_id;
@@ -256,8 +256,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_discount'])) {
             $stmt_cols_d = $conn->query("SHOW COLUMNS FROM journal_entries");
             $existing_cols_d = $stmt_cols_d->fetchAll(PDO::FETCH_COLUMN);
 
-            $debit_id_d  = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين');
-            $credit_id_d = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين');
+            $debit_id_d  = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
+            $credit_id_d = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Expense');
 
             if ($debit_id_d && $credit_id_d) {
                 $entry_num_d = "JE-SDISC-" . $discount_id;
@@ -325,8 +325,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payment'])) {
             $supplier_name_for_entry = $stmt_name->fetchColumn() ?: ('مورد #' . $supplier_id);
 
             $original_entry_num = "JE-SPAY-" . $payment_id;
+            // نجلب آخر قيد "نشط" (الأصلي أو آخر تصحيح CORR) بدل الأصلي دائماً، لتفادي عكس نفس
+            // القيد الأصلي أكثر من مرة عند تعديل نفس الدفعة أكثر من مرة.
+            $stmt_active = $conn->prepare(
+                "SELECT entry_number FROM journal_entries
+                 WHERE entry_number = ? OR entry_number LIKE ?
+                 ORDER BY id DESC LIMIT 1"
+            );
+            $stmt_active->execute([$original_entry_num, $original_entry_num . "-CORR-%"]);
+            $active_entry_num = $stmt_active->fetchColumn() ?: $original_entry_num;
+
             $stmt_je = $conn->prepare("SELECT id, account_id, debit, credit, foreign_debit, foreign_credit, exchange_rate FROM journal_entries WHERE entry_number = ?");
-            $stmt_je->execute([$original_entry_num]);
+            $stmt_je->execute([$active_entry_num]);
             $je_lines = $stmt_je->fetchAll(PDO::FETCH_ASSOC);
 
             $stmt_cols = $conn->query("SHOW COLUMNS FROM journal_entries");
@@ -335,7 +345,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payment'])) {
             if (count($je_lines) > 0) {
                 $rev_entry_num = $original_entry_num . "-REV-" . time();
                 $today = date('Y-m-d');
-                $rev_desc = "عكس تلقائي لقيد سداد دفعة معدَّلة (الأصل: $original_entry_num) للمورد: " . $supplier_name_for_entry;
+                $rev_desc = "عكس تلقائي لقيد سداد دفعة معدَّلة (عكس القيد: $active_entry_num) للمورد: " . $supplier_name_for_entry;
 
                 // 1) قيد العكس: يُبدِّل المدين والدائن لكل سطر أصلي بنفس قيمه تماماً
                 foreach ($je_lines as $line) {

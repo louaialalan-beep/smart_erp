@@ -226,7 +226,16 @@ if (!function_exists('recognizeSaleRevenue')) {
                 $conn->exec("ALTER TABLE sales ADD COLUMN delivered_at DATE NULL");
             }
         } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
-        $conn->prepare("UPDATE sales SET delivered_at = ? WHERE id = ?")->execute([$today, $sale_id]);
+        // تصحيح جوهري: كانت تُحدَّث delivered_at بلا شرط في كل استدعاء — بما فيها الاستدعاء المتكرر
+        // من sales.php عند "التعديل الكامل" لفاتورة مُسلَّمة أصلاً (يحذف قيد COGS القديم ليعيد ترحيله
+        // بالقيم الجديدة، فيتجاوز حارس "مُعترَف به بالفعل" أعلاه ويصل هنا مجدداً) — ما كان يُصفِّر تاريخ
+        // التسليم الحقيقي إلى تاريخ التعديل، فتنتقل إيرادات/تكاليف تلك الفاتورة خطأً إلى فترة تقرير
+        // مختلفة في financial_reports.php. الآن يُضبَط فقط إن لم يكن مضبوطاً من قبل (أول اعتراف حقيقي).
+        $stmt_chk_delivered = $conn->prepare("SELECT delivered_at FROM sales WHERE id = ?");
+        $stmt_chk_delivered->execute([$sale_id]);
+        if (!$stmt_chk_delivered->fetchColumn()) {
+            $conn->prepare("UPDATE sales SET delivered_at = ? WHERE id = ?")->execute([$today, $sale_id]);
+        }
 
         // تصحيح: الكلمة المفتاحية 'إيراد' (بلا "ات") كانت تُطابق أيضاً "إيرادات مؤجلة" كسلسلة فرعية
         // (كلاهما يبدأ بـ"إيرادات")، فيرجع revenue_id لنفس حساب deferred_id عند وجود الأخير بمعرّف أصغر

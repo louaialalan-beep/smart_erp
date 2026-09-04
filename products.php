@@ -15,6 +15,25 @@ if (!isset($conn)) {
 $msg = "";
 $error = "";
 
+// دالة محلية لترحيل قيد يدعم المبلغ الأجنبي (foreign_debit/foreign_credit) — نفس تعريف الدالة
+// المستخدَمة في Purchases.php، لأن postJournalLine في system_helpers.php لا تدعم هذين الحقلين،
+// وهذا الملف لا يُحمَّل أبداً في نفس الطلب مع Purchases.php (كل صفحة تُفتح مستقلة)، فلا تعارض تسمية.
+function insertJournalLine($conn, $account_id, $debit, $credit, $entry_number, $entry_date, $description, $source_module, $currency_code = 'SYP', $exchange_rate = 1, $foreign_debit = null, $foreign_credit = null) {
+    $stmt_cols = $conn->query("SHOW COLUMNS FROM journal_entries");
+    $existing_cols = $stmt_cols->fetchAll(PDO::FETCH_COLUMN);
+    $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
+    $vals = [$account_id, $entry_date, $description, $debit, $credit];
+    if (in_array('entry_number', $existing_cols)) { $cols_to_insert[] = 'entry_number'; $vals[] = $entry_number; }
+    if (in_array('currency_code', $existing_cols)) { $cols_to_insert[] = 'currency_code'; $vals[] = $currency_code; }
+    if (in_array('exchange_rate', $existing_cols)) { $cols_to_insert[] = 'exchange_rate'; $vals[] = $exchange_rate; }
+    if ($foreign_debit !== null && in_array('foreign_debit', $existing_cols)) { $cols_to_insert[] = 'foreign_debit'; $vals[] = $foreign_debit; }
+    if ($foreign_credit !== null && in_array('foreign_credit', $existing_cols)) { $cols_to_insert[] = 'foreign_credit'; $vals[] = $foreign_credit; }
+    if (in_array('source_module', $existing_cols)) { $cols_to_insert[] = 'source_module'; $vals[] = $source_module; }
+    $placeholders = implode(',', array_fill(0, count($cols_to_insert), '?'));
+    $col_names = implode(',', $cols_to_insert);
+    $conn->prepare("INSERT INTO journal_entries ({$col_names}) VALUES ({$placeholders})")->execute($vals);
+}
+
 // معرفة أعمدة جدول products ديناميكياً (تُستخدم لدعم purchased_quantity إن وُجد دون كسر التوافق)
 $products_cols_stmt = $conn->query("SHOW COLUMNS FROM products");
 $products_existing_cols = $products_cols_stmt->fetchAll(PDO::FETCH_COLUMN);
@@ -49,6 +68,77 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_category'])) {
         }
     }
 }
+
+// 0-ب. إضافة/زيادة جرد مكتبي (بضاعة بلا مورد) — ميزة جديدة تحل محل القيد اليدوي المعزول في دفتر
+// اليومية الذي كان يُستخدَم سابقاً لهذا الغرض (ويُنتج رصيداً "وهمياً" غير مرتبط بأي منتج فعلي، لا
+// يُخصَم تلقائياً عند البيع). هنا: الكمية والتكلفة تُدخَلان معاً، تُربَطان بمنتج فعلي مباشرة (جديد أو
+// موجود بلا مورد)، ويُرحَّل قيد محاسبي مرتبط بهذا المنتج تحديداً (وليس مبلغاً إجمالياً معزولاً) — فيُخصَم
+// تلقائياً عبر COGS عند البيع تماماً كأي منتج آخر يأتي من مورد.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory'])) {
+    $oi_mode = $_POST['oi_mode'] ?? 'new'; // 'new' أو 'existing'
+    $oi_qty = filter_var($_POST['oi_quantity'] ?? 0, FILTER_VALIDATE_FLOAT);
+    $oi_cost_usd = filter_var($_POST['oi_cost_price_usd'] ?? 0, FILTER_VALIDATE_FLOAT);
+    $oi_date = $_POST['oi_date'] ?? date('Y-m-d');
+    $oi_notes = trim($_POST['oi_notes'] ?? '');
+
+    if ($oi_qty <= 0 || $oi_cost_usd <= 0) {
+        $error = "خطأ: الكمية وتكلفة الوحدة بالدولار يجب أن تكونا أكبر من صفر.";
+    } else {
+        try {
+            $conn->beginTransaction();
+            $oi_product_id = null;
+            $oi_product_name = '';
+            $oi_sku = '';
+
+            if ($oi_mode === 'existing') {
+                $oi_product_id = intval($_POST['oi_existing_product_id'] ?? 0);
+                $stmt_chk = $conn->prepare("SELECT product_name, sku, supplier_id FROM products WHERE id = ?");
+                $stmt_chk->execute([$oi_product_id]);
+                $existing_p = $stmt_chk->fetch(PDO::FETCH_ASSOC);
+                if (!$existing_p) { throw new Exception("المنتج المحدَّد غير موجود."); }
+                if ($existing_p['supplier_id'] !== null) { throw new Exception("هذا المنتج مرتبط بمورد — الجرد المكتبي مخصَّص فقط للمنتجات بلا مورد. استخدم فاتورة شراء بدلاً من ذلك."); }
+                $oi_product_name = $existing_p['product_name'];
+                $oi_sku = $existing_p['sku'];
+                $conn->prepare("UPDATE products SET current_quantity = current_quantity + ?, purchased_quantity = purchased_quantity + ?, cost_price_usd = ? WHERE id = ?")
+                     ->execute([$oi_qty, $oi_qty, $oi_cost_usd, $oi_product_id]);
+            } else {
+                $oi_product_name = trim($_POST['oi_new_product_name'] ?? '');
+                $oi_sku = trim($_POST['oi_new_sku'] ?? '');
+                $oi_category_id = !empty($_POST['oi_category_id']) ? filter_var($_POST['oi_category_id'], FILTER_VALIDATE_INT) : null;
+                $oi_base_unit = trim($_POST['oi_base_unit'] ?? 'قطعة');
+                if (empty($oi_product_name) || empty($oi_sku)) { throw new Exception("اسم المنتج والباركود إجباريان."); }
+                $check_sku = $conn->prepare("SELECT id FROM products WHERE sku = ?");
+                $check_sku->execute([$oi_sku]);
+                if ($check_sku->rowCount() > 0) { throw new Exception("رمز الباركود (SKU) مستخدم مسبقاً."); }
+                $conn->prepare("INSERT INTO products (product_name, sku, category_id, cost_price_usd, wholesale_price_syp, retail_price_syp, special_price_syp, base_unit, current_quantity, purchased_quantity, supplier_id) VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, NULL)")
+                     ->execute([$oi_product_name, $oi_sku, $oi_category_id, $oi_cost_usd, $oi_base_unit, $oi_qty, $oi_qty]);
+                $oi_product_id = $conn->lastInsertId();
+            }
+
+            // القيد المحاسبي: مدين المخزون (يدخل أصل جديد) / دائن "أرصدة افتتاحية" (نفس الحساب المعتمد
+            // أصلاً في النظام لتوثيق بضاعة موجودة فعلياً قبل تسجيلها كفاتورة شراء حقيقية) — لكن هنا
+            // مرتبط بمنتج محدَّد عبر entry_number، وليس مبلغاً إجمالياً معزولاً كما كان سابقاً.
+            $exchange_rate = getExchangeRateForDate($conn, 'USD', $oi_date);
+            $amount_syp = $oi_qty * $oi_cost_usd * $exchange_rate;
+            $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
+            $equity_acc = findOrCreateAccount($conn, ['أرصدة افتتاحية', 'opening'], 'أرصدة افتتاحية', 'Equity');
+            if ($inv_acc && $equity_acc) {
+                $oi_entry_num = "JE-OFFICE-" . $oi_product_id . "-" . time();
+                $oi_desc = "إضافة جرد مكتبي: $oi_product_name (SKU: $oi_sku) — $oi_qty وحدة × \$$oi_cost_usd" . (!empty($oi_notes) ? " — $oi_notes" : "");
+                insertJournalLine($conn, $inv_acc, $amount_syp, 0, $oi_entry_num, $oi_date, $oi_desc, 'Office Inventory', 'USD', $exchange_rate, $oi_qty * $oi_cost_usd, 0);
+                insertJournalLine($conn, $equity_acc, 0, $amount_syp, $oi_entry_num, $oi_date, $oi_desc, 'Office Inventory', 'USD', $exchange_rate, 0, $oi_qty * $oi_cost_usd);
+            }
+
+            $conn->commit();
+            logAudit($conn, 'INSERT', 'الجرد المكتبي', "إضافة جرد مكتبي: $oi_product_name (SKU: $oi_sku) — كمية $oi_qty بتكلفة \$$oi_cost_usd للوحدة", $oi_product_id);
+            $msg = "تم تسجيل الجرد المكتبي وتحديث المخزون وترحيل القيد المحاسبي بنجاح!";
+        } catch (Exception $e) {
+            $conn->rollBack();
+            $error = "خطأ أثناء تسجيل الجرد المكتبي: " . $e->getMessage();
+        }
+    }
+}
+
 
 // 1. معالجة إضافة منتج جديد مع حماية كاملة للمدخلات
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_product'])) {
@@ -133,7 +223,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_product'])) {
             if ($check_sku->rowCount() > 0) {
                 $error = "خطأ: رمز الباركود (SKU) مستخدم مسبقاً لصنف آخر، يرجى اختيار رمز فريد.";
             } else {
-                $stmt_old = $conn->prepare("SELECT current_quantity FROM products WHERE id = ?");
+                $stmt_old = $conn->prepare("SELECT current_quantity, cost_price_usd FROM products WHERE id = ?");
                 $stmt_old->execute([$product_id]);
                 $old_vals = $stmt_old->fetch(PDO::FETCH_ASSOC);
 
@@ -151,9 +241,38 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_product'])) {
                     $product_id
                 ]);
 
+                // تصحيح جوهري: تعديل الكمية هنا (جرد يدوي) كان يُحدِّث current_quantity بلا أي قيد
+                // محاسبي مقابل — فيبقى حساب "المخزون" في دفتر الأستاذ بلا علاقة بالكمية الفعلية الجديدة،
+                // نفس فئة الخلل المكتشفة سابقاً في القيود اليدوية المعزولة (245,256 ل.س وهمية). الآن أي
+                // فرق (qty_delta) يُرحَّل فوراً كقيد "تسوية مخزون" حقيقي: زيادة الكمية = ربح مخزون (دائن
+                // حساب تسوية، مدين المخزون)، نقصانها = خسارة/هالك (العكس)، بالتكلفة الحالية للمنتج.
+                $old_qty = floatval($old_vals['current_quantity'] ?? 0);
+                $qty_delta = $current_quantity - $old_qty;
+                $product_cost_usd = floatval($old_vals['cost_price_usd'] ?? 0);
+                if (abs($qty_delta) > 0.00001 && $product_cost_usd > 0) {
+                    $adj_rate = getExchangeRateForDate($conn, 'USD', date('Y-m-d'));
+                    $adj_amount_usd = abs($qty_delta) * $product_cost_usd;
+                    $adj_amount_syp = $adj_amount_usd * $adj_rate;
+                    $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
+                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Expense');
+                    if ($inv_acc && $adj_acc) {
+                        $adj_entry_num = "JE-STOCKADJ-" . $product_id . "-" . time();
+                        $adj_desc = "تسوية جرد يدوي للمنتج: $product_name (SKU: $sku) — من " . number_format($old_qty, 2) . " إلى " . number_format($current_quantity, 2);
+                        if ($qty_delta > 0) {
+                            // زيادة الكمية: مدين المخزون (يزيد الأصل) / دائن تسوية المخزون (ربح/تخفيض مصروف)
+                            insertJournalLine($conn, $inv_acc, $adj_amount_syp, 0, $adj_entry_num, date('Y-m-d'), $adj_desc, 'Inventory Adjustment', 'USD', $adj_rate, $adj_amount_usd, 0);
+                            insertJournalLine($conn, $adj_acc, 0, $adj_amount_syp, $adj_entry_num, date('Y-m-d'), $adj_desc, 'Inventory Adjustment', 'USD', $adj_rate, 0, $adj_amount_usd);
+                        } else {
+                            // نقصان الكمية: دائن المخزون (ينقص الأصل) / مدين تسوية المخزون (خسارة/هالك)
+                            insertJournalLine($conn, $adj_acc, $adj_amount_syp, 0, $adj_entry_num, date('Y-m-d'), $adj_desc, 'Inventory Adjustment', 'USD', $adj_rate, $adj_amount_usd, 0);
+                            insertJournalLine($conn, $inv_acc, 0, $adj_amount_syp, $adj_entry_num, date('Y-m-d'), $adj_desc, 'Inventory Adjustment', 'USD', $adj_rate, 0, $adj_amount_usd);
+                        }
+                    }
+                }
+
                 $log_details = "تعديل منتج: $product_name (SKU: $sku)";
                 if ($old_vals && floatval($old_vals['current_quantity']) != $current_quantity) {
-                    $log_details .= " — تصحيح المخزون من " . number_format($old_vals['current_quantity'], 2) . " إلى " . number_format($current_quantity, 2);
+                    $log_details .= " — تصحيح المخزون من " . number_format($old_vals['current_quantity'], 2) . " إلى " . number_format($current_quantity, 2) . " (قيد تسوية مُرحَّل تلقائياً)";
                 }
                 logAudit($conn, 'UPDATE', 'المنتجات والمخزون', $log_details, $product_id);
 
@@ -220,6 +339,7 @@ $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
 // جلب التصنيفات والموردين للقوائم المنسدلة
 $categories = $conn->query("SELECT id, category_name FROM categories ORDER BY category_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY supplier_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+$office_products = $conn->query("SELECT id, product_name, sku, current_quantity, base_unit FROM products WHERE supplier_id IS NULL ORDER BY product_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 
 // توليد الباركود/SKU التالي تلقائياً — يتبع نمط "PRD-XXX" الموجود أصلاً في القاعدة، برقم تسلسلي
 // أكبر رقم حالي + 1. حقل الإدخال يبقى قابلاً للتعديل يدوياً إن أراد المستخدم رمزاً مختلفاً.
@@ -237,7 +357,10 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
         <h2 style="color: #2e384d; margin-bottom: 5px;">إدارة المنتجات والمخزون (Products Module)</h2>
         <p style="color: #6c757d; margin: 0; font-size: 14px;">التحكم بالأصناف، تكاليف البضائع بالدولار، أسعار البيع، والتتبع اللحظي للمخزون.</p>
     </div>
-    <div>
+    <div style="display:flex; gap:10px;">
+        <button onclick="toggleOfficeInventoryModal(true)" style="background: #8b5cf6; color: white; padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <i class="fas fa-warehouse"></i> إضافة جرد مكتبي
+        </button>
         <button onclick="toggleProductModal(true)" style="background: #1cc88a; color: white; padding: 10px 20px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             <i class="fas fa-plus"></i> إضافة صنف جديد
         </button>
@@ -562,6 +685,16 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
         document.getElementById('productModal').style.display = show ? 'flex' : 'none';
     }
 
+    function toggleOfficeInventoryModal(show) {
+        document.getElementById('officeInventoryModal').style.display = show ? 'flex' : 'none';
+    }
+
+    function toggleOiMode() {
+        var mode = document.querySelector('input[name="oi_mode"]:checked').value;
+        document.getElementById('oi_existing_block').style.display = (mode === 'existing') ? 'block' : 'none';
+        document.getElementById('oi_new_block').style.display = (mode === 'new') ? 'block' : 'none';
+    }
+
     function toggleEditProductModal(show) {
         document.getElementById('editProductModal').style.display = show ? 'flex' : 'none';
     }
@@ -607,6 +740,96 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
             <div style="text-align: left; border-top: 1px solid #e3e6f0; padding-top: 15px;">
                 <button type="button" onclick="closeAddCategoryModal()" style="background: #e2e8f0; color: #333; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-weight: bold;">إلغاء</button>
                 <button type="submit" style="background: #1cc88a; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ التصنيف</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- نافذة إضافة جرد مكتبي (Modal) -->
+<div id="officeInventoryModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1050; justify-content: center; align-items: center;">
+    <div style="background: white; width: 650px; max-width: 95%; border-radius: 8px; padding: 25px; max-height: 90vh; overflow-y: auto; box-shadow: 0 5px 25px rgba(0,0,0,0.2);">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e3e6f0; padding-bottom: 12px; margin-bottom: 20px;">
+            <h3 style="margin: 0; color: #8b5cf6;"><i class="fas fa-warehouse"></i> إضافة جرد مكتبي (بضاعة بلا مورد)</h3>
+            <button onclick="toggleOfficeInventoryModal(false)" style="background: none; border: none; font-size: 24px; cursor: pointer; color: #888; line-height: 1;">&times;</button>
+        </div>
+        <div style="background: #f3eefc; border: 1px solid #ddd0fa; padding: 10px 14px; border-radius: 6px; margin-bottom: 18px; color: #5b3a99; font-size: 12.5px;">
+            <i class="fas fa-info-circle"></i> لتسجيل بضاعة موجودة فعلياً بلا فاتورة شراء من مورد (جرد مكتبي مباشر). يُرحَّل قيد محاسبي مرتبط بهذا المنتج تحديداً، ويُخصَم تلقائياً عبر تكلفة البضاعة المباعة (COGS) عند بيعه — تماماً كأي منتج آخر.
+        </div>
+        <form method="POST" action="">
+<?php csrfField(); ?>
+            <input type="hidden" name="add_office_inventory" value="1">
+
+            <div style="margin-bottom: 15px;">
+                <label style="display:flex; gap:20px;">
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="oi_mode" value="existing" checked onchange="toggleOiMode()"> زيادة كمية صنف مكتبي موجود</label>
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="oi_mode" value="new" onchange="toggleOiMode()"> صنف جديد كلياً</label>
+                </label>
+            </div>
+
+            <div id="oi_existing_block" style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">اختر الصنف المكتبي:</label>
+                <select name="oi_existing_product_id" id="oi_existing_product_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
+                    <option value="">-- اختر --</option>
+                    <?php foreach ($office_products as $op): ?>
+                        <option value="<?php echo $op['id']; ?>"><?php echo htmlspecialchars($op['product_name']); ?> (<?php echo htmlspecialchars($op['sku']); ?>) — الحالي: <?php echo number_format($op['current_quantity'], 2); ?> <?php echo htmlspecialchars($op['base_unit']); ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <?php if (count($office_products) === 0): ?>
+                    <p style="font-size: 12px; color: #a33636; margin: 5px 0 0;"><i class="fas fa-exclamation-circle"></i> لا يوجد أي صنف مكتبي بعد — اختر "صنف جديد كلياً" أدناه.</p>
+                <?php endif; ?>
+            </div>
+
+            <div id="oi_new_block" style="display:none;">
+                <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">اسم المنتج:</label>
+                        <input type="text" name="oi_new_product_name" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px;">
+                    </div>
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">الباركود / SKU:</label>
+                        <input type="text" name="oi_new_sku" value="<?php echo htmlspecialchars($auto_sku); ?>" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التصنيف:</label>
+                        <select name="oi_category_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;">
+                            <option value="">-- اختر --</option>
+                            <?php foreach ($categories as $cat): ?>
+                                <option value="<?php echo $cat['id']; ?>"><?php echo htmlspecialchars($cat['category_name']); ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    <div>
+                        <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">وحدة القياس:</label>
+                        <input type="text" name="oi_base_unit" value="قطعة" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px;">
+                    </div>
+                </div>
+            </div>
+
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                <div>
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">الكمية:</label>
+                    <input type="number" step="0.0001" name="oi_quantity" required style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                </div>
+                <div>
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">تكلفة الوحدة ($):</label>
+                    <input type="number" step="0.0001" name="oi_cost_price_usd" required style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                </div>
+                <div>
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التاريخ:</label>
+                    <input type="date" name="oi_date" value="<?php echo date('Y-m-d'); ?>" required style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                </div>
+            </div>
+
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">ملاحظات (اختياري):</label>
+                <textarea name="oi_notes" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; height: 50px;" placeholder="مثال: جرد افتتاحي، بضاعة مُهداة، تصحيح جرد سنوي..."></textarea>
+            </div>
+
+            <div style="text-align: left; border-top: 1px solid #e3e6f0; padding-top: 15px; margin-top: 20px;">
+                <button type="button" onclick="toggleOfficeInventoryModal(false)" style="background: #e2e8f0; color: #333; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; margin-left: 10px; font-weight: bold;">إلغاء</button>
+                <button type="submit" style="background: #8b5cf6; color: white; border: none; padding: 10px 22px; border-radius: 6px; cursor: pointer; font-weight: bold;">حفظ وترحيل القيد</button>
             </div>
         </form>
     </div>
