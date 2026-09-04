@@ -203,6 +203,57 @@ if (!function_exists('recognizeSaleRevenue')) {
      * تُستدعى من: sales.php عند إصدار فاتورة بحالة Delivered مباشرة، وrepresentative_profile.php
      * عند تأكيد تسليم فاتورة كانت Pending سابقاً.
      */
+    /**
+     * === تحديث سياسة جوهري ===
+     * الإيراد الحقيقي ("إيرادات المبيعات") لا يُعترَف به إلا عند تحقّق شرطين معاً في آنٍ واحد:
+     * التسليم الفعلي (delivery_status = 'Delivered') والتحصيل النقدي الفعلي (payment_status = 'Paid').
+     * أي حالة أخرى (قيد الانتظار، أو مُسلَّمة لكن آجلة، أو مدفوعة مقدَّماً لكن لم تُسلَّم بعد) تبقى في
+     * "إيرادات مؤجلة" (التزام مؤقت) حتى يتحقق الشرطان معاً. هذه الدالة تُستدعى من نقطتين مستقلتين:
+     * عند تأكيد التسليم، وعند تحصيل الدفعة نقداً — فتُنفِّذ إعادة التصنيف فقط عندما يكتمل آخر شرط ناقص.
+     */
+    function tryRecognizeRevenue($conn, $sale_id) {
+        $stmt = $conn->prepare("SELECT * FROM sales WHERE id = ?");
+        $stmt->execute([$sale_id]);
+        $sale = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$sale) return;
+        if ($sale['delivery_status'] !== 'Delivered' || $sale['payment_status'] !== 'Paid') return; // لم يكتمل الشرطان بعد
+
+        $today = date('Y-m-d');
+        $revenue_id = findOrCreateAccount($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
+        $deferred_id = findOrCreateAccount($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
+
+        $main_entry_num = "JE-" . $sale['invoice_number'];
+        $stmt_main = $conn->prepare("SELECT id FROM journal_entries WHERE entry_number = ? AND account_id = ? AND credit > 0");
+        $stmt_main->execute([$main_entry_num, $deferred_id]);
+        if (!$stmt_main->fetchColumn()) return; // إما مُعترَف به فعلاً أو لم يُرحَّل كمؤجَّل أصلاً
+
+        $reclass_num = $main_entry_num . "-RECLASS";
+        $stmt_already = $conn->prepare("SELECT COUNT(*) FROM journal_entries WHERE entry_number = ?");
+        $stmt_already->execute([$reclass_num]);
+        if ($stmt_already->fetchColumn() > 0) return; // مُعترَف به بالفعل — لا تكرار
+
+        // الصافي بعد خصم أي مرتجع/خصم وقع بينما كانت الفاتورة لا تزال مؤجَّلة
+        $stmt_prior_returns = $conn->prepare("
+            SELECT
+                COALESCE((SELECT SUM(total_amount_syp) FROM sales_returns WHERE sale_id = ?), 0)
+                + COALESCE((SELECT SUM(amount_syp) FROM sale_item_discounts WHERE sale_id = ?), 0)
+        ");
+        $stmt_prior_returns->execute([$sale_id, $sale_id]);
+        $prior_returns_syp = floatval($stmt_prior_returns->fetchColumn());
+        $reclass_amount = floatval($sale['total_amount_syp']) - $prior_returns_syp;
+
+        if ($reclass_amount > 0) {
+            $desc = "الاعتراف بالإيراد عند اكتمال شرطي التسليم والتحصيل معاً لفاتورة: " . $sale['invoice_number'] . ($prior_returns_syp > 0 ? " (صافي بعد خصم مرتجع/خصم سابق: " . number_format($prior_returns_syp, 2) . ")" : "");
+            postJournalLine($conn, $deferred_id, $reclass_amount, 0, $reclass_num, $today, $desc, 'Revenue Recognition');
+            postJournalLine($conn, $revenue_id, 0, $reclass_amount, $reclass_num, $today, $desc, 'Revenue Recognition');
+        }
+    }
+
+    /**
+     * COGS واستحقاق العمولة مرتبطان بالتسليم الفعلي فقط (بغض النظر عن حالة الدفع) — المخزون لا يُخصَم
+     * إلا عند خروج البضاعة فعلياً. تستدعي أيضاً محاولة الاعتراف بالإيراد (تنجح فقط إن كانت الفاتورة
+     * مدفوعة بالفعل وقت التسليم).
+     */
     function recognizeSaleRevenue($conn, $sale_id) {
         $stmt = $conn->prepare("SELECT * FROM sales WHERE id = ?");
         $stmt->execute([$sale_id]);
@@ -212,7 +263,7 @@ if (!function_exists('recognizeSaleRevenue')) {
         $cogs_entry_num = "JE-" . $sale['invoice_number'] . "-COGS";
         $check = $conn->prepare("SELECT COUNT(*) FROM journal_entries WHERE entry_number = ?");
         $check->execute([$cogs_entry_num]);
-        if ($check->fetchColumn() > 0) return; // مُعترَف به بالفعل — لا تكرار
+        if ($check->fetchColumn() > 0) { tryRecognizeRevenue($conn, $sale_id); return; } // COGS مُرحَّل بالفعل — لا تكرار، لكن يبقى فحص الإيراد وارداً
 
         $today = date('Y-m-d');
 
@@ -226,47 +277,31 @@ if (!function_exists('recognizeSaleRevenue')) {
                 $conn->exec("ALTER TABLE sales ADD COLUMN delivered_at DATE NULL");
             }
         } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
-        // تصحيح جوهري: كانت تُحدَّث delivered_at بلا شرط في كل استدعاء — بما فيها الاستدعاء المتكرر
-        // من sales.php عند "التعديل الكامل" لفاتورة مُسلَّمة أصلاً (يحذف قيد COGS القديم ليعيد ترحيله
-        // بالقيم الجديدة، فيتجاوز حارس "مُعترَف به بالفعل" أعلاه ويصل هنا مجدداً) — ما كان يُصفِّر تاريخ
-        // التسليم الحقيقي إلى تاريخ التعديل، فتنتقل إيرادات/تكاليف تلك الفاتورة خطأً إلى فترة تقرير
-        // مختلفة في financial_reports.php. الآن يُضبَط فقط إن لم يكن مضبوطاً من قبل (أول اعتراف حقيقي).
         $stmt_chk_delivered = $conn->prepare("SELECT delivered_at FROM sales WHERE id = ?");
         $stmt_chk_delivered->execute([$sale_id]);
         if (!$stmt_chk_delivered->fetchColumn()) {
             $conn->prepare("UPDATE sales SET delivered_at = ? WHERE id = ?")->execute([$today, $sale_id]);
         }
 
-        // تصحيح: الكلمة المفتاحية 'إيراد' (بلا "ات") كانت تُطابق أيضاً "إيرادات مؤجلة" كسلسلة فرعية
-        // (كلاهما يبدأ بـ"إيرادات")، فيرجع revenue_id لنفس حساب deferred_id عند وجود الأخير بمعرّف أصغر
-        // — ما يجعل كلا طرفي قيد الاعتراف بالإيراد يُرحَّلان لنفس الحساب فتتحيّد قيمتهما لصفر.
-        $revenue_id = findOrCreateAccount($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات');
-        $deferred_id = findOrCreateAccount($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة');
-
-        // إعادة تصنيف: إن كانت الفاتورة أُصدِرت أصلاً كـ"مؤجلة"، حوِّل مبلغها من التزام (إيراد مؤجل)
-        // إلى إيراد حقيقي الآن. إن كانت أُصدِرت مباشرة كـ"مُسلَّمة"، لا يوجد قيد مؤجل لعكسه (يُتخطى بأمان).
-        $main_entry_num = "JE-" . $sale['invoice_number'];
-        $stmt_main = $conn->prepare("SELECT id FROM journal_entries WHERE entry_number = ? AND account_id = ? AND credit > 0");
-        $stmt_main->execute([$main_entry_num, $deferred_id]);
-        if ($stmt_main->fetchColumn()) {
-            $reclass_num = $main_entry_num . "-RECLASS";
-            $desc = "الاعتراف بالإيراد عند تأكيد التسليم لفاتورة: " . $sale['invoice_number'];
-            postJournalLine($conn, $deferred_id, floatval($sale['total_amount_syp']), 0, $reclass_num, $today, $desc, 'Revenue Recognition');
-            postJournalLine($conn, $revenue_id, 0, floatval($sale['total_amount_syp']), $reclass_num, $today, $desc, 'Revenue Recognition');
-        }
-
         // قيد COGS
-        $stmt_items = $conn->prepare("SELECT si.*, p.cost_price_usd FROM sale_items si LEFT JOIN products p ON si.product_id = p.id WHERE si.sale_id = ?");
+        // تصحيح: نفس المبدأ أعلاه — نخصم الكمية المرتجعة مسبقاً (وقت "قيد الانتظار") من كل سطر، وإلا
+        // تُرحَّل تكلفة بضاعة أُعيدت للمخزون بالفعل عبر معالج المرتجع نفسه، فتُحتسَب مرتين.
+        $stmt_items = $conn->prepare("
+            SELECT si.*, p.cost_price_usd,
+                   COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0) AS already_returned_qty
+            FROM sale_items si LEFT JOIN products p ON si.product_id = p.id WHERE si.sale_id = ?
+        ");
         $stmt_items->execute([$sale_id]);
         $items = $stmt_items->fetchAll(PDO::FETCH_ASSOC);
         $total_cogs = 0;
         foreach ($items as $it) {
             $cost = $it['cost_price_usd_at_sale'] !== null ? floatval($it['cost_price_usd_at_sale']) : floatval($it['cost_price_usd']);
-            $total_cogs += floatval($it['quantity']) * $cost * floatval($sale['exchange_rate']);
+            $net_qty = max(0, floatval($it['quantity']) - floatval($it['already_returned_qty']));
+            $total_cogs += $net_qty * $cost * floatval($sale['exchange_rate']);
         }
         if ($total_cogs > 0) {
-            $cogs_exp = findOrCreateAccount($conn, ['تكلفة البضاعة', 'تكلفة البضائع', 'cogs'], 'تكلفة البضائع المباعة (COGS)');
-            $inv = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون');
+            $cogs_exp = findOrCreateAccount($conn, ['تكلفة البضاعة', 'تكلفة البضائع', 'cogs'], 'تكلفة البضائع المباعة (COGS)', 'Expense');
+            $inv = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
             if ($cogs_exp && $inv) {
                 $desc = "تكلفة البضاعة المباعة عند تأكيد تسليم فاتورة: " . $sale['invoice_number'];
                 postJournalLine($conn, $cogs_exp, $total_cogs, 0, $cogs_entry_num, $today, $desc, 'Sales COGS');
@@ -275,16 +310,24 @@ if (!function_exists('recognizeSaleRevenue')) {
         }
 
         // قيد استحقاق العمولة
-        if ($sale['representative_id'] && floatval($sale['total_commissions']) > 0) {
+        // تصحيح: نخصم أي عمولة عُكِسَت مسبقاً بسبب مرتجع وقع وقت "قيد الانتظار"، لنفس السبب أعلاه.
+        $stmt_prior_comm = $conn->prepare("SELECT COALESCE(SUM(total_commission_reversed), 0) FROM sales_returns WHERE sale_id = ?");
+        $stmt_prior_comm->execute([$sale_id]);
+        $prior_comm_reversed = floatval($stmt_prior_comm->fetchColumn());
+        $net_commission = floatval($sale['total_commissions']) - $prior_comm_reversed;
+        if ($sale['representative_id'] && $net_commission > 0) {
             $comm_entry_num = "JE-" . $sale['invoice_number'] . "-COMM";
-            $comm_exp = findOrCreateAccount($conn, ['مصروف عمولات', 'عمولات مندوبين'], 'مصروف عمولات المندوبين');
-            $comm_pay = findOrCreateAccount($conn, ['عمولات', 'مندوب'], 'عمولات المندوبين المستحقة');
+            $comm_exp = findOrCreateAccount($conn, ['مصروف عمولات', 'عمولات مندوبين'], 'مصروف عمولات المندوبين', 'Expense');
+            $comm_pay = findOrCreateAccount($conn, ['عمولات', 'مندوب'], 'عمولات المندوبين المستحقة', 'Liability');
             if ($comm_exp && $comm_pay) {
                 $desc = "استحقاق عمولة عند تأكيد تسليم فاتورة: " . $sale['invoice_number'];
-                postJournalLine($conn, $comm_exp, floatval($sale['total_commissions']), 0, $comm_entry_num, $today, $desc, 'Commission Accrual');
-                postJournalLine($conn, $comm_pay, 0, floatval($sale['total_commissions']), $comm_entry_num, $today, $desc, 'Commission Accrual');
+                postJournalLine($conn, $comm_exp, $net_commission, 0, $comm_entry_num, $today, $desc, 'Commission Accrual');
+                postJournalLine($conn, $comm_pay, 0, $net_commission, $comm_entry_num, $today, $desc, 'Commission Accrual');
             }
         }
+
+        // بعد ترحيل COGS/العمولة، نحاول الاعتراف بالإيراد — ينجح فقط إن كانت الفاتورة مدفوعة بالفعل
+        tryRecognizeRevenue($conn, $sale_id);
     }
 }
 

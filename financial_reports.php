@@ -15,11 +15,26 @@ $total_cogs_syp = 0;
 $total_cogs_usd = 0;
 $total_commissions = 0;
 $total_expenses = 0;
+$total_shipping = 0;
+$total_payroll = 0;
+$total_supplier_discounts = 0;
 $net_profit = 0;
 $total_supplier_payables_usd = 0;
 $total_supplier_payables_syp = 0;
 $expenses_breakdown = [];
 $error_msg = '';
+
+// إنشاء جدول خصومات أصناف المبيعات دفاعياً هنا أيضاً (وليس فقط في sales.php) — هذه الصفحة قد
+// تُفتَح قبل أي زيارة لصفحة المبيعات، والاستعلام أدناه يعتمد على وجود الجدول مسبقاً.
+$conn->exec("CREATE TABLE IF NOT EXISTS sale_item_discounts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sale_item_id INT NOT NULL,
+    sale_id INT NOT NULL,
+    amount_syp DECIMAL(15,2) NOT NULL,
+    discount_date DATE NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
 
 // فحص/ترحيل دفاعي لعمود حالة الدفع في فواتير الشراء (مطابق لنفس الفحص في Purchases.php وsupplier_view.php)
 // ضروري هنا لأن استعلام ذمم الموردين أدناه يشترط هذا العمود مباشرة في جملة WHERE.
@@ -57,21 +72,16 @@ try {
     // أ) إجمالي الإيرادات: فقط الفواتير المسلَّمة فعلياً (نفس قاعدة الترحيل الذكي المعتمدة في كامل النظام)
     // تصحيح: خصم قيمة أي مرتجع حدث على هذه الفواتير — وإلا يبقى الإيراد المعروض هنا أعلى من الإيراد
     // الحقيقي المُسجَّل في القيود (والذي يُخفَّض فعلياً بقيد عكسي عند كل مرتجع في sales.php)
-    // تصحيح إضافي جوهري: التصفية الآن بـ delivered_at (تاريخ التسليم الفعلي — لحظة تحويل الحالة
-    // فعلياً) بدل invoice_date (تاريخ إصدار الفاتورة الأصلي) — وإلا فاتورة صدرت الشهر الماضي "قيد
-    // الانتظار" ثم أُكِّد تسليمها اليوم لن تظهر في تقرير اليوم إطلاقاً رغم أن الإيراد اعتُرِف به اليوم
-    // فعلياً. الفواتير القديمة قبل هذا التصحيح (delivered_at فارغة) تعود احتياطياً لـ invoice_date.
+    // === تحديث: الإيراد يُقرَأ الآن مباشرة من دفتر اليومية (حساب "إيرادات المبيعات")، بتاريخ ترحيل
+    // القيد الفعلي (entry_date) — نفس مصدر القوائم المالية الرسمية بالضبط. هذا ضروري الآن لأن توقيت
+    // الاعتراف بالإيراد أصبح يعتمد على أيهما يكتمل لاحقاً (التسليم أو التحصيل النقدي)، فلا يمكن استنتاجه
+    // بموثوقية من invoice_date أو delivered_at وحدهما في جدول sales — القيد نفسه هو المصدر الوحيد الدقيق.
     $stmt_rev = $conn->prepare("
-        SELECT COALESCE(SUM(s.total_amount_syp), 0) - COALESCE((
-            SELECT SUM(sr.total_amount_syp)
-            FROM sales_returns sr
-            JOIN sales s2 ON sr.sale_id = s2.id
-            WHERE s2.delivery_status = 'Delivered' AND COALESCE(s2.delivered_at, s2.invoice_date) BETWEEN ? AND ?
-        ), 0) AS net_revenue
-        FROM sales s
-        WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+        SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE a.account_name = 'إيرادات المبيعات' AND je.entry_date BETWEEN ? AND ?
     ");
-    $stmt_rev->execute([$start_date, $end_date, $start_date, $end_date]);
+    $stmt_rev->execute([$start_date, $end_date]);
     $total_revenue = floatval($stmt_rev->fetchColumn());
 
     // ب) تكلفة البضائع المباعة (COGS): تصحيح جوهري لدقة تاريخية حقيقية —
@@ -141,8 +151,34 @@ try {
     $stmt_ship->execute([$start_date, $end_date]);
     $total_shipping = floatval($stmt_ship->fetchColumn());
 
-    // هـ) صافي الربح الحقيقي
-    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses + $total_shipping);
+    // هـ-2) رواتب وأجور + حوافز ومكافآت + خصومات مكتسبة من الموردين — تُضاف الآن حتى تصبح بطاقة
+    // "صافي الربح الحقيقي" مطابقة تماماً لصافي الربح في القوائم المالية الرسمية (financial_statements.php).
+    // تُقرَأ من دفتر اليومية مباشرة (وليس جدول منفصل) لأن الرواتب تُرحَّل بمسيرات شهرية بلا تاريخ يومي
+    // واضح للفلترة، والقيد المحاسبي (entry_date) هو المصدر الوحيد الموثوق لتاريخ الأثر الفعلي — وهو
+    // نفس المصدر الذي تعتمده القوائم الرسمية أصلاً، فتُضمَن المطابقة الحرفية.
+    $total_payroll = 0;
+    $total_supplier_discounts = 0;
+    try {
+        $stmt_payroll = $conn->prepare("
+            SELECT COALESCE(SUM(je.debit) - SUM(je.credit), 0)
+            FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name IN ('الرواتب والأجور', 'مصروف حوافز ومكافآت الموظفين')
+              AND je.entry_date BETWEEN ? AND ?
+        ");
+        $stmt_payroll->execute([$start_date, $end_date]);
+        $total_payroll = floatval($stmt_payroll->fetchColumn());
+
+        $stmt_sup_disc = $conn->prepare("
+            SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
+            FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'خصومات مكتسبة من الموردين' AND je.entry_date BETWEEN ? AND ?
+        ");
+        $stmt_sup_disc->execute([$start_date, $end_date]);
+        $total_supplier_discounts = floatval($stmt_sup_disc->fetchColumn());
+    } catch (Exception $e) { /* يُتجاهل إن تعذّر (حسابات لم تُنشأ بعد) */ }
+
+    // هـ) صافي الربح الحقيقي — يطابق الآن صافي الربح في القوائم المالية الرسمية تماماً
+    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses + $total_shipping + $total_payroll) + $total_supplier_discounts;
 
     // و) ذمم الموردين والخصوم: لا يوجد رصيد مخزَّن، يُحسب لحظياً بنفس منطق supplier_view.php
     // (إجمالي المشتريات - إجمالي المدفوعات - المردودات/الخصومات)، وهو رصيد إجمالي حالي غير مرتبط
@@ -251,9 +287,12 @@ try {
     </div>
 
     <div style="background: white; padding: 20px; border-radius: 8px; border-right: 4px solid #f6c23e; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
-        <span style="color: #6c757d; font-size: 13px; font-weight: bold;"><i class="fas fa-handshake"></i> العمولات والمصاريف</span>
-        <h3 style="color: #f6c23e; margin: 8px 0 0; font-family: monospace; font-size: 22px;"><?php echo number_format($total_commissions + $total_expenses + $total_shipping, 2); ?> <span style="font-size: 12px;">ل.س</span></h3>
-        <span style="font-size: 11px; color: #888;">(عمولات: <?php echo number_format($total_commissions, 0); ?> | مصاريف: <?php echo number_format($total_expenses, 0); ?> | شحن: <?php echo number_format($total_shipping, 0); ?>)</span>
+        <span style="color: #6c757d; font-size: 13px; font-weight: bold;"><i class="fas fa-handshake"></i> العمولات والمصاريف والرواتب</span>
+        <h3 style="color: #f6c23e; margin: 8px 0 0; font-family: monospace; font-size: 22px;"><?php echo number_format($total_commissions + $total_expenses + $total_shipping + $total_payroll, 2); ?> <span style="font-size: 12px;">ل.س</span></h3>
+        <span style="font-size: 11px; color: #888;">(عمولات: <?php echo number_format($total_commissions, 0); ?> | مصاريف: <?php echo number_format($total_expenses, 0); ?> | شحن: <?php echo number_format($total_shipping, 0); ?> | رواتب وحوافز: <?php echo number_format($total_payroll, 0); ?>)</span>
+        <?php if ($total_supplier_discounts > 0): ?>
+            <span style="font-size: 11px; color: #1cc88a; display: block; margin-top: 3px;">+ خصومات مكتسبة من الموردين: <?php echo number_format($total_supplier_discounts, 0); ?> (تُضاف للربح)</span>
+        <?php endif; ?>
     </div>
 
     <div style="background: white; padding: 20px; border-radius: 8px; border-right: 4px solid #1cc88a; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">

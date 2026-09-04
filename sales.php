@@ -241,13 +241,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
                 $debit_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
             }
 
-            // === إصلاح معماري جوهري: توقيت الاعتراف بالإيراد ===
-            // طرف الدائن يعتمد الآن على حالة التسليم وقت إصدار الفاتورة:
-            // - "تم التسليم" مباشرة: دائن إيرادات المبيعات الحقيقية (اعتراف فوري، مطابق لما كان سابقاً).
-            // - "قيد الانتظار/مؤجلة": دائن "إيرادات مؤجلة" (التزام مؤقت)، ولا يُعترَف بالإيراد الحقيقي
-            //   ولا COGS ولا عمولة المندوب إلا لاحقاً عند تأكيد التسليم فعلياً (عبر recognizeSaleRevenue()).
-            //   هذا يمنع تسجيل ربح غير محقق لفواتير قد تُرتجَع بالكامل قبل التسليم أصلاً.
-            if ($delivery_status === 'Delivered') {
+            // === تحديث سياسة: الإيراد الحقيقي لا يُعترَف به إلا عند تحقّق شرطين معاً: التسليم الفعلي
+            // والتحصيل النقدي الفعلي. أي حالة أخرى (بما فيها "مُسلَّمة لكن آجلة") تبقى "إيرادات مؤجلة"
+            // حتى يكتمل الشرط الناقص لاحقاً (عبر tryRecognizeRevenue عند التسليم أو عند التحصيل).
+            if ($delivery_status === 'Delivered' && $payment_status === 'Paid') {
                 $credit_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
             } else {
                 $credit_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
@@ -292,7 +289,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
                 // السطر الأول: مدين (نقدية أو ذمم) بكامل قيمة الفاتورة — يُرحَّل فوراً بغض النظر عن حالة
                 // التسليم، لأن استحقاق المبلغ من العميل (نقداً أو ديناً) يحدث فعلياً لحظة الفاتورة.
                 $insertJournalLine($debit_account_id, $total_syp, 0);
-                // السطر الثاني: دائن (إيرادات حقيقية أو مؤجلة حسب الحالة) بنفس القيمة لضمان توازن القيد
+                // السطر الثاني: دائن (إيرادات حقيقية إن اكتمل التسليم+التحصيل معاً، وإلا إيرادات مؤجلة)
                 $insertJournalLine($credit_account_id, 0, $total_syp);
 
                 // قيد تكلفة الشحن (إن أُدخلت) — مدين تكاليف الشحن (مصروف) / دائن الصندوق الرئيسي (نقداً)
@@ -463,7 +460,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 } else {
                     $debit_account_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
                 }
-                if ($delivery_status === 'Delivered') {
+                // الإيراد الحقيقي فقط إن اكتمل الشرطان معاً (تسليم + تحصيل)، وإلا إيرادات مؤجلة (نفس سياسة add_sale)
+                if ($delivery_status === 'Delivered' && $payment_status === 'Paid') {
                     $credit_account_id3 = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
                 } else {
                     $credit_account_id3 = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
@@ -509,6 +507,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
 
                 if ($delivery_status === 'Delivered') {
                     recognizeSaleRevenue($conn, $sale_id);
+                } else {
+                    tryRecognizeRevenue($conn, $sale_id);
                 }
 
                 $msg = "تم تحديث الفاتورة بالكامل (رقمها، تاريخها، أصنافها، وقيودها المحاسبية) بنجاح!";
@@ -563,6 +563,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                         postJournalLine($conn, $collect_cash_id, floatval($old_sale['total_amount_syp']), 0, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
                         postJournalLine($conn, $collect_recv_id, 0, floatval($old_sale['total_amount_syp']), $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
                     }
+                    // التحصيل يُكمِل الشرط الثاني (بعد التسليم) — نحاول الاعتراف بالإيراد الآن؛ لن يحدث
+                    // شيء إن كانت الفاتورة لا تزال "قيد الانتظار" (الشرط الأول غير مكتمل بعد).
+                    tryRecognizeRevenue($conn, $sale_id);
                 } elseif ($old_payment_status === 'Paid' && $payment_status !== 'Paid') {
                     // عكس تحصيل بالخطأ: التراجع عن تعليم فاتورة كانت "مدفوعة" لتصبح "آجلة" مرة أخرى
                     $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
@@ -609,6 +612,121 @@ $conn->exec("CREATE TABLE IF NOT EXISTS sales_return_items (
     unit_price_syp DECIMAL(15,2) NOT NULL,
     total_price_syp DECIMAL(15,2) NOT NULL
 )");
+
+// ============================================================
+// خصم لصنف داخل فاتورة مبيعات موجودة بالفعل — يحل محل الحاجة لـ"تعديل كامل" للفاتورة (حذف وإعادة
+// ترحيل كل القيود) عندما يكون الهدف فقط تخفيض سعر صنف مُباع مسبقاً (تفاوض لاحق، تعويض عميل...).
+// لا يُغيِّر الفاتورة الأصلية أو سطر الصنف إطلاقاً — يُضاف كسجل خصم منفصل + قيد محاسبي حقيقي، تماماً
+// بنفس مبدأ "خصم مسجَّل" المعتمد للموردين (supplier_discounts). بخلاف المرتجع: لا يُعيد أي كمية
+// للمخزون ولا يعكس أي COGS (البضاعة لم تُرتجَع فعلياً، فقط سعرها انخفض).
+$conn->exec("CREATE TABLE IF NOT EXISTS sale_item_discounts (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sale_item_id INT NOT NULL,
+    sale_id INT NOT NULL,
+    amount_syp DECIMAL(15,2) NOT NULL,
+    discount_date DATE NOT NULL,
+    notes TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_item_discount'])) {
+    requireRole($conn, ['admin', 'accountant']);
+
+    $disc_sale_id = intval($_POST['discount_sale_id']);
+    $disc_date = $_POST['discount_date'];
+    $disc_notes_top = trim($_POST['discount_notes'] ?? '');
+    $disc_item_ids = $_POST['disc_sale_item_id'] ?? [];
+    $disc_amounts = $_POST['disc_amount'] ?? [];
+
+    if ($disc_sale_id <= 0 || count($disc_item_ids) == 0) {
+        $error = "خطأ: يرجى اختيار فاتورة وقيمة خصم واحدة على الأقل.";
+    } elseif (isDateInClosedPeriod($conn, $disc_date)) {
+        $error = getPeriodLockErrorMessage($disc_date);
+    } else {
+        try {
+            $conn->beginTransaction();
+
+            $stmt_sale = $conn->prepare("SELECT * FROM sales WHERE id = ?");
+            $stmt_sale->execute([$disc_sale_id]);
+            $sale = $stmt_sale->fetch(PDO::FETCH_ASSOC);
+            if (!$sale) { throw new Exception("الفاتورة غير موجودة."); }
+
+            $total_discount_amount = 0;
+            $discount_lines = [];
+
+            for ($i = 0; $i < count($disc_item_ids); $i++) {
+                $sale_item_id = intval($disc_item_ids[$i]);
+                $disc_amt = floatval($disc_amounts[$i] ?? 0);
+                if ($disc_amt <= 0) { continue; }
+
+                $stmt_item = $conn->prepare("SELECT * FROM sale_items WHERE id = ? AND sale_id = ?");
+                $stmt_item->execute([$sale_item_id, $disc_sale_id]);
+                $item = $stmt_item->fetch(PDO::FETCH_ASSOC);
+                if (!$item) { continue; }
+
+                // سقف الخصم: لا يتجاوز (قيمة السطر الأصلية - أي خصم سابق عليه) — يمنع خصماً يُنزِل
+                // سعر الصنف تحت الصفر أو يتراكم بلا حدود عبر خصومات متكررة.
+                $stmt_already_disc = $conn->prepare("SELECT COALESCE(SUM(amount_syp), 0) FROM sale_item_discounts WHERE sale_item_id = ?");
+                $stmt_already_disc->execute([$sale_item_id]);
+                $already_discounted = floatval($stmt_already_disc->fetchColumn());
+                $max_discountable = floatval($item['total_price_syp']) - $already_discounted;
+
+                if ($disc_amt > $max_discountable) {
+                    throw new Exception("قيمة الخصم لصنف (معرف #$sale_item_id) تتجاوز الحد الأقصى المتاح ($max_discountable ل.س).");
+                }
+
+                $total_discount_amount += $disc_amt;
+                $discount_lines[] = ['sale_item_id' => $sale_item_id, 'amount' => $disc_amt];
+            }
+
+            if (count($discount_lines) == 0) { throw new Exception("لم تُدخَل أي قيمة خصم صحيحة."); }
+
+            foreach ($discount_lines as $line) {
+                $conn->prepare("INSERT INTO sale_item_discounts (sale_item_id, sale_id, amount_syp, discount_date, notes) VALUES (?, ?, ?, ?, ?)")
+                     ->execute([$line['sale_item_id'], $disc_sale_id, $line['amount'], $disc_date, $disc_notes_top]);
+            }
+
+            // القيد المحاسبي: يُشتَق الحساب من حالة الفاتورة الحالية فعلياً (نفس شرط tryRecognizeRevenue
+            // بالضبط) — بلا أي أثر على المخزون أو COGS، لأن البضاعة لم تُرتجَع فعلياً.
+            if ($sale['delivery_status'] === 'Delivered' && $sale['payment_status'] === 'Paid') {
+                $revenue_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
+            } else {
+                $revenue_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
+            }
+            if ($sale['payment_status'] === 'Paid') {
+                $other_account_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+            } else {
+                $other_account_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
+            }
+
+            if ($revenue_account_id && $other_account_id) {
+                $disc_entry_num = "JE-DISC-" . $disc_sale_id . "-" . time();
+                $disc_desc = "خصم على صنف/أصناف من فاتورة رقم: " . $sale['invoice_number'] . (!empty($disc_notes_top) ? " (" . $disc_notes_top . ")" : "");
+                $stmt_cols_disc = $conn->query("SHOW COLUMNS FROM journal_entries");
+                $existing_cols_disc = $stmt_cols_disc->fetchAll(PDO::FETCH_COLUMN);
+                $insertDiscJournalLine = function ($account_id, $debit, $credit) use ($conn, $existing_cols_disc, $disc_entry_num, $disc_date, $disc_desc) {
+                    $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
+                    $vals = [$account_id, $disc_date, $disc_desc, $debit, $credit];
+                    if (in_array('entry_number', $existing_cols_disc)) { $cols_to_insert[] = 'entry_number'; $vals[] = $disc_entry_num; }
+                    if (in_array('currency_code', $existing_cols_disc)) { $cols_to_insert[] = 'currency_code'; $vals[] = 'SYP'; }
+                    if (in_array('source_module', $existing_cols_disc)) { $cols_to_insert[] = 'source_module'; $vals[] = 'Sales Item Discount'; }
+                    $ph = implode(',', array_fill(0, count($cols_to_insert), '?'));
+                    $cn = implode(',', $cols_to_insert);
+                    $conn->prepare("INSERT INTO journal_entries ({$cn}) VALUES ({$ph})")->execute($vals);
+                };
+                $insertDiscJournalLine($revenue_account_id, $total_discount_amount, 0);
+                $insertDiscJournalLine($other_account_id, 0, $total_discount_amount);
+            }
+
+            $conn->commit();
+            $msg = "تم تسجيل الخصم (" . number_format($total_discount_amount, 2) . " ل.س) وترحيل القيد المحاسبي بنجاح، بلا تعديل الفاتورة الأصلية.";
+            logAudit($conn, 'INSERT', 'خصومات أصناف المبيعات', "خصم بقيمة " . number_format($total_discount_amount, 2) . " ل.س على فاتورة رقم: " . $sale['invoice_number'], $disc_sale_id);
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ أثناء تسجيل الخصم: " . $e->getMessage();
+        }
+    }
+}
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
     requireRole($conn, ['admin', 'accountant']);
@@ -716,11 +834,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
             $stmt_cols = $conn->query("SHOW COLUMNS FROM journal_entries");
             $existing_cols = $stmt_cols->fetchAll(PDO::FETCH_COLUMN);
 
-            // === تصحيح متوافق مع الاعتراف المؤجَّل بالإيراد ===
-            // إن كانت الفاتورة لا تزال "قيد الانتظار" (لم يُعترَف بإيرادها الحقيقي بعد)، فالمرتجع يجب أن
-            // يعكس "الإيراد المؤجَّل" (الالتزام المؤقت)، وليس "إيرادات المبيعات" الحقيقية التي لم تُسجَّل
-            // أصلاً بعد لهذه الفاتورة — وإلا سيظهر رصيد إيراد سالب وهمي مع بقاء الالتزام المؤجَّل متضخماً.
-            if ($sale['delivery_status'] === 'Delivered') {
+            // === تصحيح نهائي وجذري: يُشتَق الحساب من حالة الفاتورة الحالية فعلياً (نفس شرط
+            // tryRecognizeRevenue بالضبط)، وليس بقراءة القيد الأصلي ===
+            // قراءة "القيد الأصلي" كانت تفشل لأي فاتورة أُعيد تصنيفها لاحقاً من "إيرادات مؤجلة" إلى
+            // "إيرادات المبيعات" (بعد اكتمال شرطي التسليم والتحصيل عبر قيد -RECLASS منفصل، أو حتى عبر
+            // تصحيح يدوي) — لأن القيد الأصلي "JE-{invoice}" يبقى يُشير دائماً للحساب الأول الذي رُحِّل
+            // إليه وقت الإصدار، حتى بعد انتقال المبلغ فعلياً لحساب آخر لاحقاً. النتيجة: مرتجع لاحق كان
+            // يعكس الحساب الخطأ (القديم) بدل الحساب الذي يحمل المبلغ فعلياً الآن. الحل الصحيح: اشتقاق
+            // الحساب مباشرة من حالة الفاتورة الحالية، تماماً كما تفعل tryRecognizeRevenue عند التصنيف.
+            if ($sale['delivery_status'] === 'Delivered' && $sale['payment_status'] === 'Paid') {
                 $revenue_account_id = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
             } else {
                 $revenue_account_id = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
@@ -967,13 +1089,15 @@ $sales_list = $stmt_sales_list->fetchAll(PDO::FETCH_ASSOC);
 // جلب أصناف كل الفواتير مع الكمية المتبقية القابلة للإرجاع (لبناء نافذة المرتجع بالجافاسكريبت)
 $items_by_sale = [];
 $stmt_all_items = $conn->query("
-    SELECT si.id, si.sale_id, si.product_id, si.quantity, si.unit_price_syp, si.commission_per_unit, p.product_name,
-           COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0) AS already_returned
+    SELECT si.id, si.sale_id, si.product_id, si.quantity, si.unit_price_syp, si.total_price_syp, si.commission_per_unit, p.product_name,
+           COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0) AS already_returned,
+           COALESCE((SELECT SUM(sid.amount_syp) FROM sale_item_discounts sid WHERE sid.sale_item_id = si.id), 0) AS already_discounted
     FROM sale_items si
     LEFT JOIN products p ON si.product_id = p.id
 ");
 foreach ($stmt_all_items->fetchAll(PDO::FETCH_ASSOC) as $row) {
     $row['remaining'] = floatval($row['quantity']) - floatval($row['already_returned']);
+    $row['discountable'] = floatval($row['total_price_syp']) - floatval($row['already_discounted']);
     $items_by_sale[$row['sale_id']][] = $row;
 }
 
@@ -1253,6 +1377,9 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                                         <i class="fas fa-rotate-left"></i> مرتجع
                                     </button>
                                 <?php endif; ?>
+                                <button onclick='openDiscountModal(<?php echo $sale['id']; ?>, "<?php echo htmlspecialchars($sale['invoice_number'], ENT_QUOTES); ?>", <?php echo json_encode($items_for_sale, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)' class="row-action-btn" style="background:#f6c23e; color:#fff;" title="خصم على صنف بلا تعديل الفاتورة">
+                                    <i class="fas fa-percent"></i> خصم
+                                </button>
                                 </div>
                             </td>
                         </tr>
@@ -1770,6 +1897,32 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
     function closeReturnModal() {
         document.getElementById('returnModal').style.display = 'none';
     }
+
+    function openDiscountModal(saleId, invoiceNumber, items) {
+        document.getElementById('discount_sale_id').value = saleId;
+        document.getElementById('discount_invoice_label').innerText = invoiceNumber;
+        var tbody = document.getElementById('discountItemsBody');
+        tbody.innerHTML = '';
+        items.forEach(function(it) {
+            if (parseFloat(it.discountable) <= 0) return;
+            var tr = document.createElement('tr');
+            tr.innerHTML =
+                '<td style="padding:8px;">' + (it.product_name || '') + '</td>' +
+                '<td style="padding:8px; font-family:monospace;">' + it.total_price_syp + '</td>' +
+                '<td style="padding:8px; font-family:monospace; color:#f6c23e;">' + it.discountable + '</td>' +
+                '<td style="padding:8px;"><input type="hidden" name="disc_sale_item_id[]" value="' + it.id + '">' +
+                '<input type="number" step="0.01" min="0" max="' + it.discountable + '" name="disc_amount[]" value="0" style="width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;"></td>';
+            tbody.appendChild(tr);
+        });
+        if (tbody.children.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" style="padding:15px; text-align:center; color:#777;">لا توجد قيمة متبقية قابلة للخصم في هذه الفاتورة.</td></tr>';
+        }
+        document.getElementById('discountModal').style.display = 'flex';
+    }
+
+    function closeDiscountModal() {
+        document.getElementById('discountModal').style.display = 'none';
+    }
 </script>
 
 <!-- Modal مرتجع مبيعات -->
@@ -1803,6 +1956,45 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
             <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px;">
                 <button type="button" onclick="closeReturnModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
                 <button type="submit" style="background: #e74a3b; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">تسجيل المرتجع</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal خصم على صنف داخل فاتورة -->
+<div id="discountModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center; overflow-y: auto;">
+    <div style="background: white; width: 650px; max-width: 95%; border-radius: 8px; padding: 25px; margin: 30px auto;">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #f6c23e;"><i class="fas fa-percent"></i> خصم على فاتورة: <span id="discount_invoice_label"></span></h3>
+            <button onclick="closeDiscountModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <div style="background: #fff8e6; color: #856404; padding: 10px 12px; border-radius: 6px; font-size: 12.5px; margin-bottom: 15px;">
+            يُخفِّض سعر الصنف دون التأثير على الفاتورة الأصلية أو المخزون — لتخفيض سعري متفق عليه لاحقاً (تفاوض، تعويض)، وليس إرجاع بضاعة فعلي. للإرجاع الفعلي استخدم زر "مرتجع".
+        </div>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="add_item_discount" value="1">
+            <input type="hidden" name="discount_sale_id" id="discount_sale_id">
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">تاريخ الخصم:</label>
+                <input type="date" name="discount_date" value="<?php echo date('Y-m-d'); ?>" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            </div>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: right; margin-bottom: 15px;">
+                <thead>
+                    <tr style="background: #f8f9fc; border-bottom: 1px solid #ddd;">
+                        <th style="padding: 8px;">الصنف</th><th style="padding: 8px;">القيمة الأصلية</th><th style="padding: 8px;">المتاح للخصم</th><th style="padding: 8px;">قيمة الخصم (ل.س)</th>
+                    </tr>
+                </thead>
+                <tbody id="discountItemsBody"></tbody>
+            </table>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">سبب الخصم / ملاحظات:</label>
+                <textarea name="discount_notes" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; height: 55px;"></textarea>
+            </div>
+            <p style="font-size: 12px; color: #888;">يُرحَّل قيد محاسبي فوري يُخفِّض الإيراد (أو الإيراد المؤجَّل إن كانت الفاتورة قيد الانتظار) بلا حاجة لتعديل الفاتورة الأصلية.</p>
+            <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px;">
+                <button type="button" onclick="closeDiscountModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
+                <button type="submit" style="background: #f6c23e; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">تسجيل الخصم</button>
             </div>
         </form>
     </div>

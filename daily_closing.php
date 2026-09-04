@@ -58,7 +58,8 @@ $source_labels = [
     'Sales' => 'مبيعات', 'Sales Return' => 'مرتجعات مبيعات', 'Supplier Payment' => 'دفعات موردين',
     'Representative Payment' => 'دفعات مندوبين', 'Operational Expense' => 'مصاريف تشغيلية',
     'Expense Accrual' => 'استحقاق مصاريف', 'Payroll' => 'رواتب', 'Employee Advance' => 'سلف موظفين',
-    'Purchase' => 'فواتير شراء', 'Manual' => 'قيود يدوية', 'غير مصنَّف' => 'غير مصنَّف',
+    'Purchase' => 'فواتير شراء', 'Purchase Return' => 'مرتجعات شراء (استرداد نقدي)', 'Manual' => 'قيود يدوية',
+    'Payment Collection' => 'تحصيل دفعة من عميل', 'Office Inventory' => 'جرد مكتبي', 'غير مصنَّف' => 'غير مصنَّف',
 ];
 ?>
 <style>
