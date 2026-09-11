@@ -166,7 +166,7 @@ if (!function_exists('logAudit')) {
 // تبقى "قيد الانتظار" لفترة، وقد تُرتجَع بالكامل قبل التسليم أصلاً.
 
 if (!function_exists('findOrCreateAccount')) {
-    function findOrCreateAccount($conn, array $keywords, string $fallback_name) {
+    function findOrCreateAccount($conn, array $keywords, string $fallback_name, ?string $account_type = null) {
         try {
             $stmt_cols = $conn->query("SHOW COLUMNS FROM accounts");
             $cols = $stmt_cols->fetchAll(PDO::FETCH_COLUMN);
@@ -183,7 +183,27 @@ if (!function_exists('findOrCreateAccount')) {
                 if ($acc_id) return $acc_id;
             }
             $target_col = $name_col ?: ($cols[1] ?? 'name');
-            $conn->exec("INSERT INTO accounts (`{$target_col}`) VALUES (" . $conn->quote($fallback_name) . ")");
+
+            // === تصحيح جذري: إن كان العمود account_code موجوداً وفريداً (UNIQUE)، يجب توليد قيمة
+            // فعلية وفريدة له دائماً — وإلا يفشل الإدراج بصمت (Exception تُبتلَع أدناه) لأي حساب ثانٍ
+            // يُنشأ بلا رمز، فتُعيد الدالة null والقيد المحاسبي بأكمله يختفي بصمت تام دون أي تنبيه.
+            $ins_cols = [$target_col]; $ins_vals = [$fallback_name];
+            if (in_array('account_code', $cols)) {
+                $code = (string) (100000 + random_int(0, 899999));
+                $stmt_dup = $conn->prepare("SELECT COUNT(*) FROM accounts WHERE account_code = ?");
+                for ($i = 0; $i < 10; $i++) {
+                    $stmt_dup->execute([$code]);
+                    if ($stmt_dup->fetchColumn() == 0) { break; }
+                    $code = (string) (100000 + random_int(0, 899999));
+                }
+                $ins_cols[] = 'account_code'; $ins_vals[] = $code;
+            }
+            if ($account_type !== null && in_array('account_type', $cols)) {
+                $ins_cols[] = 'account_type'; $ins_vals[] = $account_type;
+            }
+            $placeholders = implode(',', array_fill(0, count($ins_cols), '?'));
+            $stmt_ins = $conn->prepare("INSERT INTO accounts (`" . implode('`,`', $ins_cols) . "`) VALUES ({$placeholders})");
+            $stmt_ins->execute($ins_vals);
             return $conn->lastInsertId();
         } catch (Exception $e) { return null; }
     }

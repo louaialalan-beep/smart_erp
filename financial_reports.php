@@ -157,7 +157,6 @@ try {
     // واضح للفلترة، والقيد المحاسبي (entry_date) هو المصدر الوحيد الموثوق لتاريخ الأثر الفعلي — وهو
     // نفس المصدر الذي تعتمده القوائم الرسمية أصلاً، فتُضمَن المطابقة الحرفية.
     $total_payroll = 0;
-    $total_supplier_discounts = 0;
     try {
         $stmt_payroll = $conn->prepare("
             SELECT COALESCE(SUM(je.debit) - SUM(je.credit), 0)
@@ -167,18 +166,13 @@ try {
         ");
         $stmt_payroll->execute([$start_date, $end_date]);
         $total_payroll = floatval($stmt_payroll->fetchColumn());
-
-        $stmt_sup_disc = $conn->prepare("
-            SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
-            FROM journal_entries je JOIN accounts a ON je.account_id = a.id
-            WHERE a.account_name = 'خصومات مكتسبة من الموردين' AND je.entry_date BETWEEN ? AND ?
-        ");
-        $stmt_sup_disc->execute([$start_date, $end_date]);
-        $total_supplier_discounts = floatval($stmt_sup_disc->fetchColumn());
     } catch (Exception $e) { /* يُتجاهل إن تعذّر (حسابات لم تُنشأ بعد) */ }
 
     // هـ) صافي الربح الحقيقي — يطابق الآن صافي الربح في القوائم المالية الرسمية تماماً
-    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses + $total_shipping + $total_payroll) + $total_supplier_discounts;
+    // تصحيح: "خصومات مكتسبة من الموردين" لم تعد تُضاف هنا إطلاقاً — بناءً على توضيح صريح: هذا المبلغ
+    // لا يدخل الصندوق فعلياً، بل يقتصر أثره على تخفيض ذمم الموردين فقط (بند ميزانية عمومية بحت، وليس
+    // إيراداً). أُعيد تصنيف الحساب نفسه من Revenue إلى Asset في شجرة الحسابات لهذا السبب بالضبط.
+    $net_profit = $total_revenue - ($total_cogs_syp + $total_commissions + $total_expenses + $total_shipping + $total_payroll);
 
     // و) ذمم الموردين والخصوم: لا يوجد رصيد مخزَّن، يُحسب لحظياً بنفس منطق supplier_view.php
     // (إجمالي المشتريات - إجمالي المدفوعات - المردودات/الخصومات)، وهو رصيد إجمالي حالي غير مرتبط
@@ -290,9 +284,7 @@ try {
         <span style="color: #6c757d; font-size: 13px; font-weight: bold;"><i class="fas fa-handshake"></i> العمولات والمصاريف والرواتب</span>
         <h3 style="color: #f6c23e; margin: 8px 0 0; font-family: monospace; font-size: 22px;"><?php echo number_format($total_commissions + $total_expenses + $total_shipping + $total_payroll, 2); ?> <span style="font-size: 12px;">ل.س</span></h3>
         <span style="font-size: 11px; color: #888;">(عمولات: <?php echo number_format($total_commissions, 0); ?> | مصاريف: <?php echo number_format($total_expenses, 0); ?> | شحن: <?php echo number_format($total_shipping, 0); ?> | رواتب وحوافز: <?php echo number_format($total_payroll, 0); ?>)</span>
-        <?php if ($total_supplier_discounts > 0): ?>
-            <span style="font-size: 11px; color: #1cc88a; display: block; margin-top: 3px;">+ خصومات مكتسبة من الموردين: <?php echo number_format($total_supplier_discounts, 0); ?> (تُضاف للربح)</span>
-        <?php endif; ?>
+
     </div>
 
     <div style="background: white; padding: 20px; border-radius: 8px; border-right: 4px solid #1cc88a; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">

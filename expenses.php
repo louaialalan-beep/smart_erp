@@ -2,6 +2,7 @@
 session_start();
 include 'header.php';
 require_once __DIR__ . '/includes/system_helpers.php';
+require_once __DIR__ . '/functions.php';
 $msg = ""; $error = "";
 
 // دالة عامة للبحث عن حساب محاسبي بكلمات مفتاحية أو إنشائه إن لم يوجد (نفس منطق باقي النظام)
@@ -32,9 +33,35 @@ $conn->exec("CREATE TABLE IF NOT EXISTS recurring_expense_templates (
     category VARCHAR(100) NOT NULL,
     cost_center VARCHAR(100),
     monthly_amount DECIMAL(15,2) NOT NULL,
+    currency_code ENUM('SYP','USD') NOT NULL DEFAULT 'SYP',
+    frequency ENUM('weekly','monthly','yearly') NOT NULL DEFAULT 'monthly',
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 )");
+// دفاعي: إضافة عمودي frequency وcurrency_code لو كان الجدول موجوداً مسبقاً من نسخة أقدم بلا هذين
+// العمودين، أو تحديث نطاق frequency (ENUM) لو كان موجوداً بنسخة أقدم بلا خيار 'weekly'
+try {
+    $rt_cols = $conn->query("SHOW COLUMNS FROM recurring_expense_templates")->fetchAll(PDO::FETCH_COLUMN);
+    if (!in_array('frequency', $rt_cols)) {
+        $conn->exec("ALTER TABLE recurring_expense_templates ADD COLUMN frequency ENUM('weekly','monthly','yearly') NOT NULL DEFAULT 'monthly'");
+    } else {
+        $conn->exec("ALTER TABLE recurring_expense_templates MODIFY COLUMN frequency ENUM('weekly','monthly','yearly') NOT NULL DEFAULT 'monthly'");
+    }
+    if (!in_array('currency_code', $rt_cols)) {
+        $conn->exec("ALTER TABLE recurring_expense_templates ADD COLUMN currency_code ENUM('SYP','USD') NOT NULL DEFAULT 'SYP'");
+    }
+} catch (Exception $e) { /* يُتجاهل */ }
+
+// دالة موحَّدة لحساب الاستحقاق اليومي **بالعملة الأصلية للبند** لأي بند بغض النظر عن تكراره —
+// أسبوعي (÷6 أيام عمل فعلية، وليس 7)، شهري (÷30)، أو سنوي (÷360 = 12×30). التحويل الفعلي لليرة
+// (إن كانت العملة دولاراً) يحدث لاحقاً بسعر الصرف الحقيقي *ليوم الاستحقاق بالذات* في نقطة الترحيل
+// نفسها، وليس هنا — لضمان دقة تعكس تقلب السعر يوماً بيوم، لا سعراً ثابتاً واحداً طوال السنة.
+function getDailyAccrualAmount($tpl) {
+    $freq = $tpl['frequency'] ?? 'monthly';
+    if ($freq === 'weekly') { return round(floatval($tpl['monthly_amount']) / 6, 2); }
+    if ($freq === 'yearly') { return round(floatval($tpl['monthly_amount']) / 360, 2); }
+    return round(floatval($tpl['monthly_amount']) / 30, 2);
+}
 $conn->exec("CREATE TABLE IF NOT EXISTS expense_accruals (
     id INT AUTO_INCREMENT PRIMARY KEY,
     template_id INT NOT NULL,
@@ -67,13 +94,18 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_expense'])) {
             // هذا مصروف مدفوع نقداً فوراً: مدين المصروف / دائن الصندوق
             $entry_num = "JE-EXP-" . $expense_id;
             $desc = "مصروف تشغيلي: $category" . (!empty($cost_center) ? " (مركز التكلفة: $cost_center)" : "");
-            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category, 'Expense');
+            // تصحيح: كل فئات المصاريف الفورية (تلج، غاز، قهوة، بدل طعام...) تُرحَّل الآن تحت حساب واحد
+            // موحَّد "مصاريف تشغيلية" بدل إنشاء حساب منفصل لكل فئة — يستثني هذا التوحيد "المصاريف
+            // المتكررة" (إيجار، رواتب) عمداً، لأنها تبقى مصنَّفة كل واحدة بحسابها الخاص (منطق منفصل
+            // تماماً في معالج الاستحقاقات أدناه، لم يُمَس).
+            $debit_account_id  = findOrCreateAccount($conn, ['مصاريف تشغيلية'], 'مصاريف تشغيلية', 'Expense');
             $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
-            if ($debit_account_id && $credit_account_id) {
-                insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
-                insertJournalLine($conn, $credit_account_id, 0, $amount, $entry_num, $expense_date, $desc, 'Operational Expense');
+            if (!$debit_account_id || !$credit_account_id) {
+                throw new Exception("تعذّر تحديد/إنشاء الحساب المحاسبي اللازم — لم يُحفَظ المصروف لتفادي تسجيل بلا قيد محاسبي مقابل.");
             }
+            insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
+            insertJournalLine($conn, $credit_account_id, 0, $amount, $entry_num, $expense_date, $desc, 'Operational Expense');
 
             $conn->commit();
             $msg = "تم تسجيل المصروف التشغيلي وترحيل القيد المحاسبي بنجاح!";
@@ -118,13 +150,14 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_expense'])) {
             $conn->prepare("DELETE FROM journal_entries WHERE entry_number = ?")->execute([$entry_num]);
 
             $desc = "مصروف تشغيلي: $category" . (!empty($cost_center) ? " (مركز التكلفة: $cost_center)" : "") . " (مُعدَّل)";
-            $debit_account_id  = findOrCreateAccount($conn, [$category, 'مصروفات تشغيلية'], $category, 'Expense');
+            $debit_account_id  = findOrCreateAccount($conn, ['مصاريف تشغيلية'], 'مصاريف تشغيلية', 'Expense');
             $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
-            if ($debit_account_id && $credit_account_id) {
-                insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
-                insertJournalLine($conn, $credit_account_id, 0, $amount, $entry_num, $expense_date, $desc, 'Operational Expense');
+            if (!$debit_account_id || !$credit_account_id) {
+                throw new Exception("تعذّر تحديد/إنشاء الحساب المحاسبي اللازم — أُلغي التعديل لتفادي قيد غير مكتمل.");
             }
+            insertJournalLine($conn, $debit_account_id, $amount, 0, $entry_num, $expense_date, $desc, 'Operational Expense');
+            insertJournalLine($conn, $credit_account_id, 0, $amount, $entry_num, $expense_date, $desc, 'Operational Expense');
 
             $conn->commit();
             $msg = "تم تحديث المصروف والقيد المحاسبي المرتبط به بنجاح!";
@@ -142,16 +175,57 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_template'])) {
     $t_category = trim($_POST['t_category']);
     $t_cost_center = trim($_POST['t_cost_center']);
     $t_monthly_amount = floatval($_POST['t_monthly_amount']);
+    $t_frequency = in_array($_POST['t_frequency'] ?? '', ['weekly','monthly','yearly']) ? $_POST['t_frequency'] : 'monthly';
+    $t_currency = ($_POST['t_currency'] ?? 'SYP') === 'USD' ? 'USD' : 'SYP';
 
     if (!empty($t_name) && $t_monthly_amount > 0) {
         try {
-            $stmt = $conn->prepare("INSERT INTO recurring_expense_templates (name, category, cost_center, monthly_amount) VALUES (?, ?, ?, ?)");
-            $stmt->execute([$t_name, $t_category, $t_cost_center, $t_monthly_amount]);
+            $stmt = $conn->prepare("INSERT INTO recurring_expense_templates (name, category, cost_center, monthly_amount, frequency, currency_code) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$t_name, $t_category, $t_cost_center, $t_monthly_amount, $t_frequency, $t_currency]);
             $template_id = $conn->lastInsertId();
             $msg = "تمت إضافة بند المصروف المتكرر بنجاح!";
-            logAudit($conn, 'INSERT', 'بنود المصاريف المتكررة', "إضافة بند متكرر: $t_name بمبلغ شهري " . number_format($t_monthly_amount, 2) . " ل.س", $template_id);
+            logAudit($conn, 'INSERT', 'بنود المصاريف المتكررة', "إضافة بند متكرر: $t_name بمبلغ ($t_frequency) " . number_format($t_monthly_amount, 2) . " $t_currency", $template_id);
         } catch (Exception $e) { $error = "خطأ: " . $e->getMessage(); }
     } else { $error = "يرجى إدخال اسم البند ومبلغ شهري صحيح."; }
+}
+
+// 2-ب. تعديل بند متكرر موجود — لم تكن هذه الميزة موجودة إطلاقاً سابقاً (إضافة فقط). لا يمسّ هذا
+// أي استحقاق سابق مُرحَّل بالفعل (تلك القيود ثابتة تاريخياً) — يؤثر فقط على الترحيلات القادمة.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_template'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $tpl_id = intval($_POST['tpl_id']);
+    $t_name = trim($_POST['t_name']);
+    $t_category = trim($_POST['t_category']);
+    $t_cost_center = trim($_POST['t_cost_center']);
+    $t_monthly_amount = floatval($_POST['t_monthly_amount']);
+    $t_frequency = in_array($_POST['t_frequency'] ?? '', ['weekly','monthly','yearly']) ? $_POST['t_frequency'] : 'monthly';
+    $t_currency = ($_POST['t_currency'] ?? 'SYP') === 'USD' ? 'USD' : 'SYP';
+
+    if (empty($t_name) || $t_monthly_amount <= 0) {
+        $error = "يرجى إدخال اسم البند ومبلغ صحيح أكبر من صفر.";
+    } else {
+        try {
+            $conn->prepare("UPDATE recurring_expense_templates SET name = ?, category = ?, cost_center = ?, monthly_amount = ?, frequency = ?, currency_code = ? WHERE id = ?")
+                 ->execute([$t_name, $t_category, $t_cost_center, $t_monthly_amount, $t_frequency, $t_currency, $tpl_id]);
+            $msg = "تم تحديث بند المصروف المتكرر بنجاح! (لا يؤثر على الاستحقاقات السابقة المُرحَّلة بالفعل، فقط على الترحيلات القادمة)";
+            logAudit($conn, 'UPDATE', 'بنود المصاريف المتكررة', "تعديل بند متكرر #$tpl_id: $t_name إلى ($t_frequency) " . number_format($t_monthly_amount, 2) . " $t_currency", $tpl_id);
+        } catch (Exception $e) { $error = "خطأ: " . $e->getMessage(); }
+    }
+}
+
+// 2-ج. حذف بند متكرر — يُسمح فقط إن لم يكن له أي استحقاق مُرحَّل سابقاً (لتفادي كسر السجل التاريخي)
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_template'])) {
+    requireRole($conn, ['admin']);
+    $tpl_id = intval($_POST['tpl_id']);
+    $stmt_usage = $conn->prepare("SELECT COUNT(*) FROM expense_accruals WHERE template_id = ?");
+    $stmt_usage->execute([$tpl_id]);
+    if ($stmt_usage->fetchColumn() > 0) {
+        $error = "لا يمكن حذف هذا البند: له استحقاقات مُرحَّلة سابقاً في السجل. يمكنك إلغاء تفعيله بدلاً من ذلك.";
+    } else {
+        $conn->prepare("DELETE FROM recurring_expense_templates WHERE id = ?")->execute([$tpl_id]);
+        $msg = "تم حذف البند المتكرر بنجاح (لم يكن له أي استحقاق سابق مُرحَّل).";
+        logAudit($conn, 'DELETE', 'بنود المصاريف المتكررة', "حذف بند متكرر #$tpl_id", $tpl_id);
+    }
 }
 
 // 3. ترحيل استحقاق يومي لبند متكرر واحد (أو لكل البنود النشطة دفعة واحدة)
@@ -191,7 +265,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && (isset($_POST['accrue_one']) || isse
                 continue;
             }
 
-            $daily_amount = round($tpl['monthly_amount'] / $days_divisor, 2);
+            $daily_amount_native = getDailyAccrualAmount($tpl);
+            $tpl_currency = $tpl['currency_code'] ?? 'SYP';
+            $daily_rate = ($tpl_currency === 'USD') ? getExchangeRateForDate($conn, 'USD', $accrual_date) : 1;
+            $daily_amount = ($tpl_currency === 'USD') ? round($daily_amount_native * $daily_rate, 2) : $daily_amount_native;
 
             $conn->beginTransaction();
 
@@ -199,19 +276,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && (isset($_POST['accrue_one']) || isse
             $stmt_acc->execute([$tid, $accrual_date, $daily_amount]);
 
             // يظهر أيضاً في جدول المصاريف العادي للتقارير الموحّدة
-            $note = "استحقاق يومي تلقائي (" . number_format($tpl['monthly_amount'], 2) . " ÷ $days_divisor يوم) لبند: " . $tpl['name'];
+            $note = "استحقاق يومي تلقائي (" . number_format($tpl['monthly_amount'], 2) . " $tpl_currency ÷ $days_divisor يوم" . ($tpl_currency === 'USD' ? "، بسعر صرف $daily_rate ليوم $accrual_date" : "") . ") لبند: " . $tpl['name'];
             $stmt_exp = $conn->prepare("INSERT INTO operational_expenses (category, amount, cost_center, expense_date, notes) VALUES (?, ?, ?, ?, ?)");
             $stmt_exp->execute([$tpl['category'], $daily_amount, $tpl['cost_center'], $accrual_date, $note]);
             $expense_id = $conn->lastInsertId();
 
             $entry_num = "JE-ACCR-" . $expense_id;
-            $debit_account_id  = findOrCreateAccount($conn, [$tpl['category'], 'مصروفات تشغيلية'], $tpl['category'], 'Expense');
-            $credit_account_id = findOrCreateAccount($conn, ['مصروفات مستحقة', 'ذمم دائنة', 'accrued'], 'مصروفات مستحقة الدفع', 'Liability');
+            $debit_account_id  = findOrCreateAccount($conn, [$tpl['category']], $tpl['category'], 'Expense');
+            $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
 
-            if ($debit_account_id && $credit_account_id) {
-                insertJournalLine($conn, $debit_account_id, $daily_amount, 0, $entry_num, $accrual_date, $note, 'Expense Accrual');
-                insertJournalLine($conn, $credit_account_id, 0, $daily_amount, $entry_num, $accrual_date, $note, 'Expense Accrual');
+            if (!$debit_account_id || !$credit_account_id) {
+                throw new Exception("تعذّر تحديد/إنشاء الحساب المحاسبي اللازم لبند: " . $tpl['name']);
             }
+            insertJournalLine($conn, $debit_account_id, $daily_amount, 0, $entry_num, $accrual_date, $note, 'Expense Accrual');
+            insertJournalLine($conn, $credit_account_id, 0, $daily_amount, $entry_num, $accrual_date, $note, 'Expense Accrual');
 
             $conn->commit();
             logAudit($conn, 'INSERT', 'استحقاق المصاريف المتكررة', "ترحيل استحقاق يومي لبند: " . $tpl['name'] . " بقيمة " . number_format($daily_amount, 2) . " ل.س (يوم $accrual_date)", $expense_id);
@@ -229,6 +307,96 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && (isset($_POST['accrue_one']) || isse
         if ($conn->inTransaction()) { $conn->rollBack(); }
         $error = "خطأ أثناء ترحيل الاستحقاق: " . $e->getMessage();
     }
+    }
+}
+
+// 3-ب. ترحيل استحقاق تراكمي (Backfill) لبند واحد من تاريخ بداية محدَّد وحتى اليوم — لحالة إضافة بند
+// متكرر لم يكن موجوداً من أول الشهر (مثل إيجار يبدأ فعلياً من 2026-09-01 لكنك تُضيفه اليوم في منتصف
+// الشهر)، فيُرحَّل استحقاق كل يوم فائت بين تاريخ البداية واليوم، بلا تكرار لأي يوم سبق ترحيله فعلاً.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['backfill_accrual'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $tid = intval($_POST['backfill_template_id']);
+    $backfill_start = $_POST['backfill_start_date'] ?? date('Y-m-01');
+    $backfill_end = date('Y-m-d');
+
+    $stmt_t = $conn->prepare("SELECT * FROM recurring_expense_templates WHERE id = ? AND is_active = 1");
+    $stmt_t->execute([$tid]);
+    $tpl = $stmt_t->fetch(PDO::FETCH_ASSOC);
+
+    if (!$tpl) {
+        $error = "البند المتكرر غير موجود أو غير نشط.";
+    } elseif ($backfill_start > $backfill_end) {
+        $error = "تاريخ البداية يجب أن يكون قبل اليوم أو يساويه.";
+    } else {
+        try {
+            $days_divisor2 = 30;
+            $daily_amount_native = getDailyAccrualAmount($tpl);
+            $tpl_currency = $tpl['currency_code'] ?? 'SYP';
+            $posted_count = 0; $skipped_count = 0; $blocked_dates = [];
+
+            $cursor = new DateTime($backfill_start);
+            $end_dt = new DateTime($backfill_end);
+            while ($cursor <= $end_dt) {
+                $day_str = $cursor->format('Y-m-d');
+
+                if (isDateInClosedPeriod($conn, $day_str)) {
+                    $blocked_dates[] = $day_str;
+                    $cursor->modify('+1 day');
+                    continue;
+                }
+
+                $stmt_dup = $conn->prepare("SELECT id FROM expense_accruals WHERE template_id = ? AND accrual_date = ?");
+                $stmt_dup->execute([$tid, $day_str]);
+                if ($stmt_dup->fetchColumn()) {
+                    $skipped_count++;
+                    $cursor->modify('+1 day');
+                    continue;
+                }
+
+                // سعر الصرف الفعلي لهذا اليوم بالذات — لا سعر ثابت واحد لكل أيام الترحيل التراكمي
+                $day_rate = ($tpl_currency === 'USD') ? getExchangeRateForDate($conn, 'USD', $day_str) : 1;
+                $daily_amount = ($tpl_currency === 'USD') ? round($daily_amount_native * $day_rate, 2) : $daily_amount_native;
+
+                $conn->beginTransaction();
+
+                $conn->prepare("INSERT INTO expense_accruals (template_id, accrual_date, amount) VALUES (?, ?, ?)")
+                     ->execute([$tid, $day_str, $daily_amount]);
+
+                $note = "استحقاق يومي تراكمي (تصحيح لاحق) — " . number_format($tpl['monthly_amount'], 2) . " $tpl_currency ÷ $days_divisor2 يوم" . ($tpl_currency === 'USD' ? "، بسعر صرف $day_rate ليوم $day_str" : "") . " — لبند: " . $tpl['name'];
+                $conn->prepare("INSERT INTO operational_expenses (category, amount, cost_center, expense_date, notes) VALUES (?, ?, ?, ?, ?)")
+                     ->execute([$tpl['category'], $daily_amount, $tpl['cost_center'], $day_str, $note]);
+                $expense_id = $conn->lastInsertId();
+
+                $entry_num = "JE-ACCR-" . $expense_id;
+                $debit_account_id  = findOrCreateAccount($conn, [$tpl['category']], $tpl['category'], 'Expense');
+                $credit_account_id = findOrCreateAccount($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+
+                if (!$debit_account_id || !$credit_account_id) {
+                    throw new Exception("تعذّر تحديد/إنشاء الحساب المحاسبي اللازم لبند: " . $tpl['name'] . " ليوم $day_str");
+                }
+                insertJournalLine($conn, $debit_account_id, $daily_amount, 0, $entry_num, $day_str, $note, 'Expense Accrual');
+                insertJournalLine($conn, $credit_account_id, 0, $daily_amount, $entry_num, $day_str, $note, 'Expense Accrual');
+
+                $conn->commit();
+                $posted_count++;
+                $cursor->modify('+1 day');
+            }
+
+            $parts = [];
+            if ($posted_count > 0) { $parts[] = "تم ترحيل استحقاق $posted_count يوم بنجاح من $backfill_start إلى $backfill_end"; }
+            if ($skipped_count > 0) { $parts[] = "تخطي $skipped_count يوم مُرحَّل مسبقاً"; }
+            if (count($blocked_dates) > 0) { $parts[] = "تعذّر ترحيل " . count($blocked_dates) . " يوم ضمن فترة مالية مُقفَلة"; }
+
+            if ($posted_count > 0) {
+                $msg = implode(" — ", $parts) . " لبند: " . $tpl['name'] . ".";
+                logAudit($conn, 'INSERT', 'استحقاق المصاريف المتكررة', "ترحيل استحقاق تراكمي لبند: " . $tpl['name'] . " من $backfill_start إلى $backfill_end — $posted_count يوم بقيمة " . number_format($daily_amount, 2) . " ل.س/يوم");
+            } else {
+                $error = implode(" — ", $parts) ?: "لا توجد أيام جديدة لترحيلها ضمن هذا النطاق.";
+            }
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ أثناء الترحيل التراكمي: " . $e->getMessage();
+        }
     }
 }
 
@@ -268,10 +436,61 @@ try {
 <?php if ($msg): ?><div style="background: #d4edda; color: #155724; padding: 12px; border-radius: 6px; margin-bottom: 15px;"><?php echo $msg; ?></div><?php endif; ?>
 <?php if ($error): ?><div style="background: #f8d7da; color: #721c24; padding: 12px; border-radius: 6px; margin-bottom: 15px;"><?php echo $error; ?></div><?php endif; ?>
 
+<?php
+// ============================================================
+// فلتر تاريخ (من/إلى) + بطاقتان: إجمالي المصاريف التشغيلية (الفورية، بحساب "مصاريف تشغيلية" الموحَّد)
+// مقابل إجمالي المصاريف المتكررة (استحقاقات إيجار/رواتب، بحساباتها المنفصلة الخاصة بكل بند)
+// ============================================================
+$exp_filter_start = $_GET['exp_filter_start'] ?? date('Y-m-01');
+$exp_filter_end   = $_GET['exp_filter_end'] ?? date('Y-m-t');
+
+$total_immediate_expenses = 0;
+$total_recurring_expenses = 0;
+try {
+    $stmt_immediate = $conn->prepare("
+        SELECT COALESCE(SUM(je.debit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE a.account_name = 'مصاريف تشغيلية' AND je.source_module = 'Operational Expense'
+          AND je.entry_date BETWEEN ? AND ?
+    ");
+    $stmt_immediate->execute([$exp_filter_start, $exp_filter_end]);
+    $total_immediate_expenses = floatval($stmt_immediate->fetchColumn());
+
+    $stmt_recurring = $conn->prepare("
+        SELECT COALESCE(SUM(je.debit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE je.source_module = 'Expense Accrual' AND je.entry_date BETWEEN ? AND ?
+    ");
+    $stmt_recurring->execute([$exp_filter_start, $exp_filter_end]);
+    $total_recurring_expenses = floatval($stmt_recurring->fetchColumn());
+} catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+?>
+
+<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
+    <form method="GET" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+        <label style="font-size: 13px; font-weight: bold; color: #555;"><i class="fas fa-filter"></i> من:</label>
+        <input type="date" name="exp_filter_start" value="<?php echo htmlspecialchars($exp_filter_start); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+        <label style="font-size: 13px; font-weight: bold; color: #555;">إلى:</label>
+        <input type="date" name="exp_filter_end" value="<?php echo htmlspecialchars($exp_filter_end); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+        <button type="submit" style="background: #4e73df; color: white; border: none; padding: 7px 16px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold;">تطبيق</button>
+    </form>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 15px; margin-bottom: 20px;">
+    <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 18px; border-radius: 8px;">
+        <div style="color: #a33636; font-size: 13px; font-weight: bold;">إجمالي المصاريف التشغيلية (الفورية)</div>
+        <div style="font-size: 22px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 6px;"><?php echo number_format($total_immediate_expenses, 2); ?> ل.س</div>
+    </div>
+    <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 18px; border-radius: 8px;">
+        <div style="color: #856404; font-size: 13px; font-weight: bold;">إجمالي المصاريف التشغيلية المتكررة (استحقاق إيجار/رواتب)</div>
+        <div style="font-size: 22px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 6px;"><?php echo number_format($total_recurring_expenses, 2); ?> ل.س</div>
+    </div>
+</div>
+
 <!-- توضيح منطق الاستحقاق اليومي -->
 <div style="background: #e8f4fd; border: 1px solid #bbe1fa; padding: 12px 18px; border-radius: 6px; margin-bottom: 20px; color: #0c5460; font-size: 13.5px;">
     <i class="fas fa-info-circle" style="margin-left: 5px;"></i>
-    <strong>الاستحقاق اليومي للمصاريف المتكررة:</strong> عرِّف البند مرة واحدة (كإيجار المحل أو إجمالي الرواتب الشهرية)، ثم رحِّل استحقاقه اليومي بضغطة زر. القيد المُنشأ هو <strong>استحقاق</strong> (مدين المصروف / دائن "مصروفات مستحقة الدفع") وليس دفعاً نقدياً فورياً، لأنك لم تدفع المبلغ فعلياً كل يوم — يُصفَّى هذا الالتزام لاحقاً بقيد سداد منفصل عند الدفع الفعلي.
+    <strong>الاستحقاق اليومي للمصاريف المتكررة:</strong> عرِّف البند مرة واحدة (كإيجار المحل أو إجمالي الرواتب الشهرية)، ثم رحِّل استحقاقه اليومي بضغطة زر. القيد المُنشأ الآن يُخصَم **فعلياً من الصندوق النقدي** كل يوم (مدين المصروف / دائن "الصندوق الرئيسي") — يُعامَل كدفع نقدي فعلي يومي، لا كالتزام مؤجَّل.
 </div>
 
 <!-- قسم البنود المتكررة والاستحقاق اليومي -->
@@ -294,32 +513,60 @@ try {
                 <th style="padding: 10px 15px;">اسم البند</th>
                 <th style="padding: 10px 15px;">التصنيف</th>
                 <th style="padding: 10px 15px;">مركز التكلفة</th>
-                <th style="padding: 10px 15px;">المبلغ الشهري</th>
-                <th style="padding: 10px 15px;">الاستحقاق اليومي (÷30)</th>
+                <th style="padding: 10px 15px;">التكرار / المبلغ</th>
+                <th style="padding: 10px 15px;">الاستحقاق اليومي</th>
                 <th style="padding: 10px 15px; text-align: center;">الإجراء</th>
             </tr>
         </thead>
         <tbody>
             <?php if (count($templates_list) > 0): foreach ($templates_list as $tpl): 
-                $daily = round($tpl['monthly_amount'] / 30, 2);
+                $daily = getDailyAccrualAmount($tpl);
                 $already_today = in_array($tpl['id'], $accrued_today_ids);
             ?>
                 <tr style="border-bottom: 1px solid #f1f1f1;">
                     <td style="padding: 10px 15px; font-weight: bold; color: #333;"><?php echo htmlspecialchars($tpl['name']); ?></td>
                     <td style="padding: 10px 15px; color: #666;"><?php echo htmlspecialchars($tpl['category']); ?></td>
                     <td style="padding: 10px 15px; color: #4e73df;"><?php echo htmlspecialchars($tpl['cost_center'] ?: 'عام'); ?></td>
-                    <td style="padding: 10px 15px; font-family: monospace; font-weight: bold;"><?php echo number_format($tpl['monthly_amount'], 2); ?> ل.س</td>
-                    <td style="padding: 10px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;"><?php echo number_format($daily, 2); ?> ل.س</td>
+                    <td style="padding: 10px 15px; font-family: monospace; font-weight: bold;">
+                        <?php
+                            $freq_val = $tpl['frequency'] ?? 'monthly';
+                            $tpl_cur = $tpl['currency_code'] ?? 'SYP';
+                            $freq_labels = ['weekly' => 'أسبوعي', 'monthly' => 'شهري', 'yearly' => 'سنوي'];
+                            $freq_colors = ['weekly' => ['#fdecea', '#a33636'], 'monthly' => ['#eef1f6', '#555'], 'yearly' => ['#e2d9f3', '#4b3869']];
+                            $cur_symbol = $tpl_cur === 'USD' ? '$' : 'ل.س';
+                        ?>
+                        <?php echo $tpl_cur === 'USD' ? '$' : ''; ?><?php echo number_format($tpl['monthly_amount'], 2); ?><?php echo $tpl_cur === 'SYP' ? ' ل.س' : ''; ?>
+                        <span style="background: <?php echo $freq_colors[$freq_val][0]; ?>; color: <?php echo $freq_colors[$freq_val][1]; ?>; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px;">
+                            <?php echo $freq_labels[$freq_val]; ?>
+                        </span>
+                    </td>
+                    <td style="padding: 10px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;">
+                        <?php if ($tpl_cur === 'USD'): ?>
+                            $<?php echo number_format($daily, 2); ?>
+                            <div style="font-size: 10px; color: #999; font-weight: normal;">(÷<?php echo ['weekly' => 6, 'monthly' => 30, 'yearly' => 360][$freq_val]; ?>) — يُحوَّل لليرة بسعر يوم الترحيل الفعلي</div>
+                        <?php else: ?>
+                            <?php echo number_format($daily, 2); ?> ل.س
+                            <div style="font-size: 10px; color: #999; font-weight: normal;">(÷<?php echo ['weekly' => 6, 'monthly' => 30, 'yearly' => 360][$freq_val]; ?>)</div>
+                        <?php endif; ?>
+                    </td>
                     <td style="padding: 10px 15px; text-align: center;">
                         <?php if ($already_today): ?>
-                            <span style="background: #d4edda; color: #155724; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;">تم ترحيل اليوم ✓</span>
+                            <span style="background: #d4edda; color: #155724; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: bold; display: block; margin-bottom: 4px;">تم ترحيل اليوم ✓</span>
                         <?php else: ?>
-                            <form method="POST">
+                            <form method="POST" style="display: inline-block; margin-bottom: 4px;">
 <?php csrfField(); ?>
                                 <input type="hidden" name="accrue_one" value="<?php echo $tpl['id']; ?>">
                                 <button type="submit" style="background: #f6c23e; color: white; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: bold;">ترحيل استحقاق اليوم</button>
                             </form>
                         <?php endif; ?>
+                        <br>
+                        <button type="button" onclick="openBackfillModal(<?php echo $tpl['id']; ?>, '<?php echo htmlspecialchars($tpl['name'], ENT_QUOTES); ?>')" style="background: #6f42c1; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 10.5px; font-weight: bold; margin-top: 3px;">
+                            <i class="fas fa-history"></i> ترحيل تراكمي منذ تاريخ
+                        </button>
+                        <br>
+                        <button type="button" onclick='openEditTplModal(<?php echo json_encode($tpl, JSON_HEX_APOS | JSON_HEX_QUOT); ?>)' style="background: #4e73df; color: white; border: none; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 10.5px; font-weight: bold; margin-top: 3px;">
+                            <i class="fas fa-edit"></i> تعديل البند
+                        </button>
                     </td>
                 </tr>
             <?php endforeach; else: ?>
@@ -483,13 +730,117 @@ try {
                 <label style="display: block; margin-bottom: 4px; font-weight: 500;">مركز التكلفة (اختياري):</label>
                 <input type="text" name="t_cost_center" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
             </div>
-            <div style="margin-bottom: 15px;">
-                <label style="display: block; margin-bottom: 4px; font-weight: 500;">المبلغ الشهري الكامل (ل.س):</label>
-                <input type="number" step="0.01" name="t_monthly_amount" id="tplMonthlyAmount" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">التكرار:</label>
+                <select name="t_frequency" id="tplFrequency" onchange="updateAmountLabel()" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; background: #fff;">
+                    <option value="weekly">أسبوعي (يُقسَّم ÷6 أيام عمل)</option>
+                    <option value="monthly" selected>شهري (يُقسَّم ÷30 يومياً)</option>
+                    <option value="yearly">سنوي (يُقسَّم ÷360 يومياً)</option>
+                </select>
+            </div>
+            <div style="margin-bottom: 15px; display: flex; gap: 10px;">
+                <div style="flex: 2;">
+                    <label style="display: block; margin-bottom: 4px; font-weight: 500;" id="tplAmountLabel">المبلغ الشهري الكامل:</label>
+                    <input type="number" step="0.01" name="t_monthly_amount" id="tplMonthlyAmount" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                </div>
+                <div style="flex: 1;">
+                    <label style="display: block; margin-bottom: 4px; font-weight: 500;">العملة:</label>
+                    <select name="t_currency" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; background: #fff;">
+                        <option value="SYP">ل.س</option>
+                        <option value="USD">$</option>
+                    </select>
+                </div>
             </div>
             <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px;">
                 <button type="button" onclick="closeTplModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
                 <button type="submit" style="background: #4e73df; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ البند</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal: تعديل بند مصروف متكرر -->
+<div id="editTplModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; width: 450px; max-width: 95%; padding: 25px; border-radius: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #4e73df;"><i class="fas fa-edit"></i> تعديل بند مصروف متكرر</h3>
+            <button onclick="closeEditTplModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <div style="background: #fff3cd; color: #856404; padding: 8px 12px; border-radius: 4px; margin-bottom: 15px; font-size: 12px;">
+            <i class="fas fa-info-circle"></i> التعديل يؤثر فقط على الترحيلات القادمة — لا يُغيِّر أي استحقاق سابق مُرحَّل بالفعل.
+        </div>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="edit_template" value="1">
+            <input type="hidden" name="tpl_id" id="edit_tpl_id">
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">اسم البند:</label>
+                <input type="text" name="t_name" id="edit_tpl_name" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">التصنيف المحاسبي:</label>
+                <input type="text" name="t_category" id="edit_tpl_category" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">مركز التكلفة (اختياري):</label>
+                <input type="text" name="t_cost_center" id="edit_tpl_cost_center" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">التكرار:</label>
+                <select name="t_frequency" id="edit_tpl_frequency" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; background: #fff;">
+                    <option value="weekly">أسبوعي (يُقسَّم ÷6 أيام عمل)</option>
+                    <option value="monthly">شهري (يُقسَّم ÷30 يومياً)</option>
+                    <option value="yearly">سنوي (يُقسَّم ÷360 يومياً)</option>
+                </select>
+            </div>
+            <div style="margin-bottom: 15px; display: flex; gap: 10px;">
+                <div style="flex: 2;">
+                    <label style="display: block; margin-bottom: 4px; font-weight: 500;">المبلغ الكامل:</label>
+                    <input type="number" step="0.01" name="t_monthly_amount" id="edit_tpl_amount" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                </div>
+                <div style="flex: 1;">
+                    <label style="display: block; margin-bottom: 4px; font-weight: 500;">العملة:</label>
+                    <select name="t_currency" id="edit_tpl_currency" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; background: #fff;">
+                        <option value="SYP">ل.س</option>
+                        <option value="USD">$</option>
+                    </select>
+                </div>
+            </div>
+            <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px; display: flex; justify-content: space-between;">
+                <button type="button" onclick="deleteTplFromModal()" style="background: #fdecea; color: #e74a3b; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-size: 12px;"><i class="fas fa-trash-alt"></i> حذف البند</button>
+                <div>
+                    <button type="button" onclick="closeEditTplModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
+                    <button type="submit" style="background: #4e73df; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ التعديلات</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+<form method="POST" id="deleteTplForm" style="display:none;">
+<?php csrfField(); ?>
+    <input type="hidden" name="delete_template" value="1">
+    <input type="hidden" name="tpl_id" id="delete_tpl_id">
+</form>
+
+<!-- Modal: ترحيل استحقاق تراكمي منذ تاريخ -->
+<div id="backfillModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; width: 420px; max-width: 95%; padding: 25px; border-radius: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #6f42c1; font-size: 16px;"><i class="fas fa-history"></i> ترحيل تراكمي: <span id="backfill_tpl_name"></span></h3>
+            <button onclick="closeBackfillModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <p style="font-size: 12.5px; color: #666; margin-bottom: 15px;">يُرحِّل استحقاق يوم بيوم من التاريخ المحدَّد وحتى اليوم — يتخطى تلقائياً أي يوم سبق ترحيله فعلاً.</p>
+        <form method="POST">
+<?php csrfField(); ?>
+            <input type="hidden" name="backfill_accrual" value="1">
+            <input type="hidden" name="backfill_template_id" id="backfill_template_id">
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: 500;">ابدأ الترحيل من تاريخ:</label>
+                <input type="date" name="backfill_start_date" id="backfill_start_date" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="text-align: left; border-top: 1px solid #eee; padding-top: 15px;">
+                <button type="button" onclick="closeBackfillModal()" style="background: none; border: none; color: #666; padding: 8px 15px; cursor: pointer;">إلغاء</button>
+                <button type="submit" style="background: #6f42c1; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">ترحيل حتى اليوم</button>
             </div>
         </form>
     </div>
@@ -501,6 +852,24 @@ try {
     function openTplModal() { document.getElementById('tplModal').style.display = 'flex'; }
     function closeTplModal() { document.getElementById('tplModal').style.display = 'none'; }
     function fillPayrollAmount(amount) { document.getElementById('tplMonthlyAmount').value = amount; }
+    function updateAmountLabel() {
+        var freq = document.getElementById('tplFrequency').value;
+        var labels = { weekly: 'المبلغ الأسبوعي الكامل:', monthly: 'المبلغ الشهري الكامل:', yearly: 'المبلغ السنوي الكامل:' };
+        document.getElementById('tplAmountLabel').innerText = labels[freq] || labels.monthly;
+    }
+
+    function openBackfillModal(tplId, tplName) {
+        document.getElementById('backfill_template_id').value = tplId;
+        document.getElementById('backfill_tpl_name').innerText = tplName;
+        // افتراضي: أول يوم من الشهر الحالي — يطابق طلبك المعتاد "البدء من أول الشهر"
+        var now = new Date();
+        var firstOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10);
+        document.getElementById('backfill_start_date').value = firstOfMonth;
+        document.getElementById('backfillModal').style.display = 'flex';
+    }
+    function closeBackfillModal() {
+        document.getElementById('backfillModal').style.display = 'none';
+    }
 </script>
 
 <?php include 'footer.php'; ?>

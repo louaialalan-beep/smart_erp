@@ -46,18 +46,43 @@ if ($cash_account_id) {
 
 $closing_balance = $opening_balance + $total_in - $total_out;
 
-// تصنيف الحركات حسب مصدرها (source_module) لعرض ملخص سريع أعلى الصفحة
+// رصيد "عمولات المندوبين المستحقة" الحالي (لحظي، بلا فلتر تاريخ) — لعرض معلوماتي فقط يوضح صافي
+// النقد المتاح فعلياً للتصرف الحر لو استُبعِد المبلغ المحجوز للمندوبين، بلا أي تعديل على الرصيد الفعلي
+$commission_liability_balance = 0;
+try {
+    $stmt_comm_liability = $conn->query("
+        SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE a.account_name = 'عمولات المندوبين المستحقة'
+    ");
+    $commission_liability_balance = floatval($stmt_comm_liability->fetchColumn());
+} catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+$closing_net_of_commissions = $closing_balance - $commission_liability_balance;
+
+// تصنيف الحركات حسب مصدرها (source_module) لعرض ملخص سريع أعلى الصفحة — أي مصدر "عكس" (ينتهي
+// بكلمة Reversal) يُدمَج ضمن فئة مصدره الأصلي، لكن بطرح قيمته من العمود المقابل مباشرة (لا بإضافته
+// لعمود جديد)، لأن الجدول يعرض عمودي "مدفوعات"/"مقبوضات" كرقمين منفصلين لا صافياً واحداً — فمجرد
+// دمج المفتاح وحده لا يكفي لإلغاء الأثر الأصلي بصرياً.
 $by_source = [];
 foreach ($day_lines as $line) {
     $src = $line['source_module'] ?: 'غير مصنَّف';
+    $is_reversal = (bool) preg_match('/\s+Reversal$/', $src);
+    $src = preg_replace('/\s+Reversal$/', '', $src);
     if (!isset($by_source[$src])) { $by_source[$src] = ['in' => 0, 'out' => 0]; }
-    $by_source[$src]['in'] += floatval($line['debit']);
-    $by_source[$src]['out'] += floatval($line['credit']);
+    if ($is_reversal) {
+        // قيد العكس يُبدِّل مدين/دائن أصلاً، فنطرحه من العمود الذي يُلغيه فعلياً في الفئة الأصلية
+        $by_source[$src]['out'] -= floatval($line['debit']);
+        $by_source[$src]['in'] -= floatval($line['credit']);
+    } else {
+        $by_source[$src]['in'] += floatval($line['debit']);
+        $by_source[$src]['out'] += floatval($line['credit']);
+    }
 }
 $source_labels = [
     'Sales' => 'مبيعات', 'Sales Return' => 'مرتجعات مبيعات', 'Supplier Payment' => 'دفعات موردين',
     'Representative Payment' => 'دفعات مندوبين', 'Operational Expense' => 'مصاريف تشغيلية',
     'Expense Accrual' => 'استحقاق مصاريف', 'Payroll' => 'رواتب', 'Employee Advance' => 'سلف موظفين',
+    'Commission Accrual' => 'مصروف عمولات المندوبين',
     'Purchase' => 'فواتير شراء', 'Purchase Return' => 'مرتجعات شراء (استرداد نقدي)', 'Manual' => 'قيود يدوية',
     'Payment Collection' => 'تحصيل دفعة من عميل', 'Office Inventory' => 'جرد مكتبي', 'غير مصنَّف' => 'غير مصنَّف',
 ];
@@ -72,7 +97,7 @@ $source_labels = [
 </style>
 
 <div class="no-print" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">
-    <h2><i class="fas fa-cash-register"></i> الإقفال اليومي للصندوق</h2>
+    <h2><i class="fas fa-cash-register"></i> الإقفال اليومي للصندوق <span style="font-size:11px; color:#e74a3b; font-weight:normal;">(نسخة مُحدَّثة — v3)</span></h2>
     <div style="display:flex; gap:10px; align-items:center;">
         <form method="GET" style="display:flex; gap:8px; align-items:center;">
             <input type="date" name="date" value="<?php echo htmlspecialchars($selected_date); ?>" style="padding:7px; border:1px solid #ccc; border-radius:4px;">
@@ -110,6 +135,20 @@ $source_labels = [
             <div style="font-size:20px; font-weight:bold; font-family:monospace; color:#4e73df; margin-top:5px;"><?php echo number_format($closing_balance, 2); ?> ل.س</div>
         </div>
     </div>
+
+    <?php if ($commission_liability_balance > 0): ?>
+    <!-- بطاقة معلوماتية: صافي النقد الحر بعد استبعاد عمولات المندوبين المستحقة (لا تُغيِّر الرصيد الفعلي) -->
+    <div style="background:#fff8e6; border:1px solid #f6dfa3; border-radius:8px; padding:15px 20px; margin-bottom:20px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div>
+            <div style="font-size:13px; color:#856404; font-weight:bold;"><i class="fas fa-info-circle"></i> للعلم فقط — لا يُغيِّر الرصيد أعلاه</div>
+            <div style="font-size:12px; color:#856404; margin-top:3px;">من ضمن الرصيد الختامي (<?php echo number_format($closing_balance, 2); ?>)، مبلغ <b><?php echo number_format($commission_liability_balance, 2); ?> ل.س</b> محجوز فعلياً كعمولات مندوبين مستحقة لم تُدفَع بعد.</div>
+        </div>
+        <div style="text-align:left;">
+            <div style="font-size:11px; color:#856404;">صافي النقد الحر للتصرف (تقديري)</div>
+            <div style="font-size:19px; font-weight:bold; font-family:monospace; color:#a3730f;"><?php echo number_format($closing_net_of_commissions, 2); ?> ل.س</div>
+        </div>
+    </div>
+    <?php endif; ?>
 
     <!-- ملخص حسب المصدر -->
     <?php if (count($by_source) > 0): ?>

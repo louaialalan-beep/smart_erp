@@ -7,6 +7,7 @@ $msg = "";
 
 // معالجة إضافة حساب جديد
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_account'])) {
+    verifyCsrfToken();
     $account_code = trim($_POST['account_code']);
     $account_name = trim($_POST['account_name']);
     $account_type = $_POST['account_type'];
@@ -28,6 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_account'])) {
 // معالجة إكمال بيانات حساب ناقص (أُنشئ تلقائياً من وحدة أخرى في النظام عبر findAccountId
 // ولم يُملأ له رمز أو نوع حساب حينها)
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['complete_account'])) {
+    verifyCsrfToken();
     $acc_id = intval($_POST['acc_id'] ?? 0);
     $account_code = trim($_POST['account_code'] ?? '');
     $account_type = $_POST['account_type'] ?? '';
@@ -59,6 +61,7 @@ function getNextAvailableCode($conn, $preferred_code) {
 // معالجة الإنشاء/الإكمال التلقائي الجماعي لكل الحسابات الأساسية التي يبحث عنها findAccountId
 // عبر النظام كله، بحيث لا تحتاج هذه الدالة للإنشاء التلقائي الناقص مستقبلاً
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['seed_accounts'])) {
+    verifyCsrfToken();
     // القائمة مطابقة تماماً لأسماء fallback_name المستخدمة في findAccountId بكل ملفات النظام،
     // بحيث تُطابق بالاسم الحرفي أي حساب أُنشئ تلقائياً سابقاً بنفس هذا الاسم فتُكمله بدل تكراره.
     $seed_list = [
@@ -76,24 +79,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['seed_accounts'])) {
         ['name' => 'جزاءات وخصومات الموظفين',        'type' => 'Revenue',   'code' => '4121'],
         ['name' => 'تكلفة البضائع المباعة (COGS)',  'type' => 'Expense',   'code' => '5121'],
         ['name' => 'مصروف عمولات المندوبين',        'type' => 'Expense',   'code' => '5131'],
+        ['name' => 'مصروفات تشغيلية',                'type' => 'Expense',   'code' => '5100'],
     ];
 
-    // إضافة تصنيفات المصاريف الفعلية المستخدمة (من المصاريف الفورية والبنود المتكررة) كحسابات مصروفات منفصلة
-    try {
-        $cat_stmt = $conn->query("
-            SELECT DISTINCT category AS cat FROM operational_expenses WHERE category IS NOT NULL AND category != ''
-            UNION
-            SELECT DISTINCT category AS cat FROM recurring_expense_templates WHERE category IS NOT NULL AND category != ''
-        ");
-        $existing_categories = $cat_stmt->fetchAll(PDO::FETCH_COLUMN);
-        $next_expense_code = 5141;
-        foreach ($existing_categories as $cat) {
-            $seed_list[] = ['name' => $cat, 'type' => 'Expense', 'code' => (string)$next_expense_code];
-            $next_expense_code++;
-        }
-    } catch (Exception $e) {
-        // في حال عدم توفر جدولَي المصاريف بعد، يُتجاهل هذا الجزء بصمت
-    }
+    // ملاحظة: أُزيل عمداً إنشاء حساب منفصل لكل تصنيف مصروف — التصنيف يبقى بُعداً تقريرياً ضمن جدول
+    // operational_expenses نفسه (عمود category)، ولا يحتاج حساباً مستقلاً في دفتر الأستاذ العام؛
+    // كل المصاريف التشغيلية تُرحَّل لحساب واحد موحَّد "مصروفات تشغيلية" بناءً على تفضيل صريح من المستخدم.
 
     $created = 0; $completed = 0; $skipped = 0;
     try {
@@ -128,6 +119,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['seed_accounts'])) {
 
 // معالجة حذف حساب واحد، بشرط ألا يكون مستخدَماً في أي قيد محاسبي ولا حساباً أباً لحسابات فرعية
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_account'])) {
+    verifyCsrfToken();
     requireRole($conn, ['admin']);
     $acc_id = intval($_POST['acc_id'] ?? 0);
     try {
@@ -159,6 +151,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['delete_account'])) {
 
 // معالجة حذف كل الحسابات غير المستخدمة دفعة واحدة (لا في أي قيد محاسبي ولا أب لأي حساب فرعي)
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['cleanup_unused'])) {
+    verifyCsrfToken();
     requireRole($conn, ['admin']);
     try {
         // التقاط أسماء الحسابات المرشَّحة للحذف قبل تنفيذ الحذف الفعلي، لتوثيقها في سجل التدقيق

@@ -431,9 +431,15 @@ try {
             <li>
                 <a href="advanced_features.php"><i class="fa-solid fa-shield-halved"></i> سجل التدقيق والزمن التاريخي</a>
             </li>
+             <li>
+                <a href="capital_profit_report.php"><i class="fa-solid fa-shield-halved"></i>  التدقيق اليومي</a>
+            </li>
             <?php if ($logged_in_role === 'admin'): ?>
             <li>
                 <a href="users.php"><i class="fa-solid fa-users-cog"></i> المستخدمين والصلاحيات</a>
+            </li>
+             <li>
+                <a href="owner_withdrawals.php"><i class="fa-solid fa-shield-halved"></i> مسحوبات البنك </a>
             </li>
             <?php endif; ?>
             <li>

@@ -455,17 +455,22 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 $journal_desc3 = "قيد فاتورة مبيعات رقم: " . $new_invoice_number . " للعميل: " . $customer_name . " (مُعدَّلة)";
                 $entry_num3 = "JE-" . $new_invoice_number;
 
-                if ($payment_status === 'Paid') {
-                    $debit_account_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
-                } else {
-                    $debit_account_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
-                }
-                // الإيراد الحقيقي فقط إن اكتمل الشرطان معاً (تسليم + تحصيل)، وإلا إيرادات مؤجلة (نفس سياسة add_sale)
-                if ($delivery_status === 'Delivered' && $payment_status === 'Paid') {
-                    $credit_account_id3 = findAccountId($conn, ['إيرادات المبيعات', 'مبيعات', 'sales revenue'], 'إيرادات المبيعات', 'Revenue');
-                } else {
-                    $credit_account_id3 = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
-                }
+                // === تصحيح جوهري مطابق تماماً لتصحيح الإيراد أعلاه، لكن على الجانب النقدي (مدين) ===
+                // القيد الرئيسي عند "التعديل الكامل" كان يختار "الصندوق" مباشرة إن كانت الحالة الحالية
+                // "مدفوعة"، ويُرحِّله بتاريخ الفاتورة الأصلي القديم — فيظهر وكأن النقد دخل الصندوق في
+                // الماضي فعلاً، ويُضخِّم "الرصيد الافتتاحي" لأي يوم لاحق بأثر رجعي زوراً. الآن الجانب
+                // المدين يبقى دائماً "ذمم العملاء" هنا (كسياسة الإصدار الأول تماماً)، وقيد تحصيل منفصل
+                // بتاريخ اليوم الفعلي (أدناه بعد الترحيل) يتولى نقله فعلياً للصندوق إن كانت الحالة الآن
+                // "مدفوعة" — تماماً كما يحدث عند تبديل حالة الدفع بالزر السريع في نفس هذا الملف.
+                $debit_account_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
+                // === تصحيح جوهري: القيد الرئيسي عند "التعديل الكامل" يجب أن يبقى دائماً "إيرادات مؤجلة"
+                // (تماماً كسياسة الإصدار الأول)، ولا يُقرَّر مباشرة بناءً على الحالة الحالية بتاريخ
+                // الفاتورة الأصلي — وإلا فإن تعديل فاتورة قديمة لتصبح "مُسلَّمة ومدفوعة" اليوم كان
+                // يُسجِّل كامل الإيراد وكأنه تحقَّق في تاريخ الفاتورة الأصلي (الماضي)، بدل تاريخ اكتمال
+                // الشرطين الفعلي (اليوم) — ما يُغيِّر بأثر رجعي تقارير فترات سابقة عند مجرد تعديل لاحق.
+                // الاستدعاء أدناه (recognizeSaleRevenue/tryRecognizeRevenue) هو ما يُعيد تصنيف المبلغ
+                // فعلياً إلى "إيرادات المبيعات" الحقيقية، بتاريخ اليوم بالضبط، إن اكتمل الشرطان الآن.
+                $credit_account_id3 = findAccountId($conn, ['إيرادات مؤجلة', 'مؤجل', 'deferred'], 'إيرادات مؤجلة', 'Liability');
 
                 if ($debit_account_id3 && $credit_account_id3 && in_array('account_id', $existing_cols3)) {
                     $insertLine3 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols3, $entry_num3, $new_invoice_date, $journal_desc3, $new_exchange_rate, $new_invoice_number) {
@@ -509,6 +514,21 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                     recognizeSaleRevenue($conn, $sale_id);
                 } else {
                     tryRecognizeRevenue($conn, $sale_id);
+                }
+
+                // === تصحيح مكمِّل: إن كانت الفاتورة "مدفوعة" حالياً بعد هذا التعديل الكامل، يجب نقل
+                // المبلغ فعلياً من "ذمم العملاء" إلى "الصندوق الرئيسي" — لكن بتاريخ اليوم الفعلي، لا
+                // بتاريخ الفاتورة الأصلي (القيد الرئيسي أعلاه يبقى دائماً على ذمم العملاء عمداً الآن).
+                // نفس منطق "تحصيل نقدي" المُستخدَم عند تبديل حالة الدفع بالزر السريع في هذا الملف بالضبط.
+                if ($payment_status === 'Paid') {
+                    $collect_cash_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
+                    $collect_recv_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
+                    if ($collect_cash_id3 && $collect_recv_id3 && $total_syp > 0) {
+                        $collect_entry_num3 = "JE-" . $new_invoice_number . "-COLLECT-" . time();
+                        $collect_desc3 = "تحصيل نقدي لفاتورة رقم: " . $new_invoice_number . " (بعد تعديل كامل — بتاريخ التحصيل الفعلي)";
+                        postJournalLine($conn, $collect_cash_id3, $total_syp, 0, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
+                        postJournalLine($conn, $collect_recv_id3, 0, $total_syp, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
+                    }
                 }
 
                 $msg = "تم تحديث الفاتورة بالكامل (رقمها، تاريخها، أصنافها، وقيودها المحاسبية) بنجاح!";
@@ -557,11 +577,24 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 if ($old_payment_status !== 'Paid' && $payment_status === 'Paid') {
                     $collect_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                     $collect_recv_id = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
-                    if ($collect_cash_id && $collect_recv_id) {
+                    // تصحيح جوهري: التحصيل كان يستخدم قيمة الفاتورة الأصلية الكاملة (total_amount_syp)
+                    // بلا خصم أي مرتجع/خصم وقع عليها سابقاً وهي لا تزال آجلة — ما كان يُحصِّل من الصندوق
+                    // أكثر مما دفعه العميل فعلياً، ويجعل "ذمم العملاء" لهذه الفاتورة تظهر بالسالب. الآن
+                    // يُحصَّل الرصيد المتبقي الفعلي فقط (القيمة الأصلية ناقص كل مرتجع/خصم مُسجَّل عليها).
+                    $stmt_prior_ret_collect = $conn->prepare("
+                        SELECT
+                            COALESCE((SELECT SUM(total_amount_syp) FROM sales_returns WHERE sale_id = ?), 0)
+                            + COALESCE((SELECT SUM(amount_syp) FROM sale_item_discounts WHERE sale_id = ?), 0)
+                    ");
+                    $stmt_prior_ret_collect->execute([$sale_id, $sale_id]);
+                    $prior_ret_collect = floatval($stmt_prior_ret_collect->fetchColumn());
+                    $collect_amount = floatval($old_sale['total_amount_syp']) - $prior_ret_collect;
+
+                    if ($collect_cash_id && $collect_recv_id && $collect_amount > 0) {
                         $collect_entry_num = "JE-" . $old_invoice_number . "-COLLECT-" . time();
-                        $collect_desc = "تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تغيير حالة الدفع إلى نقداً)";
-                        postJournalLine($conn, $collect_cash_id, floatval($old_sale['total_amount_syp']), 0, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
-                        postJournalLine($conn, $collect_recv_id, 0, floatval($old_sale['total_amount_syp']), $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
+                        $collect_desc = "تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تغيير حالة الدفع إلى نقداً)" . ($prior_ret_collect > 0 ? " — صافي بعد خصم مرتجع/خصم سابق: " . number_format($prior_ret_collect, 2) : "");
+                        postJournalLine($conn, $collect_cash_id, $collect_amount, 0, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
+                        postJournalLine($conn, $collect_recv_id, 0, $collect_amount, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
                     }
                     // التحصيل يُكمِل الشرط الثاني (بعد التسليم) — نحاول الاعتراف بالإيراد الآن؛ لن يحدث
                     // شيء إن كانت الفاتورة لا تزال "قيد الانتظار" (الشرط الأول غير مكتمل بعد).
@@ -989,25 +1022,41 @@ $qty_grand_total = $qty_delivered + $qty_pending + $qty_deferred;
 
 // إجمالي المبلغ (ل.س) لكل حالة تسليم ضمن نفس الفترة — نفس مبدأ delivered_at أعلاه لحالة "تم التسليم" تحديداً
 // تصحيح إضافي: يُطرَح صافي أي مرتجع فعلي حدث على هذه الفواتير (بغض النظر عن تاريخ المرتجع نفسه)،
-// وإلا يبقى المبلغ المعروض هو الإجمالي الأصلي الخام رغم إرجاع جزء منه فعلياً.
+// وأيضاً صافي أي خصم على صنف طُبِّق عليها (ميزة "خصم" — كانت مفقودة من هنا سابقاً)، وإلا يبقى المبلغ
+// المعروض هو الإجمالي الأصلي الخام رغم إرجاع أو خصم جزء منه فعلياً.
 $stmt_amt_delivered = $conn->prepare("
-    SELECT COALESCE(SUM(s.total_amount_syp - COALESCE(ret.total_returned, 0)), 0)
+    SELECT COALESCE(SUM(s.total_amount_syp - COALESCE(ret.total_returned, 0) - COALESCE(disc.total_discounted, 0)), 0)
     FROM sales s
     LEFT JOIN (
         SELECT sale_id, SUM(total_amount_syp) AS total_returned
         FROM sales_returns
         GROUP BY sale_id
     ) ret ON ret.sale_id = s.id
+    LEFT JOIN (
+        SELECT sale_id, SUM(amount_syp) AS total_discounted
+        FROM sale_item_discounts
+        GROUP BY sale_id
+    ) disc ON disc.sale_id = s.id
     WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
 ");
 $stmt_amt_delivered->execute([$qf_from, $qf_to]);
 $amt_delivered = floatval($stmt_amt_delivered->fetchColumn());
 
 $stmt_amt_by_status = $conn->prepare("
-    SELECT delivery_status, COALESCE(SUM(total_amount_syp), 0) AS total_syp
-    FROM sales
-    WHERE delivery_status IN ('Pending', 'Deferred') AND invoice_date BETWEEN ? AND ?
-    GROUP BY delivery_status
+    SELECT s.delivery_status, COALESCE(SUM(s.total_amount_syp - COALESCE(ret.total_returned, 0) - COALESCE(disc.total_discounted, 0)), 0) AS total_syp
+    FROM sales s
+    LEFT JOIN (
+        SELECT sale_id, SUM(total_amount_syp) AS total_returned
+        FROM sales_returns
+        GROUP BY sale_id
+    ) ret ON ret.sale_id = s.id
+    LEFT JOIN (
+        SELECT sale_id, SUM(amount_syp) AS total_discounted
+        FROM sale_item_discounts
+        GROUP BY sale_id
+    ) disc ON disc.sale_id = s.id
+    WHERE s.delivery_status IN ('Pending', 'Deferred') AND s.invoice_date BETWEEN ? AND ?
+    GROUP BY s.delivery_status
 ");
 $stmt_amt_by_status->execute([$qf_from, $qf_to]);
 $amt_pending = 0; $amt_deferred = 0;
@@ -1108,6 +1157,13 @@ $returns_by_sale = [];
 $stmt_returns_totals = $conn->query("SELECT sale_id, COALESCE(SUM(total_amount_syp), 0) AS total_returned FROM sales_returns GROUP BY sale_id");
 foreach ($stmt_returns_totals->fetchAll(PDO::FETCH_ASSOC) as $row) {
     $returns_by_sale[$row['sale_id']] = floatval($row['total_returned']);
+}
+
+// نفس المبدأ لخصومات الأصناف — لعرض "الصافي بعد الخصم" بجانب المبلغ الأصلي في قائمة الفواتير
+$discounts_by_sale = [];
+$stmt_discounts_totals = $conn->query("SELECT sale_id, COALESCE(SUM(amount_syp), 0) AS total_discounted FROM sale_item_discounts GROUP BY sale_id");
+foreach ($stmt_discounts_totals->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    $discounts_by_sale[$row['sale_id']] = floatval($row['total_discounted']);
 }
 
 // فقط المنتجات المتوفرة فعلياً بالمخزون تظهر في نموذج فاتورة المبيعات — لا معنى لعرض صنف نافد للبيع
@@ -1333,12 +1389,14 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                             <td style="padding: 9px 12px; color: #555; white-space: nowrap;"><?php echo htmlspecialchars($sale['rep_name'] ?: 'بدون مندوب'); ?></td>
                             <?php
                                 $sale_returned_syp = $returns_by_sale[$sale['id']] ?? 0;
-                                $sale_net_syp = floatval($sale['total_amount_syp']) - $sale_returned_syp;
+                                $sale_discounted_syp = $discounts_by_sale[$sale['id']] ?? 0;
+                                $sale_net_syp = floatval($sale['total_amount_syp']) - $sale_returned_syp - $sale_discounted_syp;
+                                $sale_reduced_total = $sale_returned_syp + $sale_discounted_syp;
                             ?>
                             <td style="padding: 9px 12px; font-family: monospace; color: #2e59d9; font-weight: bold; white-space: nowrap;">
-                                <?php if ($sale_returned_syp > 0): ?>
+                                <?php if ($sale_reduced_total > 0): ?>
                                     <span style="text-decoration: line-through; color: #aaa; font-size: 11.5px; display: block;"><?php echo number_format($sale['total_amount_syp'], 2); ?></span>
-                                    <span title="الصافي بعد خصم مرتجعات بقيمة <?php echo number_format($sale_returned_syp, 2); ?> ل.س"><?php echo number_format($sale_net_syp, 2); ?> ل.س</span>
+                                    <span title="الصافي بعد مرتجع بقيمة <?php echo number_format($sale_returned_syp, 2); ?> ل.س وخصم بقيمة <?php echo number_format($sale_discounted_syp, 2); ?> ل.س"><?php echo number_format($sale_net_syp, 2); ?> ل.س</span>
                                 <?php else: ?>
                                     <?php echo number_format($sale['total_amount_syp'], 2); ?> ل.س
                                 <?php endif; ?>

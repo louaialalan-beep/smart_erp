@@ -325,8 +325,6 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payment'])) {
             $supplier_name_for_entry = $stmt_name->fetchColumn() ?: ('مورد #' . $supplier_id);
 
             $original_entry_num = "JE-SPAY-" . $payment_id;
-            // نجلب آخر قيد "نشط" (الأصلي أو آخر تصحيح CORR) بدل الأصلي دائماً، لتفادي عكس نفس
-            // القيد الأصلي أكثر من مرة عند تعديل نفس الدفعة أكثر من مرة.
             $stmt_active = $conn->prepare(
                 "SELECT entry_number FROM journal_entries
                  WHERE entry_number = ? OR entry_number LIKE ?
@@ -542,6 +540,20 @@ $item_stats = $stmt_item_stats->fetch(PDO::FETCH_ASSOC);
 $stmt_stock_now = $conn->prepare("SELECT COALESCE(SUM(current_quantity), 0) FROM products WHERE supplier_id = ?");
 $stmt_stock_now->execute([$supplier_id]);
 $item_stats['total_pieces'] = floatval($stmt_stock_now->fetchColumn());
+
+// عدد القطع المرتجعة للمورد وقيمتها — ضمن نفس فلتر الفترة (stat_from/stat_to) المُطبَّق على الشراء أعلاه
+$stmt_returned_stats = $conn->prepare("
+    SELECT COALESCE(SUM(pri.quantity), 0) AS total_pieces_returned,
+           COALESCE(SUM(pri.quantity * pri.unit_cost_usd), 0) AS total_pieces_returned_value
+    FROM purchase_return_items pri
+    INNER JOIN purchase_returns pr ON pri.purchase_return_id = pr.id
+    INNER JOIN purchase_invoices pi ON pr.purchase_invoice_id = pi.id
+    WHERE pi.supplier_id = ? AND pr.return_date BETWEEN ? AND ?
+");
+$stmt_returned_stats->execute([$supplier_id, $stat_from, $stat_to]);
+$returned_stats = $stmt_returned_stats->fetch(PDO::FETCH_ASSOC);
+$item_stats['total_pieces_returned'] = floatval($returned_stats['total_pieces_returned']);
+$item_stats['total_pieces_returned_value'] = floatval($returned_stats['total_pieces_returned_value']);
 
 // (2) تكلفة البضائع المباعة (COGS) — للأصناف المُسلَّمة فعلياً حصراً (مصروف حقيقي مُرحَّل بالفعل)
 $stmt_cogs_delivered = $conn->prepare("
@@ -840,6 +852,11 @@ $statement_closing_balance = $statement_running_balance;
     <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
         <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="الرصيد الحي الآن دائماً، بغض النظر عن الفلتر الزمني أعلاه">المتبقي حالياً بالمخزون</div>
         <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces'], 2), '0'), '.'); ?> قطعة</div>
+    </div>
+    <div style="background: #fdecea; border-right: 4px solid #e6a817; padding: 15px; border-radius: 6px;">
+        <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="محسوبة من مرتجعات هذا المورد الفعلية ضمن الفترة المحدَّدة أعلاه">عدد القطع المرتجعة للمورد (الفترة)</div>
+        <div style="font-size: 20px; font-weight: bold; color: #e6a817; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces_returned'], 2), '0'), '.'); ?> قطعة</div>
+        <div style="font-size: 12.5px; color: #96751c; font-family: monospace; margin-top: 3px;">بقيمة: $<?php echo number_format($item_stats['total_pieces_returned_value'], 2); ?></div>
     </div>
     <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
         <div style="color: #a33636; font-size: 13px; font-weight: bold;" title="مصروف حقيقي مُرحَّل فعلياً في اليومية">تكلفة البضائع المباعة (COGS) — مُسلَّمة (الفترة)</div>

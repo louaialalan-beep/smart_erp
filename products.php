@@ -75,7 +75,66 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_category'])) {
 // موجود بلا مورد)، ويُرحَّل قيد محاسبي مرتبط بهذا المنتج تحديداً (وليس مبلغاً إجمالياً معزولاً) — فيُخصَم
 // تلقائياً عبر COGS عند البيع تماماً كأي منتج آخر يأتي من مورد.
 if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory'])) {
-    $oi_mode = $_POST['oi_mode'] ?? 'new'; // 'new' أو 'existing'
+    $oi_mode = $_POST['oi_mode'] ?? 'new'; // 'new' أو 'existing' أو 'cost_correction'
+
+    // ============================================================
+    // وضع ثالث جديد: تصحيح/تحديد تكلفة صنف مكتبي موجود بالفعل، بلا أي تغيير في الكمية إطلاقاً —
+    // لحالة إضافة كمية سابقاً بتكلفة غير معروفة بعد، ثم الرغبة بتثبيتها لاحقاً دون تكرار إدخال الكمية.
+    // يُرحَّل قيد تسوية تقييم (Valuation Adjustment) على الكمية الحالية الموجودة فقط، بفارق التكلفة.
+    // ============================================================
+    if ($oi_mode === 'cost_correction') {
+        $oi_product_id = intval($_POST['oi_cost_product_id'] ?? 0);
+        $oi_new_cost = filter_var($_POST['oi_new_cost_usd'] ?? 0, FILTER_VALIDATE_FLOAT);
+        $oi_date = $_POST['oi_date_alt'] ?? date('Y-m-d');
+        $oi_notes = trim($_POST['oi_notes'] ?? '');
+
+        if ($oi_product_id <= 0 || $oi_new_cost <= 0) {
+            $error = "خطأ: يرجى اختيار الصنف وإدخال تكلفة أكبر من صفر.";
+        } else {
+            try {
+                $conn->beginTransaction();
+                $stmt_p = $conn->prepare("SELECT product_name, sku, supplier_id, current_quantity, cost_price_usd FROM products WHERE id = ?");
+                $stmt_p->execute([$oi_product_id]);
+                $p = $stmt_p->fetch(PDO::FETCH_ASSOC);
+                if (!$p) { throw new Exception("المنتج غير موجود."); }
+                if ($p['supplier_id'] !== null) { throw new Exception("هذا المنتج مرتبط بمورد — لا يمكن تصحيح تكلفته من هنا."); }
+
+                $old_cost = floatval($p['cost_price_usd']);
+                $qty_on_hand = floatval($p['current_quantity']);
+                $cost_delta = $oi_new_cost - $old_cost;
+
+                $conn->prepare("UPDATE products SET cost_price_usd = ? WHERE id = ?")->execute([$oi_new_cost, $oi_product_id]);
+
+                if (abs($cost_delta) > 0.00001 && $qty_on_hand > 0) {
+                    $exchange_rate = getExchangeRateForDate($conn, 'USD', $oi_date);
+                    $amount_usd = abs($cost_delta) * $qty_on_hand;
+                    $amount_syp = $amount_usd * $exchange_rate;
+                    $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
+                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Expense');
+                    if ($inv_acc && $adj_acc) {
+                        $cc_entry_num = "JE-OFFICE-COSTFIX-" . $oi_product_id . "-" . time();
+                        $cc_desc = "تصحيح تكلفة جرد مكتبي: " . $p['product_name'] . " (SKU: " . $p['sku'] . ") — من \$" . number_format($old_cost, 4) . " إلى \$" . number_format($oi_new_cost, 4) . " على كمية $qty_on_hand" . (!empty($oi_notes) ? " — $oi_notes" : "");
+                        if ($cost_delta > 0) {
+                            // التكلفة ارتفعت: قيمة المخزون تزداد
+                            insertJournalLine($conn, $inv_acc, $amount_syp, 0, $cc_entry_num, $oi_date, $cc_desc, 'Office Inventory', 'USD', $exchange_rate, $amount_usd, 0);
+                            insertJournalLine($conn, $adj_acc, 0, $amount_syp, $cc_entry_num, $oi_date, $cc_desc, 'Office Inventory', 'USD', $exchange_rate, 0, $amount_usd);
+                        } else {
+                            // التكلفة انخفضت: قيمة المخزون تنقص
+                            insertJournalLine($conn, $adj_acc, $amount_syp, 0, $cc_entry_num, $oi_date, $cc_desc, 'Office Inventory', 'USD', $exchange_rate, $amount_usd, 0);
+                            insertJournalLine($conn, $inv_acc, 0, $amount_syp, $cc_entry_num, $oi_date, $cc_desc, 'Office Inventory', 'USD', $exchange_rate, 0, $amount_usd);
+                        }
+                    }
+                }
+
+                $conn->commit();
+                logAudit($conn, 'UPDATE', 'الجرد المكتبي', "تصحيح تكلفة: " . $p['product_name'] . " من \$" . number_format($old_cost, 4) . " إلى \$" . number_format($oi_new_cost, 4), $oi_product_id);
+                $msg = "تم تصحيح التكلفة" . ($qty_on_hand > 0 ? " وترحيل قيد تسوية القيمة" : "") . " بنجاح، بلا أي تغيير في الكمية.";
+            } catch (Exception $e) {
+                if ($conn->inTransaction()) { $conn->rollBack(); }
+                $error = "خطأ أثناء تصحيح التكلفة: " . $e->getMessage();
+            }
+        }
+    } else {
     $oi_qty = filter_var($_POST['oi_quantity'] ?? 0, FILTER_VALIDATE_FLOAT);
     $oi_cost_usd = filter_var($_POST['oi_cost_price_usd'] ?? 0, FILTER_VALIDATE_FLOAT);
     $oi_date = $_POST['oi_date'] ?? date('Y-m-d');
@@ -99,8 +158,29 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
                 if ($existing_p['supplier_id'] !== null) { throw new Exception("هذا المنتج مرتبط بمورد — الجرد المكتبي مخصَّص فقط للمنتجات بلا مورد. استخدم فاتورة شراء بدلاً من ذلك."); }
                 $oi_product_name = $existing_p['product_name'];
                 $oi_sku = $existing_p['sku'];
-                $conn->prepare("UPDATE products SET current_quantity = current_quantity + ?, purchased_quantity = purchased_quantity + ?, cost_price_usd = ? WHERE id = ?")
-                     ->execute([$oi_qty, $oi_qty, $oi_cost_usd, $oi_product_id]);
+                $stmt_before_update = $conn->prepare("SELECT current_quantity FROM products WHERE id = ?");
+                $stmt_before_update->execute([$oi_product_id]);
+                $qty_before_update = floatval($stmt_before_update->fetchColumn());
+
+                $conn->prepare("UPDATE products SET
+                        current_quantity = current_quantity + :qty,
+                        purchased_quantity = purchased_quantity + :qty2,
+                        cost_price_usd = :cost
+                    WHERE id = :pid")
+                     ->execute([
+                        ':qty' => $oi_qty,
+                        ':qty2' => $oi_qty,
+                        ':cost' => $oi_cost_usd,
+                        ':pid' => $oi_product_id,
+                     ]);
+
+                // نفس التحقق الفوري الإلزامي: الكمية الجديدة يجب أن تساوي (القديمة + المُضافة) بالضبط
+                $stmt_verify2 = $conn->prepare("SELECT current_quantity FROM products WHERE id = ?");
+                $stmt_verify2->execute([$oi_product_id]);
+                $qty_after_update = floatval($stmt_verify2->fetchColumn());
+                if (abs($qty_after_update - ($qty_before_update + $oi_qty)) > 0.0001) {
+                    throw new Exception("فشل تحقّق حرج: الكمية بعد التحديث ($qty_after_update) لا تُطابق المتوقَّع (" . ($qty_before_update + $oi_qty) . "). أُلغيت العملية بالكامل قبل ترحيل أي قيد محاسبي خاطئ.");
+                }
             } else {
                 $oi_product_name = trim($_POST['oi_new_product_name'] ?? '');
                 $oi_sku = trim($_POST['oi_new_sku'] ?? '');
@@ -110,9 +190,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
                 $check_sku = $conn->prepare("SELECT id FROM products WHERE sku = ?");
                 $check_sku->execute([$oi_sku]);
                 if ($check_sku->rowCount() > 0) { throw new Exception("رمز الباركود (SKU) مستخدم مسبقاً."); }
-                $conn->prepare("INSERT INTO products (product_name, sku, category_id, cost_price_usd, wholesale_price_syp, retail_price_syp, special_price_syp, base_unit, current_quantity, purchased_quantity, supplier_id) VALUES (?, ?, ?, ?, 0, 0, 0, ?, ?, ?, NULL)")
-                     ->execute([$oi_product_name, $oi_sku, $oi_category_id, $oi_cost_usd, $oi_base_unit, $oi_qty, $oi_qty]);
+                $conn->prepare("INSERT INTO products
+                        (product_name, sku, category_id, cost_price_usd, wholesale_price_syp, retail_price_syp, special_price_syp, base_unit, current_quantity, purchased_quantity, supplier_id)
+                    VALUES
+                        (:product_name, :sku, :category_id, :cost_price_usd, 0, 0, 0, :base_unit, :current_quantity, :purchased_quantity, NULL)")
+                     ->execute([
+                        ':product_name' => $oi_product_name,
+                        ':sku' => $oi_sku,
+                        ':category_id' => $oi_category_id,
+                        ':cost_price_usd' => $oi_cost_usd,
+                        ':base_unit' => $oi_base_unit,
+                        ':current_quantity' => $oi_qty,
+                        ':purchased_quantity' => $oi_qty,
+                     ]);
                 $oi_product_id = $conn->lastInsertId();
+
+                // تحقق فوري إلزامي: التأكد أن الكمية والتكلفة حُفظتا فعلياً كما أُدخلتا، بدل الاستمرار
+                // بصمت وترحيل قيد محاسبي يوثّق قيمة قد لا تُطابق فعلياً ما في جدول المنتجات — هذا بالضبط
+                // الخلل الذي وقع سابقاً (قيد صحيح بقيمة $X، لكن current_quantity بقي 0 فعلياً في الجدول).
+                $stmt_verify = $conn->prepare("SELECT current_quantity, cost_price_usd FROM products WHERE id = ?");
+                $stmt_verify->execute([$oi_product_id]);
+                $verify_row = $stmt_verify->fetch(PDO::FETCH_ASSOC);
+                if (!$verify_row || abs(floatval($verify_row['current_quantity']) - $oi_qty) > 0.0001) {
+                    throw new Exception("فشل تحقّق حرج: الكمية المحفوظة فعلياً في جدول المنتجات (" . ($verify_row['current_quantity'] ?? 'غير موجود') . ") لا تُطابق الكمية المُدخَلة ($oi_qty). أُلغيت العملية بالكامل قبل ترحيل أي قيد محاسبي خاطئ.");
+                }
             }
 
             // القيد المحاسبي: مدين المخزون (يدخل أصل جديد) / دائن "أرصدة افتتاحية" (نفس الحساب المعتمد
@@ -136,6 +237,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
             $conn->rollBack();
             $error = "خطأ أثناء تسجيل الجرد المكتبي: " . $e->getMessage();
         }
+    }
     }
 }
 
@@ -339,7 +441,7 @@ $products = $stmt->fetchAll(PDO::FETCH_ASSOC);
 // جلب التصنيفات والموردين للقوائم المنسدلة
 $categories = $conn->query("SELECT id, category_name FROM categories ORDER BY category_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 $suppliers  = $conn->query("SELECT id, supplier_name FROM suppliers ORDER BY supplier_name ASC")->fetchAll(PDO::FETCH_ASSOC);
-$office_products = $conn->query("SELECT id, product_name, sku, current_quantity, base_unit FROM products WHERE supplier_id IS NULL ORDER BY product_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+$office_products = $conn->query("SELECT id, product_name, sku, current_quantity, base_unit, cost_price_usd FROM products WHERE supplier_id IS NULL ORDER BY product_name ASC")->fetchAll(PDO::FETCH_ASSOC);
 
 // توليد الباركود/SKU التالي تلقائياً — يتبع نمط "PRD-XXX" الموجود أصلاً في القاعدة، برقم تسلسلي
 // أكبر رقم حالي + 1. حقل الإدخال يبقى قابلاً للتعديل يدوياً إن أراد المستخدم رمزاً مختلفاً.
@@ -446,6 +548,7 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
                     <th style="padding: 12px 15px;">اسم المنتج</th>
                     <th style="padding: 12px 15px;">التصنيف</th>
                     <th style="padding: 12px 15px; color: #e74a3b;">التكلفة (USD)</th>
+                    <th style="padding: 12px 15px; color: #a33636;">التكلفة الإجمالية (USD)</th>
                     <th style="padding: 12px 15px;">سعر الجملة (ل.س)</th>
                     <th style="padding: 12px 15px;">سعر المفرق (ل.س)</th>
                     <th style="padding: 12px 15px;">المخزون الحالي</th>
@@ -468,6 +571,9 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
                             </td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;">
                                 $<?php echo number_format($prod['cost_price_usd'], 4); ?>
+                            </td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #a33636; font-weight: bold;">
+                                $<?php echo number_format($prod['cost_price_usd'] * $prod['current_quantity'], 2); ?>
                             </td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a; font-weight: bold;">
                                 <?php echo number_format($prod['wholesale_price_syp'], 2); ?>
@@ -492,7 +598,7 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="9" style="padding: 40px; text-align: center; color: #777;">
+                        <td colspan="10" style="padding: 40px; text-align: center; color: #777;">
                             <i class="fas fa-box-open" style="font-size: 35px; color: #ccc; margin-bottom: 10px; display: block;"></i>
                             لا توجد منتجات مسجلة مطابقة لخيارات البحث أو الفلترة الحالية.
                         </td>
@@ -693,6 +799,30 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
         var mode = document.querySelector('input[name="oi_mode"]:checked').value;
         document.getElementById('oi_existing_block').style.display = (mode === 'existing') ? 'block' : 'none';
         document.getElementById('oi_new_block').style.display = (mode === 'new') ? 'block' : 'none';
+        document.getElementById('oi_cost_correction_block').style.display = (mode === 'cost_correction') ? 'block' : 'none';
+        document.getElementById('oi_qty_cost_grid').style.display = (mode === 'cost_correction') ? 'none' : 'grid';
+        document.getElementById('oi_date_only_block').style.display = (mode === 'cost_correction') ? 'block' : 'none';
+
+        // تصحيح: إلغاء/إعادة تفعيل "required" صراحة بدل الاعتماد فقط على الإخفاء (display:none) —
+        // بعض المتصفحات تمنع إرسال النموذج بصمت (بلا أي رسالة) بسبب حقل مخفي لا يزال "إجبارياً".
+        var isCostCorrection = (mode === 'cost_correction');
+        var qtyField = document.querySelector('#oi_qty_cost_grid [name="oi_quantity"]');
+        var costField = document.querySelector('#oi_qty_cost_grid [name="oi_cost_price_usd"]');
+        var dateField = document.querySelector('#oi_qty_cost_grid [name="oi_date"]');
+        if (qtyField) qtyField.required = !isCostCorrection;
+        if (costField) costField.required = !isCostCorrection;
+        if (dateField) dateField.required = !isCostCorrection;
+    }
+
+    function updateOiOldCost() {
+        var sel = document.getElementById('oi_cost_product_id');
+        var opt = sel.options[sel.selectedIndex];
+        var disp = document.getElementById('oi_old_cost_display');
+        if (opt && opt.value) {
+            disp.innerText = 'التكلفة الحالية: $' + parseFloat(opt.getAttribute('data-cost') || 0).toFixed(4);
+        } else {
+            disp.innerText = '';
+        }
     }
 
     function toggleEditProductModal(show) {
@@ -760,9 +890,10 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
             <input type="hidden" name="add_office_inventory" value="1">
 
             <div style="margin-bottom: 15px;">
-                <label style="display:flex; gap:20px;">
+                <label style="display:flex; gap:20px; flex-wrap: wrap;">
                     <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="oi_mode" value="existing" checked onchange="toggleOiMode()"> زيادة كمية صنف مكتبي موجود</label>
                     <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="oi_mode" value="new" onchange="toggleOiMode()"> صنف جديد كلياً</label>
+                    <label style="font-weight:normal; cursor:pointer;"><input type="radio" name="oi_mode" value="cost_correction" onchange="toggleOiMode()"> تحديد/تصحيح تكلفة صنف موجود (بلا تغيير الكمية)</label>
                 </label>
             </div>
 
@@ -807,7 +938,22 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
                 </div>
             </div>
 
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+            <div id="oi_cost_correction_block" style="display:none; margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">اختر الصنف المكتبي:</label>
+                <select name="oi_cost_product_id" id="oi_cost_product_id" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; background: #fff;" onchange="updateOiOldCost()">
+                    <option value="">-- اختر --</option>
+                    <?php foreach ($office_products as $op): ?>
+                        <option value="<?php echo $op['id']; ?>" data-cost="<?php echo htmlspecialchars($op['cost_price_usd'] ?? 0); ?>"><?php echo htmlspecialchars($op['product_name']); ?> (<?php echo htmlspecialchars($op['sku']); ?>) — الكمية الحالية: <?php echo number_format($op['current_quantity'], 2); ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <p id="oi_old_cost_display" style="font-size: 12.5px; color: #666; margin: 6px 0 0;"></p>
+                <div style="margin-top: 12px;">
+                    <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التكلفة الجديدة للوحدة ($):</label>
+                    <input type="number" step="0.0001" name="oi_new_cost_usd" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
+                </div>
+            </div>
+
+            <div id="oi_qty_cost_grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">الكمية:</label>
                     <input type="number" step="0.0001" name="oi_quantity" required style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
@@ -820,6 +966,12 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
                     <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">التاريخ:</label>
                     <input type="date" name="oi_date" value="<?php echo date('Y-m-d'); ?>" required style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
                 </div>
+            </div>
+
+            <!-- تاريخ منفصل لوضع تصحيح التكلفة (نفس اسم الحقل oi_date، يُظهَر بدل الشبكة أعلاه) -->
+            <div id="oi_date_only_block" style="display:none; margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 5px; font-weight: bold; color: #333;">تاريخ التصحيح:</label>
+                <input type="date" name="oi_date_alt" id="oi_date_alt" value="<?php echo date('Y-m-d'); ?>" style="width: 100%; padding: 9px; border: 1px solid #d1d3e2; border-radius: 6px; font-family: monospace;">
             </div>
 
             <div style="margin-bottom: 15px;">
