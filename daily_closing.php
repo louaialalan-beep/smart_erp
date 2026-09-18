@@ -46,17 +46,34 @@ if ($cash_account_id) {
 
 $closing_balance = $opening_balance + $total_in - $total_out;
 
-// رصيد "عمولات المندوبين المستحقة" الحالي (لحظي، بلا فلتر تاريخ) — لعرض معلوماتي فقط يوضح صافي
-// النقد المتاح فعلياً للتصرف الحر لو استُبعِد المبلغ المحجوز للمندوبين، بلا أي تعديل على الرصيد الفعلي
+// رصيد "عمولات المندوبين المستحقة" — بطريقتين مستقلّتين للمقارنة بينهما:
+// (أ) journal_balance: من دفتر اليومية مباشرة (رصيد حساب الالتزام كما هو)، محسوب كما كان "حتى نهاية
+//     اليوم المحدَّد" وليس "الآن دائماً" كما كان سابقاً — تصحيح مهم عند إقفال تاريخ سابق (ليس اليوم).
+// (ب) direct_sum: بإعادة الحساب المباشر من نفس منهجية representatives.php (عمولات مُسلَّمة - معكوسة
+//     بالمرتجعات - المدفوع فعلياً)، لكل المندوبين مجتمعين حتى نهاية نفس اليوم المحدَّد.
+// إن تطابق الرقمان فالرصيد المحاسبي سليم؛ وإن اختلفا فالفرق هو بالضبط مقدار الانحراف الحقيقي — نفس
+// أسلوب التشخيص الذي استخدمناه سابقاً لمشكلة المخزون.
 $commission_liability_balance = 0;
+$commission_liability_direct = 0;
 try {
-    $stmt_comm_liability = $conn->query("
+    $stmt_comm_liability = $conn->prepare("
         SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
         FROM journal_entries je JOIN accounts a ON je.account_id = a.id
-        WHERE a.account_name = 'عمولات المندوبين المستحقة'
+        WHERE a.account_name = 'عمولات المندوبين المستحقة' AND je.entry_date <= ?
     ");
+    $stmt_comm_liability->execute([$selected_date]);
     $commission_liability_balance = floatval($stmt_comm_liability->fetchColumn());
+
+    $stmt_comm_direct = $conn->prepare("
+        SELECT
+            COALESCE((SELECT SUM(s.total_commissions) FROM sales s WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) <= ?), 0)
+            - COALESCE((SELECT SUM(sr.total_commission_reversed) FROM sales_returns sr INNER JOIN sales s2 ON sr.sale_id = s2.id WHERE s2.delivery_status = 'Delivered' AND sr.return_date <= ?), 0)
+            - COALESCE((SELECT SUM(rp.amount_syp) FROM representative_payments rp WHERE rp.payment_date <= ?), 0)
+    ");
+    $stmt_comm_direct->execute([$selected_date, $selected_date, $selected_date]);
+    $commission_liability_direct = floatval($stmt_comm_direct->fetchColumn());
 } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+$commission_liability_diff = $commission_liability_balance - $commission_liability_direct;
 $closing_net_of_commissions = $closing_balance - $commission_liability_balance;
 
 // تصنيف الحركات حسب مصدرها (source_module) لعرض ملخص سريع أعلى الصفحة — أي مصدر "عكس" (ينتهي
@@ -142,6 +159,14 @@ $source_labels = [
         <div>
             <div style="font-size:13px; color:#856404; font-weight:bold;"><i class="fas fa-info-circle"></i> للعلم فقط — لا يُغيِّر الرصيد أعلاه</div>
             <div style="font-size:12px; color:#856404; margin-top:3px;">من ضمن الرصيد الختامي (<?php echo number_format($closing_balance, 2); ?>)، مبلغ <b><?php echo number_format($commission_liability_balance, 2); ?> ل.س</b> محجوز فعلياً كعمولات مندوبين مستحقة لم تُدفَع بعد.</div>
+            <?php if (abs($commission_liability_diff) > 0.5): ?>
+                <div style="font-size:11.5px; color:#a33636; margin-top:6px; background:#fdecea; padding:6px 10px; border-radius:5px;">
+                    <i class="fas fa-exclamation-triangle"></i> تحقّق مزدوج: إعادة الحساب المباشر لنفس المبلغ (من فواتير المبيعات والمدفوعات مباشرة، بنفس منهجية representatives.php) يعطي
+                    <b><?php echo number_format($commission_liability_direct, 2); ?> ل.س</b> — بفارق <b><?php echo number_format($commission_liability_diff, 2); ?> ل.س</b> عن رصيد دفتر اليومية أعلاه.
+                    هذا الفارق يعني أن أحد الرقمين غير دقيق (على الأرجح رصيد دفتر اليومية، بسبب قيد لم يُرحَّل بشكل كامل لأحد المندوبين) — راجع
+                    <a href="representatives.php" style="color:#a33636; font-weight:bold;">صفحة المندوبين</a> ومقارنة "صافي الرصيد" لكل مندوب على حدة لتحديد أيّهم فيه الفرق.
+                </div>
+            <?php endif; ?>
         </div>
         <div style="text-align:left;">
             <div style="font-size:11px; color:#856404;">صافي النقد الحر للتصرف (تقديري)</div>

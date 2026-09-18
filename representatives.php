@@ -48,6 +48,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_representative']))
 // يطرح منها العمولات المعكوسة بسبب المرتجعات (sales_returns.total_commission_reversed) والدفعات
 // المسددة فعلياً (representative_payments) — والآن هذه القائمة تستخدم نفس المعادلة بالضبط، فلا يظهر
 // رقم متضخم لمندوب سُدِّدت عمولاته بالفعل (نفس الإصلاح المطبَّق سابقاً بين suppliers.php وsupplier_view.php).
+// تصحيح/توسعة: بدل عمود واحد "مطويّ" (عمولة - مرتجعات - دفعات)، نفصل الآن الأرقام الثلاثة كلٌّ على
+// حدة لكل مندوب: (1) إجمالي العمولات المستحقة (المسلَّمة فقط، بعد طرح عمولات المرتجعات)، (2) إجمالي
+// الدفعات المسددة فعلياً له، (3) صافي الرصيد/الذمة المتبقية = (1) - (2). هذا يسمح بعرض الثلاثة معاً
+// بدل رقم واحد مدمج فقط، ويتيح حساب إجماليات تراكمية لكل المندوبين في بطاقات الملخص أعلى الصفحة.
 $stmt = $conn->query("SELECT r.*, 
     (SELECT COUNT(s.id) FROM sales s WHERE s.representative_id = r.id) as total_sales_count,
     (
@@ -58,10 +62,22 @@ $stmt = $conn->query("SELECT r.*,
             INNER JOIN sales s2 ON sr.sale_id = s2.id
             WHERE s2.representative_id = r.id AND s2.delivery_status = 'Delivered'
         ), 0)
-        - COALESCE((SELECT SUM(rp.amount_syp) FROM representative_payments rp WHERE rp.representative_id = r.id), 0)
-    ) as total_commissions
+    ) as total_earned_commissions,
+    COALESCE((SELECT SUM(rp.amount_syp) FROM representative_payments rp WHERE rp.representative_id = r.id), 0) as total_paid_payments
     FROM representatives r ORDER BY r.id DESC");
 $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// حساب صافي الرصيد لكل مندوب + إجماليات تراكمية لكل المندوبين مجتمعين (لبطاقات الملخص)
+$grand_total_earned = 0;
+$grand_total_paid = 0;
+$grand_total_net = 0;
+foreach ($representatives as &$rep_row) {
+    $rep_row['net_balance'] = floatval($rep_row['total_earned_commissions']) - floatval($rep_row['total_paid_payments']);
+    $grand_total_earned += floatval($rep_row['total_earned_commissions']);
+    $grand_total_paid += floatval($rep_row['total_paid_payments']);
+    $grand_total_net += $rep_row['net_balance'];
+}
+unset($rep_row);
 ?>
 
 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
@@ -87,6 +103,22 @@ $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
     </div>
 <?php endif; ?>
 
+<!-- بطاقات ملخص تراكمي لكل المندوبين مجتمعين -->
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px;">
+    <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+        <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;">إجمالي العمولات المستحقة (كل المندوبين)</div>
+        <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo number_format($grand_total_earned, 2); ?> ل.س</div>
+    </div>
+    <div style="background: #eafaf1; border-right: 4px solid #1cc88a; padding: 15px; border-radius: 6px;">
+        <div style="color: #1a8f5f; font-size: 13px; font-weight: bold;">إجمالي الدفعات المسددة (كل المندوبين)</div>
+        <div style="font-size: 20px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;"><?php echo number_format($grand_total_paid, 2); ?> ل.س</div>
+    </div>
+    <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+        <div style="color: #a33636; font-size: 13px; font-weight: bold;">صافي الرصيد/الذمة المتبقية (كل المندوبين)</div>
+        <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($grand_total_net, 2); ?> ل.س</div>
+    </div>
+</div>
+
 <div class="zoho-card">
     <div class="zoho-card-header">
         <h3><i class="fas fa-list"></i> قائمة المندوبين المسجلين</h3>
@@ -101,6 +133,8 @@ $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     <th>البريد الإلكتروني</th>
                     <th>عدد الفواتير</th>
                     <th>إجمالي العمولات المستحقة</th>
+                    <th>إجمالي الدفعات المسددة</th>
+                    <th>صافي الرصيد / الذمة المالية</th>
                     <th style="text-align: center;">الإجراءات</th>
                 </tr>
             </thead>
@@ -113,7 +147,9 @@ $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
                             <td style="font-family: monospace;"><?php echo htmlspecialchars($rep['phone'] ?: '-'); ?></td>
                             <td><?php echo htmlspecialchars($rep['email'] ?: '-'); ?></td>
                             <td style="font-family: monospace;"><?php echo $rep['total_sales_count']; ?></td>
-                            <td style="font-family: monospace; color: var(--zoho-accent); font-weight: bold;"><?php echo number_format($rep['total_commissions'], 2); ?> ل.س</td>
+                            <td style="font-family: monospace; color: #4e73df; font-weight: bold;"><?php echo number_format($rep['total_earned_commissions'], 2); ?> ل.س</td>
+                            <td style="font-family: monospace; color: #1cc88a; font-weight: bold;"><?php echo number_format($rep['total_paid_payments'], 2); ?> ل.س</td>
+                            <td style="font-family: monospace; color: <?php echo $rep['net_balance'] > 0 ? '#e74a3b' : '#888'; ?>; font-weight: bold;"><?php echo number_format($rep['net_balance'], 2); ?> ل.س</td>
                             <td style="text-align: center;">
                                 <a href="representative_profile.php?id=<?php echo $rep['id']; ?>" style="background: var(--zoho-primary); color: white; padding: 6px 14px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; display: inline-block;">
                                     <i class="fas fa-file-invoice-dollar"></i> كشف الحساب والعمولات
@@ -123,7 +159,7 @@ $representatives = $stmt->fetchAll(PDO::FETCH_ASSOC);
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="7" style="padding: 30px; text-align: center; color: #777;">لا يوجد مندوبون مسجلون حتى الآن. قم بإضافة مندوب جديد للبدء.</td>
+                        <td colspan="9" style="padding: 30px; text-align: center; color: #777;">لا يوجد مندوبون مسجلون حتى الآن. قم بإضافة مندوب جديد للبدء.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>

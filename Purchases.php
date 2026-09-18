@@ -568,6 +568,7 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
         <thead>
             <tr style="background:#f8f9fc; color:#4e73df; border-bottom:2px solid #e3e6f0;">
                 <th style="padding:10px 15px;">رقم الفاتورة</th><th style="padding:10px 15px;">المورد</th>
+                <th style="padding:10px 15px;">الأصناف (الكمية)</th>
                 <th style="padding:10px 15px;">القيمة (USD)</th><th style="padding:10px 15px;">سعر الصرف</th><th style="padding:10px 15px;">التاريخ</th><th style="padding:10px 15px;">حالة الدفع</th>
                 <th style="padding:10px 15px; text-align:center;">الإجراءات</th>
             </tr>
@@ -583,6 +584,20 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
                 <tr style="border-bottom:1px solid #f1f1f1;">
                     <td style="padding:10px 15px; font-family:monospace; font-weight:bold; color:#4e73df;"><?php echo htmlspecialchars($p['invoice_number']); ?></td>
                     <td style="padding:10px 15px;"><?php echo htmlspecialchars($p['supplier_name'] ?: 'غير محدد'); ?></td>
+                    <td style="padding:10px 15px; color:#555; font-size:12.5px; max-width:260px;">
+                        <?php
+                            if (count($p_items) > 0) {
+                                $pf_item_parts = [];
+                                foreach ($p_items as $__it) {
+                                    $__qty_disp = rtrim(rtrim(number_format(floatval($__it['quantity']), 2), '0'), '.');
+                                    $pf_item_parts[] = htmlspecialchars(($__it['product_name'] ?: 'منتج محذوف') . ' × ' . $__qty_disp);
+                                }
+                                echo implode('، ', $pf_item_parts);
+                            } else {
+                                echo '<span style="color:#aaa;">-</span>';
+                            }
+                        ?>
+                    </td>
                     <td style="padding:10px 15px; font-family:monospace; color:#e74a3b; font-weight:bold;">$<?php echo number_format($p['total_amount_usd'], 2); ?></td>
                     <td style="padding:10px 15px; font-family:monospace;"><?php echo number_format($p['exchange_rate'], 2); ?></td>
                     <td style="padding:10px 15px; font-family:monospace; color:#666;"><?php echo htmlspecialchars($p['invoice_date']); ?></td>
@@ -617,7 +632,7 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
                     </td>
                 </tr>
             <?php endforeach; else: ?>
-                <tr><td colspan="7" style="padding:25px; text-align:center; color:#777;"><?php echo ($pf_date_filter !== 'all' || $pf_returnable_only) ? 'لا توجد فواتير مطابقة للفلاتر المحددة.' : 'لا توجد فواتير شراء مسجلة بعد.'; ?></td></tr>
+                <tr><td colspan="8" style="padding:25px; text-align:center; color:#777;"><?php echo ($pf_date_filter !== 'all' || $pf_returnable_only) ? 'لا توجد فواتير مطابقة للفلاتر المحددة.' : 'لا توجد فواتير شراء مسجلة بعد.'; ?></td></tr>
             <?php endif; ?>
         </tbody>
     </table>
@@ -626,7 +641,7 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
 <div id="purModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center; overflow-y:auto;">
     <div style="background:white; width:800px; max-width:95%; border-radius:8px; padding:25px; margin:30px auto;">
         <h3 style="margin-top:0; color:#1cc88a;">فاتورة شراء جديدة</h3>
-        <form method="POST">
+        <form method="POST" onsubmit="return validateProductPickers(this);">
 <?php csrfField(); ?>
             <input type="hidden" name="add_purchase" value="1">
             <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px;">
@@ -651,11 +666,12 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
             </div>
             <h4 style="color:#4e73df;">الأصناف</h4>
             <div id="itemsContainer">
-                <div class="pur-row" style="display:grid; grid-template-columns:3fr 1fr 1fr auto; gap:10px; margin-bottom:10px;">
-                    <select name="product_id[]" required style="padding:8px;border:1px solid #ccc;border-radius:4px;">
-                        <option value="">-- المنتج --</option>
-                        <?php foreach ($products_list as $prod): ?><option value="<?php echo $prod['id']; ?>"><?php echo htmlspecialchars($prod['product_name']); ?></option><?php endforeach; ?>
-                    </select>
+                <div class="pur-row" style="display:grid; grid-template-columns:3fr 1fr 1fr auto; gap:10px; margin-bottom:10px; align-items:start;">
+                    <div class="prod-picker" style="position:relative;">
+                        <input type="text" class="prod-search" autocomplete="off" placeholder="ابحث عن منتج بالاسم أو الباركود..." style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;">
+                        <input type="hidden" class="prod-id" name="product_id[]">
+                        <div class="prod-dropdown" style="display:none; position:absolute; z-index:50; background:#fff; border:1px solid #ccc; border-radius:4px; max-height:220px; overflow-y:auto; width:100%; box-shadow:0 4px 10px rgba(0,0,0,0.1);"></div>
+                    </div>
                     <input type="number" step="0.0001" name="quantity[]" placeholder="الكمية" required style="padding:8px;border:1px solid #ccc;border-radius:4px;">
                     <input type="number" step="0.0001" name="unit_cost_usd[]" placeholder="تكلفة الوحدة $" required style="padding:8px;border:1px solid #ccc;border-radius:4px;">
                     <button type="button" onclick="this.parentElement.remove()" style="background:#e74a3b;color:white;border:none;padding:8px 12px;border-radius:4px;cursor:pointer;"><i class="fas fa-trash"></i></button>
@@ -670,13 +686,87 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
     </div>
 </div>
 <script>
+    // قائمة كل المنتجات للبحث الفوري (اسم + باركود/SKU + المتبقي بالمخزون) بدل قائمة <select> طويلة
+    var ALL_PRODUCTS = <?php echo json_encode(array_map(function ($p) {
+        return ['id' => $p['id'], 'name' => $p['product_name'], 'sku' => $p['sku'], 'qty' => rtrim(rtrim(number_format($p['current_quantity'], 2), '0'), '.')];
+    }, $products_list)); ?>;
+
+    function prodPickerHTML(inputName, id, displayText) {
+        var safeText = (displayText || '').replace(/"/g, '&quot;');
+        return '<div class="prod-picker" style="position:relative;">' +
+            '<input type="text" class="prod-search" autocomplete="off" value="' + safeText + '" placeholder="ابحث عن منتج بالاسم أو الباركود..." style="width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;">' +
+            '<input type="hidden" class="prod-id" name="' + inputName + '" value="' + (id || '') + '">' +
+            '<div class="prod-dropdown" style="display:none; position:absolute; z-index:50; background:#fff; border:1px solid #ccc; border-radius:4px; max-height:220px; overflow-y:auto; width:100%; box-shadow:0 4px 10px rgba(0,0,0,0.1);"></div>' +
+        '</div>';
+    }
+
+    function renderProdDropdown(picker, query) {
+        var dd = picker.querySelector('.prod-dropdown');
+        var q = query.trim().toLowerCase();
+        var matches = ALL_PRODUCTS.filter(function (p) {
+            return !q || p.name.toLowerCase().indexOf(q) !== -1 || (p.sku && p.sku.toLowerCase().indexOf(q) !== -1);
+        }).slice(0, 40);
+        if (matches.length === 0) {
+            dd.innerHTML = '<div style="padding:8px 10px; color:#999; font-size:13px;">لا توجد نتائج مطابقة</div>';
+        } else {
+            dd.innerHTML = matches.map(function (p) {
+                return '<div class="prod-dd-item" data-id="' + p.id + '" data-name="' + String(p.name).replace(/"/g, '&quot;') + '" ' +
+                    'style="padding:8px 10px; cursor:pointer; border-bottom:1px solid #f1f1f1; font-size:13px;">' +
+                    '<span style="font-weight:bold; color:#333;">' + p.name + '</span> ' +
+                    '<span style="color:#888; font-family:monospace; font-size:11.5px;">(' + (p.sku || '') + ' — متبقٍ: ' + p.qty + ')</span></div>';
+            }).join('');
+        }
+        dd.style.display = 'block';
+    }
+
+    // تفويض الأحداث (event delegation) على document بدل ربطها بكل عنصر — يعمل تلقائياً مع الصفوف
+    // المُستنسَخة لاحقاً (إضافة صنف / نافذة التعديل) بلا حاجة لإعادة ربط أي مستمع يدوياً.
+    document.addEventListener('focusin', function (e) {
+        if (e.target.classList && e.target.classList.contains('prod-search')) {
+            renderProdDropdown(e.target.closest('.prod-picker'), e.target.value);
+        }
+    });
+    document.addEventListener('input', function (e) {
+        if (e.target.classList && e.target.classList.contains('prod-search')) {
+            var picker = e.target.closest('.prod-picker');
+            picker.querySelector('.prod-id').value = ''; // أي تعديل يدوي على النص يُلغي التحديد السابق
+            renderProdDropdown(picker, e.target.value);
+        }
+    });
+    document.addEventListener('click', function (e) {
+        var item = e.target.closest('.prod-dd-item');
+        if (item) {
+            var picker = item.closest('.prod-picker');
+            picker.querySelector('.prod-search').value = item.getAttribute('data-name');
+            picker.querySelector('.prod-id').value = item.getAttribute('data-id');
+            picker.querySelector('.prod-dropdown').style.display = 'none';
+            return;
+        }
+        document.querySelectorAll('.prod-picker').forEach(function (pk) {
+            if (!pk.contains(e.target)) { pk.querySelector('.prod-dropdown').style.display = 'none'; }
+        });
+    });
+
+    // تحقق قبل الإرسال: الحقل الفعلي المُرسَل هو مُخفي (hidden) فلا يخضع للتحقق التلقائي required من
+    // المتصفح — لذا لزم تحقق يدوي أن كل صف اختار منتجاً حقيقياً من القائمة (وليس نصاً حراً فقط).
+    function validateProductPickers(form) {
+        var ids = form.querySelectorAll('.prod-id');
+        for (var i = 0; i < ids.length; i++) {
+            if (!ids[i].value) {
+                alert('يرجى اختيار منتج فعلي من نتائج البحث لكل صنف (وليس كتابة اسم فقط بلا اختيار).');
+                ids[i].closest('.prod-picker').querySelector('.prod-search').focus();
+                return false;
+            }
+        }
+        return true;
+    }
+
     function openModal() { document.getElementById('purModal').style.display='flex'; }
     function closeModal() { document.getElementById('purModal').style.display='none'; }
     function addRow() {
         var c = document.getElementById('itemsContainer');
         var r = c.querySelector('.pur-row').cloneNode(true);
         r.querySelectorAll('input').forEach(i => i.value = '');
-        r.querySelector('select').selectedIndex = 0;
         c.appendChild(r);
     }
 
@@ -695,13 +785,7 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
             var tr = document.createElement('tr');
             var productTd = document.createElement('td');
             productTd.style.padding = '8px';
-            var sourceSelect = document.querySelector('#itemsContainer .pur-row select[name="product_id[]"]');
-            var select = sourceSelect ? sourceSelect.cloneNode(true) : document.createElement('select');
-            select.name = 'edit_product_id[]';
-            select.required = true;
-            select.style.cssText = 'width:100%;padding:6px;border:1px solid #ccc;border-radius:4px;';
-            select.value = String(it.product_id);
-            productTd.appendChild(select);
+            productTd.innerHTML = prodPickerHTML('edit_product_id[]', it.product_id, it.product_name || '');
             tr.appendChild(productTd);
             tr.insertAdjacentHTML('beforeend',
                 '<td style="padding:8px;"><input type="hidden" name="edit_item_id[]" value="' + it.id + '">' +
@@ -749,7 +833,7 @@ foreach ($purchases_list as $__p) { $pf_total_value_usd += floatval($__p['total_
 <div id="editPurchaseModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.5); z-index:1000; justify-content:center; align-items:center; overflow-y:auto;">
     <div style="background:white; width:750px; max-width:95%; border-radius:8px; padding:25px; margin:30px auto;">
         <h3 style="margin-top:0; color:#f6c23e;"><i class="fas fa-edit"></i> تعديل فاتورة شراء</h3>
-        <form method="POST">
+        <form method="POST" onsubmit="return validateProductPickers(this);">
 <?php csrfField(); ?>
             <input type="hidden" name="edit_purchase" value="1">
             <input type="hidden" name="purchase_id" id="edit_purchase_id">

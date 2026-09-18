@@ -177,7 +177,27 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_payment'])) {
                 if ($debit_account_id && $credit_account_id) {
                     $entry_num = "JE-SPAY-" . $payment_id;
                     $journal_desc = "سداد دفعة نقدية للمورد: " . $supplier_name_for_entry . (!empty($notes) ? " (" . $notes . ")" : "");
-                    $base_amount = $amount_usd * $exchange_rate;
+
+                    // ============================================================
+                    // تصحيح جوهري (فروقات صرف العملة): كان القيد يُسجِّل الطرفين (الذمم والصندوق) بنفس
+                    // سعر صرف يوم الدفعة تماماً — فيُطفئ الالتزام بالدولار بشكل صحيح، لكنه يُخفي تماماً
+                    // الفرق الحقيقي بالليرة الناتج عن صعود/هبوط الدولار بين تاريخ نشوء الدَين للمورد
+                    // وتاريخ سداده فعلياً (وهو بالضبط ما يعنيه "أخسر بسبب فرق السعر"). الآن يُحسَب متوسط
+                    // سعر الصرف المرجَّح الذي نشأ عنده دَين هذا المورد غير المسدَّد (من فواتير الشراء غير
+                    // المدفوعة)، ويُقسَم القيد لثلاثة أطراف متوازنة: تسوية الذمم بسعرها الأصلي + فرق
+                    // الصرف الحقيقي (خسارة أو ربح) + الصندوق بسعر اليوم الفعلي — فيظهر فرق الصرف كبند
+                    // مستقل قابل للتتبّع والتقرير، بدل أن يختفي بصمت داخل رصيد الذمم.
+                    $stmt_hist_rate = $conn->prepare("
+                        SELECT COALESCE(SUM(total_amount_usd * exchange_rate), 0) AS weighted_syp, COALESCE(SUM(total_amount_usd), 0) AS total_usd
+                        FROM purchase_invoices WHERE supplier_id = ? AND payment_status != 'Paid'
+                    ");
+                    $stmt_hist_rate->execute([$supplier_id]);
+                    $hist_row = $stmt_hist_rate->fetch(PDO::FETCH_ASSOC);
+                    $historical_rate = (floatval($hist_row['total_usd']) > 0.009) ? (floatval($hist_row['weighted_syp']) / floatval($hist_row['total_usd'])) : $exchange_rate;
+
+                    $liability_base_amount = $amount_usd * $historical_rate; // الذمم تُطفَأ بسعرها الأصلي (متوسط مرجَّح)
+                    $cash_base_amount = $amount_usd * $exchange_rate;        // ما خرج فعلياً من الصندوق اليوم بسعر اليوم
+                    $fx_diff = $cash_base_amount - $liability_base_amount;   // موجب = خسارة صرف | سالب = ربح صرف
 
                     $insertJournalLine = function ($account_id, $f_debit, $f_credit, $b_debit, $b_credit) use ($conn, $existing_cols, $entry_num, $payment_date, $journal_desc, $exchange_rate) {
                         $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
@@ -196,15 +216,33 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_payment'])) {
                         $stmt_j->execute($vals);
                     };
 
-                    // مدين: ذمم الموردين بالدولار (foreign) وما يقابلها بالليرة (base)
-                    $insertJournalLine($debit_account_id, $amount_usd, 0, $base_amount, 0);
-                    // دائن: الصندوق بنفس القيمة تماماً لضمان توازن القيد
-                    $insertJournalLine($credit_account_id, 0, $amount_usd, 0, $base_amount);
+                    // مدين: ذمم الموردين بالدولار (foreign) كاملاً — وما يقابله بالليرة بسعر الشراء الأصلي (base)
+                    $insertJournalLine($debit_account_id, $amount_usd, 0, $liability_base_amount, 0);
+
+                    // فرق الصرف الحقيقي — بند مستقل قابل للتقرير بدل أن يختفي داخل رصيد الذمم بصمت
+                    if (abs($fx_diff) > 0.5) {
+                        if ($fx_diff > 0) {
+                            $fx_loss_account_id = findOrCreateAccount($conn, ['خسارة فروقات', 'فروقات العملة'], 'خسارة فروقات العملة', 'Expense');
+                            if ($fx_loss_account_id) { $insertJournalLine($fx_loss_account_id, 0, 0, $fx_diff, 0); }
+                        } else {
+                            $fx_gain_account_id = findOrCreateAccount($conn, ['أرباح فروقات', 'ربح فروقات العملة'], 'أرباح فروقات العملة', 'Revenue');
+                            if ($fx_gain_account_id) { $insertJournalLine($fx_gain_account_id, 0, 0, 0, abs($fx_diff)); }
+                        }
+                    }
+
+                    // دائن: الصندوق بالمبلغ الفعلي الذي خرج اليوم بسعر صرف اليوم
+                    $insertJournalLine($credit_account_id, 0, $amount_usd, 0, $cash_base_amount);
                 }
             }
 
             $conn->commit();
-            $msg = "تم تسجيل الدفعة النقدية وترحيل القيد المحاسبي بنجاح!";
+            $fx_note = '';
+            if (isset($fx_diff) && abs($fx_diff) > 0.5) {
+                $fx_note = $fx_diff > 0
+                    ? " (سُجِّلت خسارة فروقات عملة قدرها " . number_format($fx_diff, 2) . " ل.س بسبب ارتفاع سعر الصرف منذ تاريخ الشراء)"
+                    : " (سُجِّل ربح فروقات عملة قدره " . number_format(abs($fx_diff), 2) . " ل.س بسبب انخفاض سعر الصرف منذ تاريخ الشراء)";
+            }
+            $msg = "تم تسجيل الدفعة النقدية وترحيل القيد المحاسبي بنجاح!" . $fx_note;
             logAudit($conn, 'INSERT', 'دفعات الموردين', "تسجيل دفعة نقدية بقيمة $" . number_format($amount_usd, 2) . " للمورد: " . $supplier_name_for_entry, $payment_id);
         } catch (PDOException $e) {
             $conn->rollBack();
@@ -359,24 +397,56 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payment'])) {
                     $conn->prepare("INSERT INTO journal_entries ({$cn}) VALUES ({$ph})")->execute($vals);
                 }
 
-                // 2) القيد الصحيح الجديد بالمبلغ المُحدَّث، بنفس سعر الصرف التاريخي الأصلي المثبت (الحصانة التاريخية)
-                $orig_rate = floatval($je_lines[0]['exchange_rate']) > 0 ? floatval($je_lines[0]['exchange_rate']) : 1.0;
+                // 2) القيد الصحيح الجديد — يُعاد بناؤه بالكامل من الصفر بنفس منهجية إنشاء دفعة جديدة
+                // بالضبط (ذمم بسعرها التاريخي المرجَّح + فرق صرف حقيقي مستقل + صندوق بسعر يوم الدفع
+                // الجديد) — تصحيح جوهري: الكود القديم هنا كان يستنسخ عدد أسطر القيد الأصلي (قد تكون
+                // 3 أسطر إن تضمَّنت فرق صرف) ويُطبِّق عليها *نفس المبلغ الكامل* بالتساوي، فينتج قيداً
+                // غير متوازن (مديون ≠ دائن) لأي دفعة كانت تتضمَّن سطر فرق صرف مستقل.
                 $new_entry_num = $original_entry_num . "-CORR-" . time();
                 $new_desc = "سداد دفعة نقدية معدَّلة للمورد: " . $supplier_name_for_entry . (!empty($notes) ? " (" . $notes . ")" : "");
-                $new_base = $amount_usd * $orig_rate;
+                $new_exchange_rate = getExchangeRateForDate($conn, 'USD', $payment_date);
+                $debit_account_id = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
+                $stmt_cash_edit = $conn->prepare("SELECT id FROM accounts WHERE account_name LIKE '%صندوق الرئيسي%' LIMIT 1");
+                $stmt_cash_edit->execute();
+                $credit_account_id = $stmt_cash_edit->fetchColumn();
 
-                foreach ($je_lines as $line) {
-                    $is_debit_line = floatval($line['debit']) > 0;
+                $stmt_hist_edit = $conn->prepare("
+                    SELECT COALESCE(SUM(total_amount_usd * exchange_rate), 0) AS weighted_syp, COALESCE(SUM(total_amount_usd), 0) AS total_usd
+                    FROM purchase_invoices WHERE supplier_id = ? AND payment_status != 'Paid'
+                ");
+                $stmt_hist_edit->execute([$supplier_id]);
+                $hist_row_edit = $stmt_hist_edit->fetch(PDO::FETCH_ASSOC);
+                $historical_rate_edit = (floatval($hist_row_edit['total_usd']) > 0.009) ? (floatval($hist_row_edit['weighted_syp']) / floatval($hist_row_edit['total_usd'])) : $new_exchange_rate;
+
+                $new_liability_base = $amount_usd * $historical_rate_edit;
+                $new_cash_base = $amount_usd * $new_exchange_rate;
+                $new_fx_diff = $new_cash_base - $new_liability_base;
+
+                $insertCorrLine = function ($account_id, $f_debit, $f_credit, $b_debit, $b_credit) use ($conn, $existing_cols, $new_entry_num, $payment_date, $new_desc, $new_exchange_rate) {
                     $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit', 'entry_number'];
-                    $vals = [$line['account_id'], $payment_date, $new_desc, $is_debit_line ? $new_base : 0, $is_debit_line ? 0 : $new_base, $new_entry_num];
+                    $vals = [$account_id, $payment_date, $new_desc, $b_debit, $b_credit, $new_entry_num];
                     if (in_array('currency_code', $existing_cols)) { $cols_to_insert[] = 'currency_code'; $vals[] = 'USD'; }
-                    if (in_array('exchange_rate', $existing_cols)) { $cols_to_insert[] = 'exchange_rate'; $vals[] = $orig_rate; }
-                    if (in_array('foreign_debit', $existing_cols)) { $cols_to_insert[] = 'foreign_debit'; $vals[] = $is_debit_line ? $amount_usd : 0; }
-                    if (in_array('foreign_credit', $existing_cols)) { $cols_to_insert[] = 'foreign_credit'; $vals[] = $is_debit_line ? 0 : $amount_usd; }
+                    if (in_array('exchange_rate', $existing_cols)) { $cols_to_insert[] = 'exchange_rate'; $vals[] = $new_exchange_rate; }
+                    if (in_array('foreign_debit', $existing_cols)) { $cols_to_insert[] = 'foreign_debit'; $vals[] = $f_debit; }
+                    if (in_array('foreign_credit', $existing_cols)) { $cols_to_insert[] = 'foreign_credit'; $vals[] = $f_credit; }
                     if (in_array('source_module', $existing_cols)) { $cols_to_insert[] = 'source_module'; $vals[] = 'Supplier Payment'; }
                     $ph = implode(',', array_fill(0, count($cols_to_insert), '?'));
                     $cn = implode(',', $cols_to_insert);
                     $conn->prepare("INSERT INTO journal_entries ({$cn}) VALUES ({$ph})")->execute($vals);
+                };
+
+                if ($debit_account_id && $credit_account_id) {
+                    $insertCorrLine($debit_account_id, $amount_usd, 0, $new_liability_base, 0);
+                    if (abs($new_fx_diff) > 0.5) {
+                        if ($new_fx_diff > 0) {
+                            $fx_loss_account_id_edit = findOrCreateAccount($conn, ['خسارة فروقات', 'فروقات العملة'], 'خسارة فروقات العملة', 'Expense');
+                            if ($fx_loss_account_id_edit) { $insertCorrLine($fx_loss_account_id_edit, 0, 0, $new_fx_diff, 0); }
+                        } else {
+                            $fx_gain_account_id_edit = findOrCreateAccount($conn, ['أرباح فروقات', 'ربح فروقات العملة'], 'أرباح فروقات العملة', 'Revenue');
+                            if ($fx_gain_account_id_edit) { $insertCorrLine($fx_gain_account_id_edit, 0, 0, 0, abs($new_fx_diff)); }
+                        }
+                    }
+                    $insertCorrLine($credit_account_id, 0, $amount_usd, 0, $new_cash_base);
                 }
             }
 
@@ -535,6 +605,21 @@ $stmt_item_stats = $conn->prepare("
 $stmt_item_stats->execute([$supplier_id, $stat_from, $stat_to]);
 $item_stats = $stmt_item_stats->fetch(PDO::FETCH_ASSOC);
 
+// لمؤشّر "فروقات الصرف" الحي في نموذج تسجيل الدفعة: متوسط سعر الصرف المرجَّح الذي نشأ عنده دَين هذا
+// المورد الحالي غير المسدَّد، مقارنةً بسعر اليوم — نفس منهجية الحساب المُستخدَمة فعلياً عند حفظ الدفعة.
+$fx_historical_rate = 0;
+try {
+    $stmt_fx_hist = $conn->prepare("
+        SELECT COALESCE(SUM(total_amount_usd * exchange_rate), 0) AS weighted_syp, COALESCE(SUM(total_amount_usd), 0) AS total_usd
+        FROM purchase_invoices WHERE supplier_id = ? AND payment_status != 'Paid'
+    ");
+    $stmt_fx_hist->execute([$supplier_id]);
+    $fx_hist_row = $stmt_fx_hist->fetch(PDO::FETCH_ASSOC);
+    $fx_historical_rate = (floatval($fx_hist_row['total_usd']) > 0.009) ? (floatval($fx_hist_row['weighted_syp']) / floatval($fx_hist_row['total_usd'])) : 0;
+} catch (Exception $e) { }
+$fx_today_rate = 0;
+try { $fx_today_rate = getExchangeRateForDate($conn, 'USD', date('Y-m-d')); } catch (Exception $e) { }
+
 // المتبقي حالياً بالمخزون يبقى من جدول المنتجات (current_quantity هو الرصيد الحي الصحيح لهذا الغرض
 // تحديداً، بلا فلترة على cost_price_usd — لا علاقة له بالتاريخ فهو "الآن" دائماً بغض النظر عن الفلتر)
 $stmt_stock_now = $conn->prepare("SELECT COALESCE(SUM(current_quantity), 0) FROM products WHERE supplier_id = ?");
@@ -578,9 +663,25 @@ $stmt_cogs_pending = $conn->prepare("
 $stmt_cogs_pending->execute([$supplier_id, $stat_from, $stat_to]);
 $cogs_pending = floatval($stmt_cogs_pending->fetchColumn());
 
-// جلب قائمة المنتجات المرتبطة بهذا المورد
-$stmt_products = $conn->prepare("SELECT * FROM products WHERE supplier_id = ? ORDER BY id DESC");
-$stmt_products->execute([$supplier_id]);
+// جلب قائمة المنتجات المرتبطة بهذا المورد — مع ترقيم صفحات (10 لكل صفحة) وفلتر "المتوفر بالمخزون فقط"
+$prod_stock_filter = $_GET['prod_stock'] ?? 'in_stock'; // 'in_stock' (افتراضي) أو 'all'
+$prod_where = ["supplier_id = ?"];
+$prod_params = [$supplier_id];
+if ($prod_stock_filter === 'in_stock') {
+    $prod_where[] = "current_quantity > 0";
+}
+
+$stmt_prod_count = $conn->prepare("SELECT COUNT(*) FROM products WHERE " . implode(' AND ', $prod_where));
+$stmt_prod_count->execute($prod_params);
+$prod_total_count = intval($stmt_prod_count->fetchColumn());
+
+$prod_per_page = 10;
+$prod_total_pages = max(1, (int)ceil($prod_total_count / $prod_per_page));
+$prod_page = max(1, min($prod_total_pages, intval($_GET['prod_page'] ?? 1)));
+$prod_offset = ($prod_page - 1) * $prod_per_page;
+
+$stmt_products = $conn->prepare("SELECT * FROM products WHERE " . implode(' AND ', $prod_where) . " ORDER BY id DESC LIMIT $prod_per_page OFFSET $prod_offset");
+$stmt_products->execute($prod_params);
 $products = $stmt_products->fetchAll(PDO::FETCH_ASSOC);
 
 // إجمالي الكمية المرتجعة لكل منتج من مرتجعات هذا المورد تحديداً، لعرض شارة "مرتجع" وكميتها
@@ -607,11 +708,35 @@ $filter_end = $_GET['filter_end'] ?? '';
 $filter_search = trim($_GET['filter_search'] ?? '');
 
 // فواتير الشراء الخاصة بهذا المورد (لم تكن معروضة هنا إطلاقاً سابقاً رغم وجود الجدول)
+$pi_returnable_only = isset($_GET['pi_returnable']) && $_GET['pi_returnable'] == '1';
+
 $pi_where = ["supplier_id = ?"];
 $pi_params = [$supplier_id];
 if (!empty($filter_start)) { $pi_where[] = "invoice_date >= ?"; $pi_params[] = $filter_start; }
 if (!empty($filter_end)) { $pi_where[] = "invoice_date <= ?"; $pi_params[] = $filter_end; }
 if (!empty($filter_search)) { $pi_where[] = "(invoice_number LIKE ? OR notes LIKE ?)"; $pi_params[] = "%$filter_search%"; $pi_params[] = "%$filter_search%"; }
+if ($pi_returnable_only) {
+    // فاتورة "قابلة للإرجاع" = تحتوي صنفاً واحداً على الأقل ما زالت كميته المشتراة أكبر من إجمالي ما أُرجِع منه
+    $pi_where[] = "EXISTS (
+        SELECT 1 FROM purchase_invoice_items pii2
+        WHERE pii2.purchase_invoice_id = pi.id
+        AND pii2.quantity > COALESCE((
+            SELECT SUM(pri2.quantity) FROM purchase_return_items pri2
+            INNER JOIN purchase_returns pr2 ON pri2.purchase_return_id = pr2.id
+            WHERE pr2.purchase_invoice_id = pi.id AND pri2.product_id = pii2.product_id
+        ), 0)
+    )";
+}
+
+$stmt_pi_count = $conn->prepare("SELECT COUNT(*) FROM purchase_invoices pi WHERE " . implode(' AND ', $pi_where));
+$stmt_pi_count->execute($pi_params);
+$pi_total_count = intval($stmt_pi_count->fetchColumn());
+
+$pi_per_page = 10;
+$pi_total_pages = max(1, (int)ceil($pi_total_count / $pi_per_page));
+$pi_page = max(1, min($pi_total_pages, intval($_GET['pi_page'] ?? 1)));
+$pi_offset = ($pi_page - 1) * $pi_per_page;
+
 $stmt_pi_list = $conn->prepare("
     SELECT pi.*, COALESCE((
         SELECT SUM(pr.total_amount_usd) FROM purchase_returns pr WHERE pr.purchase_invoice_id = pi.id
@@ -619,6 +744,7 @@ $stmt_pi_list = $conn->prepare("
     FROM purchase_invoices pi
     WHERE " . implode(' AND ', $pi_where) . "
     ORDER BY pi.invoice_date DESC, pi.id DESC
+    LIMIT $pi_per_page OFFSET $pi_offset
 ");
 $stmt_pi_list->execute($pi_params);
 $purchase_invoices_list = $stmt_pi_list->fetchAll(PDO::FETCH_ASSOC);
@@ -745,15 +871,38 @@ usort($statement_entries, function ($a, $b) {
     return $a['src_id'] <=> $b['src_id'];
 });
 
+// ============================================================
+// فلتر أسبوعي مستقل خاص بكشف الحساب فقط (سبت -> خميس)، منفصل تماماً عن فلتر فواتير الشراء
+// والمدفوعات أعلاه (filter_start/filter_end). يُحدَّد بتاريخ مرجعي (stmt_ref) تقع فيه الأسبوع
+// المطلوب، مع أزرار تنقّل للأسبوع السابق/التالي، وخيار "عرض كل الفترات" لتعطيل الأسبوعية مؤقتاً.
+// ============================================================
+$stmt_view_all = isset($_GET['stmt_all']) && $_GET['stmt_all'] == '1';
+$stmt_ref_date = $_GET['stmt_ref'] ?? date('Y-m-d');
+try {
+    $stmt_ref_dt = new DateTime($stmt_ref_date);
+} catch (Exception $e) {
+    $stmt_ref_dt = new DateTime();
+}
+$stmt_dow = (int)$stmt_ref_dt->format('N'); // 1=اثنين ... 7=أحد
+$stmt_days_since_saturday = ($stmt_dow - 6 + 7) % 7; // السبت = 6
+$stmt_week_start_dt = (clone $stmt_ref_dt)->modify("-{$stmt_days_since_saturday} days");
+$stmt_week_end_dt = (clone $stmt_week_start_dt)->modify("+5 days");
+$stmt_week_start = $stmt_week_start_dt->format('Y-m-d');
+$stmt_week_end = $stmt_week_end_dt->format('Y-m-d');
+$stmt_prev_week_ref = (clone $stmt_week_start_dt)->modify('-1 day')->format('Y-m-d');
+$stmt_next_week_ref = (clone $stmt_week_end_dt)->modify('+1 day')->format('Y-m-d');
+
 $statement_opening_balance = 0;
 $statement_rows = [];
 foreach ($statement_entries as $e) {
-    if (!empty($filter_start) && $e['date'] < $filter_start) {
-        $statement_opening_balance += $e['due'] - $e['settled'];
-        continue;
-    }
-    if (!empty($filter_end) && $e['date'] > $filter_end) {
-        continue;
+    if (!$stmt_view_all) {
+        if ($e['date'] < $stmt_week_start) {
+            $statement_opening_balance += $e['due'] - $e['settled'];
+            continue;
+        }
+        if ($e['date'] > $stmt_week_end) {
+            continue;
+        }
     }
     $statement_rows[] = $e;
 }
@@ -765,12 +914,53 @@ foreach ($statement_rows as &$row) {
 }
 unset($row);
 $statement_closing_balance = $statement_running_balance;
+
+// مجموع عمودي "مستحق له (+)" و"مسدد/مرتجع (-)" ضمن الصفوف المعروضة حالياً فقط (الأسبوع/الفترة المختارة)
+$statement_total_due = 0;
+$statement_total_settled = 0;
+foreach ($statement_rows as $__sr) {
+    $statement_total_due += floatval($__sr['due']);
+    $statement_total_settled += floatval($__sr['settled']);
+}
+
+// إحصاءات الأسبوع المعروض (أو كل الفترات إن كان stmt_all مفعّلاً): عدد/قيمة المنتجات المشتراة
+// مقابل عدد/قيمة المرتجع، ضمن نفس النطاق الزمني المعروض في كشف الحساب تحديداً.
+$stmt_week_bounds_from = $stmt_view_all ? '2000-01-01' : $stmt_week_start;
+$stmt_week_bounds_to   = $stmt_view_all ? '2100-12-31' : $stmt_week_end;
+
+$stmt_week_purch_q = $conn->prepare("
+    SELECT COUNT(DISTINCT pii.product_id) AS products_count,
+           COALESCE(SUM(pii.quantity), 0) AS products_qty,
+           COALESCE(SUM(pii.quantity * pii.unit_cost_usd), 0) AS products_value
+    FROM purchase_invoice_items pii
+    INNER JOIN purchase_invoices pi ON pii.purchase_invoice_id = pi.id
+    WHERE pi.supplier_id = ? AND pi.invoice_date BETWEEN ? AND ?
+");
+$stmt_week_purch_q->execute([$supplier_id, $stmt_week_bounds_from, $stmt_week_bounds_to]);
+$stmt_week_purch = $stmt_week_purch_q->fetch(PDO::FETCH_ASSOC);
+
+$stmt_week_ret_q = $conn->prepare("
+    SELECT COUNT(DISTINCT pri.product_id) AS returns_products_count,
+           COALESCE(SUM(pri.quantity), 0) AS returns_qty,
+           COALESCE(SUM(pri.quantity * pri.unit_cost_usd), 0) AS returns_value
+    FROM purchase_return_items pri
+    INNER JOIN purchase_returns pr ON pri.purchase_return_id = pr.id
+    INNER JOIN purchase_invoices pi ON pr.purchase_invoice_id = pi.id
+    WHERE pi.supplier_id = ? AND pr.return_date BETWEEN ? AND ?
+");
+$stmt_week_ret_q->execute([$supplier_id, $stmt_week_bounds_from, $stmt_week_bounds_to]);
+$stmt_week_ret = $stmt_week_ret_q->fetch(PDO::FETCH_ASSOC);
 ?>
 
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
     <div>
         <a href="suppliers.php" style="color: #4e73df; text-decoration: none; font-size: 13px; font-weight: bold;"><i class="fas fa-arrow-right"></i> العودة لقائمة الموردين</a>
         <h2 style="margin: 5px 0 0 0; color: #333;">الملف التفصيلي للمورد: <?php echo htmlspecialchars($supplier['supplier_name']); ?></h2>
+        <div style="margin-top: 6px; display:flex; gap:16px; flex-wrap:wrap; font-size:12.5px; color:#666;">
+            <span><i class="fas fa-phone" style="color:#4e73df;"></i> <?php echo htmlspecialchars($supplier['phone'] ?: 'غير متوفر'); ?></span>
+            <span><i class="fas fa-coins" style="color:#4e73df;"></i> <?php echo htmlspecialchars($supplier['currency']); ?></span>
+            <span><i class="fas fa-file-contract" style="color:#4e73df;"></i> <?php echo htmlspecialchars($supplier['payment_terms']); ?></span>
+        </div>
     </div>
     <div>
         <button onclick="toggleOpeningBalanceModal(true)" style="background: #6f42c1; color: white; padding: 9px 18px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; margin-left: 8px;">
@@ -785,6 +975,16 @@ $statement_closing_balance = $statement_running_balance;
     </div>
 </div>
 
+<!-- شريط تنقّل سريع بين أقسام الصفحة الطويلة -->
+<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 10px 15px; margin-bottom: 20px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+    <span style="font-size:12px; color:#888; font-weight:bold;"><i class="fas fa-compass"></i> انتقال سريع:</span>
+    <a href="#section-financial" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">الملخص المالي</a>
+    <a href="#linked-products" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">المنتجات</a>
+    <a href="#section-purchase-invoices" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">فواتير الشراء</a>
+    <a href="#section-payments" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">المدفوعات</a>
+    <a href="#statement-print-area" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">كشف الحساب</a>
+</div>
+
 <?php if ($msg): ?>
     <div style="background: #d4edda; color: #155724; padding: 12px; border-radius: 6px; margin-bottom: 15px;"><?php echo $msg; ?></div>
 <?php endif; ?>
@@ -792,93 +992,96 @@ $statement_closing_balance = $statement_running_balance;
     <div style="background: #f8d7da; color: #721c24; padding: 12px; border-radius: 6px; margin-bottom: 15px;"><?php echo $error; ?></div>
 <?php endif; ?>
 
-<!-- بطاقات الملخص المالي -->
-<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 25px;">
-    <div style="background: #fff; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px; box-shadow: 0 0.15rem 1rem rgba(0,0,0,0.05);">
-        <div style="color: #888; font-size: 13px; font-weight: bold;">إجمالي المشتريات (له)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($total_purchases, 2); ?></div>
-    </div>
-    <div style="background: #fff; border-right: 4px solid #1cc88a; padding: 15px; border-radius: 6px; box-shadow: 0 0.15rem 1rem rgba(0,0,0,0.05);">
-        <div style="color: #888; font-size: 13px; font-weight: bold;">إجمالي المدفوعات (عليه)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;">$<?php echo number_format($total_payments, 2); ?></div>
-    </div>
-    <div style="background: #fff; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px; box-shadow: 0 0.15rem 1rem rgba(0,0,0,0.05);">
-        <div style="color: #888; font-size: 13px; font-weight: bold;" title="خصومات يدوية: $<?php echo number_format($returns_discounts, 2); ?> + مرتجعات فعلية: $<?php echo number_format($total_purchase_returns, 2); ?>">المردودات / الخصم</div>
-        <div style="font-size: 20px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($returns_discounts + $total_purchase_returns, 2); ?></div>
-    </div>
-    <div style="background: #fff; border-right: 4px solid #6f42c1; padding: 15px; border-radius: 6px; box-shadow: 0 0.15rem 1rem rgba(0,0,0,0.05);">
-        <div style="color: #888; font-size: 13px; font-weight: bold;">رصيد افتتاحي سابق</div>
-        <div style="font-size: 20px; font-weight: bold; color: #6f42c1; font-family: monospace; margin-top: 5px;">$<?php echo number_format($opening_balance_usd, 2); ?></div>
-    </div>
-    <div style="background: #fff; border-right: 4px solid #2e59d9; padding: 15px; border-radius: 6px; box-shadow: 0 0.15rem 1rem rgba(0,0,0,0.05);">
-        <div style="color: #888; font-size: 13px; font-weight: bold;">صافي الحساب الباقي</div>
-        <div style="font-size: 20px; font-weight: bold; color: #2e59d9; font-family: monospace; margin-top: 5px;">$<?php echo number_format($net_balance, 2); ?></div>
-    </div>
-</div>
+<!-- الملخص المالي والتشغيلي: بطاقات الأرصدة + فلتر الفترة + إحصاءات الأصناف/COGS، مجمَّعة في قسم واحد متّسق -->
+<div id="section-financial" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 20px; margin-bottom: 25px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
+    <h3 style="margin: 0 0 15px; color: #3a3b45; font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
+        <i class="fas fa-chart-pie"></i> الملخص المالي والتشغيلي
+    </h3>
 
-<!-- فلتر زمني للإحصائيات أدناه فقط (لا يؤثر على الأرصدة المالية التراكمية أعلاه) -->
-<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 15px 20px; margin-bottom: 15px;">
-    <form method="GET" action="" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
-        <input type="hidden" name="id" value="<?php echo $supplier_id; ?>">
-        <label style="font-size: 13px; font-weight: bold; color: #555;"><i class="fas fa-filter"></i> فترة الإحصائيات أدناه:</label>
-        <a href="?id=<?php echo $supplier_id; ?>&stat_period=all" style="text-decoration: none;">
-            <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'all' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $stat_period === 'all' ? '#fff' : '#4e73df'; ?>;">كل الفترة</span>
-        </a>
-        <a href="?id=<?php echo $supplier_id; ?>&stat_period=month" style="text-decoration: none;">
-            <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'month' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $stat_period === 'month' ? '#fff' : '#4e73df'; ?>;">هذا الشهر</span>
-        </a>
-        <a href="?id=<?php echo $supplier_id; ?>&stat_period=year" style="text-decoration: none;">
-            <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'year' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $stat_period === 'year' ? '#fff' : '#4e73df'; ?>;">هذه السنة</span>
-        </a>
-        <input type="hidden" name="stat_period" value="custom">
-        <input type="date" name="stat_from" value="<?php echo $stat_period === 'custom' ? htmlspecialchars($stat_from) : ''; ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
-        <span style="color: #888;">إلى</span>
-        <input type="date" name="stat_to" value="<?php echo $stat_period === 'custom' ? htmlspecialchars($stat_to) : ''; ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
-        <button type="submit" style="background: #6f42c1; color: white; border: none; padding: 6px 14px; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: bold;">تطبيق فترة مخصصة</button>
-    </form>
-</div>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px;">
+        <div style="background: #fafbfe; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+            <div style="color: #888; font-size: 13px; font-weight: bold;">إجمالي المشتريات (له)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($total_purchases, 2); ?></div>
+        </div>
+        <div style="background: #fafbfe; border-right: 4px solid #1cc88a; padding: 15px; border-radius: 6px;">
+            <div style="color: #888; font-size: 13px; font-weight: bold;">إجمالي المدفوعات (عليه)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;">$<?php echo number_format($total_payments, 2); ?></div>
+        </div>
+        <div style="background: #fafbfe; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
+            <div style="color: #888; font-size: 13px; font-weight: bold;" title="خصومات يدوية: $<?php echo number_format($returns_discounts, 2); ?> + مرتجعات فعلية: $<?php echo number_format($total_purchase_returns, 2); ?>">المردودات / الخصم</div>
+            <div style="font-size: 20px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($returns_discounts + $total_purchase_returns, 2); ?></div>
+        </div>
+        <div style="background: #fafbfe; border-right: 4px solid #6f42c1; padding: 15px; border-radius: 6px;">
+            <div style="color: #888; font-size: 13px; font-weight: bold;">رصيد افتتاحي سابق</div>
+            <div style="font-size: 20px; font-weight: bold; color: #6f42c1; font-family: monospace; margin-top: 5px;">$<?php echo number_format($opening_balance_usd, 2); ?></div>
+        </div>
+        <div style="background: #eef1fc; border-right: 4px solid #2e59d9; padding: 15px; border-radius: 6px;">
+            <div style="color: #2e59d9; font-size: 13px; font-weight: bold;">صافي الحساب الباقي</div>
+            <div style="font-size: 20px; font-weight: bold; color: #2e59d9; font-family: monospace; margin-top: 5px;">$<?php echo number_format($net_balance, 2); ?></div>
+        </div>
+    </div>
 
-<!-- بطاقات إضافية: إحصاء الأصناف وتكلفة البضائع المباعة حسب حالة التسليم -->
-<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 25px;">
-    <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
-        <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;">إجمالي عدد الأصناف المستلمة (الفترة)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo intval($item_stats['distinct_products']); ?> صنف</div>
+    <!-- فلتر زمني للإحصائيات أدناه فقط (لا يؤثر على الأرصدة المالية التراكمية أعلاه) -->
+    <div style="background: #f8f9fc; border: 1px solid #edf0f7; border-radius: 8px; padding: 12px 15px; margin-bottom: 15px;">
+        <form method="GET" action="" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <input type="hidden" name="id" value="<?php echo $supplier_id; ?>">
+            <label style="font-size: 13px; font-weight: bold; color: #555;"><i class="fas fa-filter"></i> فترة الإحصائيات أدناه:</label>
+            <a href="?id=<?php echo $supplier_id; ?>&stat_period=all" style="text-decoration: none;">
+                <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'all' ? '#4e73df' : '#eef1f9'; ?>; color: <?php echo $stat_period === 'all' ? '#fff' : '#4e73df'; ?>;">كل الفترة</span>
+            </a>
+            <a href="?id=<?php echo $supplier_id; ?>&stat_period=month" style="text-decoration: none;">
+                <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'month' ? '#4e73df' : '#eef1f9'; ?>; color: <?php echo $stat_period === 'month' ? '#fff' : '#4e73df'; ?>;">هذا الشهر</span>
+            </a>
+            <a href="?id=<?php echo $supplier_id; ?>&stat_period=year" style="text-decoration: none;">
+                <span style="padding: 6px 12px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $stat_period === 'year' ? '#4e73df' : '#eef1f9'; ?>; color: <?php echo $stat_period === 'year' ? '#fff' : '#4e73df'; ?>;">هذه السنة</span>
+            </a>
+            <input type="hidden" name="stat_period" value="custom">
+            <input type="date" name="stat_from" value="<?php echo $stat_period === 'custom' ? htmlspecialchars($stat_from) : ''; ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <span style="color: #888;">إلى</span>
+            <input type="date" name="stat_to" value="<?php echo $stat_period === 'custom' ? htmlspecialchars($stat_to) : ''; ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <button type="submit" style="background: #6f42c1; color: white; border: none; padding: 6px 14px; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: bold;">تطبيق فترة مخصصة</button>
+        </form>
     </div>
-    <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
-        <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="محسوبة من فواتير الشراء الفعلية ضمن الفترة، باستبعاد أي سطر بتكلفة وحدة = صفر">إجمالي عدد القطع المستلمة (الفترة، بلا تكلفة صفر)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces_received'], 2), '0'), '.'); ?> قطعة</div>
-        <div style="font-size: 12.5px; color: #2c4e9c; font-family: monospace; margin-top: 3px;">بقيمة: $<?php echo number_format($item_stats['total_pieces_received_value'], 2); ?></div>
-    </div>
-    <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
-        <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="الرصيد الحي الآن دائماً، بغض النظر عن الفلتر الزمني أعلاه">المتبقي حالياً بالمخزون</div>
-        <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces'], 2), '0'), '.'); ?> قطعة</div>
-    </div>
-    <div style="background: #fdecea; border-right: 4px solid #e6a817; padding: 15px; border-radius: 6px;">
-        <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="محسوبة من مرتجعات هذا المورد الفعلية ضمن الفترة المحدَّدة أعلاه">عدد القطع المرتجعة للمورد (الفترة)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #e6a817; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces_returned'], 2), '0'), '.'); ?> قطعة</div>
-        <div style="font-size: 12.5px; color: #96751c; font-family: monospace; margin-top: 3px;">بقيمة: $<?php echo number_format($item_stats['total_pieces_returned_value'], 2); ?></div>
-    </div>
-    <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
-        <div style="color: #a33636; font-size: 13px; font-weight: bold;" title="مصروف حقيقي مُرحَّل فعلياً في اليومية">تكلفة البضائع المباعة (COGS) — مُسلَّمة (الفترة)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($cogs_delivered, 2); ?></div>
-    </div>
-    <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
-        <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="تقديرية — لم تُرحَّل كمصروف حقيقي بعد، للاطلاع المسبق فقط">تكلفة البضائع المباعة (COGS) — قيد الانتظار (الفترة)</div>
-        <div style="font-size: 20px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($cogs_pending, 2); ?></div>
-    </div>
-</div>
 
-<!-- معلومات الاتصال والشروط -->
-<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 15px; margin-bottom: 25px; display: flex; gap: 30px; font-size: 14px;">
-    <div><strong>رقم الهاتف:</strong> <span style="font-family: monospace; color: #555;"><?php echo htmlspecialchars($supplier['phone'] ?: 'غير متوفر'); ?></span></div>
-    <div><strong>العملة المعتمدة:</strong> <span style="color: #4e73df; font-weight: bold;"><?php echo htmlspecialchars($supplier['currency']); ?></span></div>
-    <div><strong>شروط السداد:</strong> <span style="color: #666;"><?php echo htmlspecialchars($supplier['payment_terms']); ?></span></div>
+    <!-- بطاقات إضافية: إحصاء الأصناف وتكلفة البضائع المباعة حسب حالة التسليم -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px;">
+        <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+            <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;">إجمالي عدد الأصناف المستلمة (الفترة)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo intval($item_stats['distinct_products']); ?> صنف</div>
+        </div>
+        <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+            <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="محسوبة من فواتير الشراء الفعلية ضمن الفترة، باستبعاد أي سطر بتكلفة وحدة = صفر">إجمالي عدد القطع المستلمة (الفترة، بلا تكلفة صفر)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces_received'], 2), '0'), '.'); ?> قطعة</div>
+            <div style="font-size: 12.5px; color: #2c4e9c; font-family: monospace; margin-top: 3px;">بقيمة: $<?php echo number_format($item_stats['total_pieces_received_value'], 2); ?></div>
+        </div>
+        <div style="background: #eaf1fc; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+            <div style="color: #2c4e9c; font-size: 13px; font-weight: bold;" title="الرصيد الحي الآن دائماً، بغض النظر عن الفلتر الزمني أعلاه">المتبقي حالياً بالمخزون</div>
+            <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces'], 2), '0'), '.'); ?> قطعة</div>
+        </div>
+        <div style="background: #fdecea; border-right: 4px solid #e6a817; padding: 15px; border-radius: 6px;">
+            <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="محسوبة من مرتجعات هذا المورد الفعلية ضمن الفترة المحدَّدة أعلاه">عدد القطع المرتجعة للمورد (الفترة)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #e6a817; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($item_stats['total_pieces_returned'], 2), '0'), '.'); ?> قطعة</div>
+            <div style="font-size: 12.5px; color: #96751c; font-family: monospace; margin-top: 3px;">بقيمة: $<?php echo number_format($item_stats['total_pieces_returned_value'], 2); ?></div>
+        </div>
+        <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+            <div style="color: #a33636; font-size: 13px; font-weight: bold;" title="مصروف حقيقي مُرحَّل فعلياً في اليومية">تكلفة البضائع المباعة (COGS) — مُسلَّمة (الفترة)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;">$<?php echo number_format($cogs_delivered, 2); ?></div>
+        </div>
+        <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
+            <div style="color: #96751c; font-size: 13px; font-weight: bold;" title="تقديرية — لم تُرحَّل كمصروف حقيقي بعد، للاطلاع المسبق فقط">تكلفة البضائع المباعة (COGS) — قيد الانتظار (الفترة)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($cogs_pending, 2); ?></div>
+        </div>
+    </div>
 </div>
 
 <!-- جدول المنتجات المرتبطة بالمورد -->
 <div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; margin-bottom: 25px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
-    <div style="background: #f8f9fc; padding: 12px 15px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #4e73df;">
-        <i class="fas fa-boxes"></i> المنتجات المرتبطة والمشتراة من هذا المورد
+    <div style="background: #f8f9fc; padding: 12px 15px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #4e73df; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span><i class="fas fa-boxes"></i> المنتجات المرتبطة والمشتراة من هذا المورد <span style="color:#888; font-weight:normal; font-size:12.5px;">(<?php echo $prod_total_count; ?>)</span></span>
+        <div style="display:flex; gap:6px;">
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['prod_stock' => 'in_stock', 'prod_page' => 1])); ?>#linked-products" style="text-decoration:none; padding:5px 12px; border-radius:5px; font-size:12.5px; font-weight:bold; background: <?php echo $prod_stock_filter === 'in_stock' ? '#4e73df' : '#eef1f9'; ?>; color: <?php echo $prod_stock_filter === 'in_stock' ? '#fff' : '#4e73df'; ?>;">المتوفر بالمخزون فقط</a>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['prod_stock' => 'all', 'prod_page' => 1])); ?>#linked-products" style="text-decoration:none; padding:5px 12px; border-radius:5px; font-size:12.5px; font-weight:bold; background: <?php echo $prod_stock_filter === 'all' ? '#4e73df' : '#eef1f9'; ?>; color: <?php echo $prod_stock_filter === 'all' ? '#fff' : '#4e73df'; ?>;">عرض الكل</a>
+        </div>
     </div>
     <div style="overflow-x: auto;">
         <table style="width: 100%; border-collapse: collapse; font-size: 14px; text-align: right;">
@@ -917,12 +1120,19 @@ $statement_closing_balance = $statement_running_balance;
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="6" style="padding: 20px; text-align: center; color: #777;">لا توجد منتجات مسجلة مرتبطة بهذا المورد حتى الآن.</td>
+                        <td colspan="6" style="padding: 20px; text-align: center; color: #777;">لا توجد منتجات مسجلة مرتبطة بهذا المورد <?php echo $prod_stock_filter === 'in_stock' ? 'متوفرة حالياً بالمخزون' : ''; ?>.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>
         </table>
     </div>
+    <?php if ($prod_total_pages > 1): ?>
+    <div id="linked-products" style="display:flex; justify-content:center; align-items:center; gap:6px; padding:12px; border-top:1px solid #f1f1f1; flex-wrap:wrap;">
+        <?php for ($p = 1; $p <= $prod_total_pages; $p++): ?>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['prod_page' => $p])); ?>#linked-products" style="text-decoration:none; min-width:30px; text-align:center; padding:5px 10px; border-radius:5px; font-size:12.5px; font-weight:bold; background: <?php echo $p === $prod_page ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $p === $prod_page ? '#fff' : '#4e73df'; ?>;"><?php echo $p; ?></a>
+        <?php endfor; ?>
+    </div>
+    <?php endif; ?>
 </div>
 
 <!-- شريط الفلترة المشترك (تاريخ + بحث) لفواتير الشراء وسجل المدفوعات أدناه -->
@@ -935,17 +1145,23 @@ $statement_closing_balance = $statement_running_balance;
             <input type="date" name="filter_end" value="<?php echo htmlspecialchars($filter_end); ?>" style="padding:7px; border:1px solid #ccc; border-radius:4px;"></div>
         <div style="flex:1; min-width:180px;"><label style="display:block; font-size:12px; font-weight:bold; margin-bottom:4px;">بحث (رقم فاتورة / ملاحظات):</label>
             <input type="text" name="filter_search" value="<?php echo htmlspecialchars($filter_search); ?>" placeholder="ابحث..." style="width:100%; padding:7px; border:1px solid #ccc; border-radius:4px;"></div>
+        <div style="padding-bottom:8px;">
+            <label style="font-size:12.5px; font-weight:bold; color:#e6a817; display:flex; align-items:center; gap:5px; cursor:pointer;">
+                <input type="checkbox" name="pi_returnable" value="1" <?php echo $pi_returnable_only ? 'checked' : ''; ?> style="width:15px; height:15px;">
+                فواتير تحتوي منتجات يمكن إرجاعها فقط
+            </label>
+        </div>
         <button type="submit" style="background:#4e73df; color:white; border:none; padding:8px 18px; border-radius:6px; cursor:pointer; font-weight:bold;">تطبيق الفلتر</button>
-        <?php if (!empty($filter_start) || !empty($filter_end) || !empty($filter_search)): ?>
+        <?php if (!empty($filter_start) || !empty($filter_end) || !empty($filter_search) || $pi_returnable_only): ?>
             <a href="supplier_view.php?id=<?php echo $supplier_id; ?>" style="color:#666; font-size:13px; padding:8px 0;">إلغاء الفلتر</a>
         <?php endif; ?>
     </form>
 </div>
 
 <!-- فواتير الشراء الخاصة بهذا المورد -->
-<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08); margin-bottom: 25px;">
+<div id="section-purchase-invoices" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08); margin-bottom: 25px;">
     <div style="background: #f8f9fc; padding: 12px 15px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #4e73df;">
-        <i class="fas fa-truck-loading"></i> فواتير الشراء المسجَّلة من هذا المورد
+        <i class="fas fa-truck-loading"></i> فواتير الشراء المسجَّلة من هذا المورد <span style="color:#888; font-weight:normal; font-size:12.5px;">(<?php echo $pi_total_count; ?>)</span>
     </div>
     <div style="overflow-x: auto;">
         <table style="width: 100%; border-collapse: collapse; font-size: 14px; text-align: right;">
@@ -994,10 +1210,17 @@ $statement_closing_balance = $statement_running_balance;
             </tbody>
         </table>
     </div>
+    <?php if ($pi_total_pages > 1): ?>
+    <div style="display:flex; justify-content:center; align-items:center; gap:6px; padding:12px; border-top:1px solid #f1f1f1; flex-wrap:wrap;">
+        <?php for ($p = 1; $p <= $pi_total_pages; $p++): ?>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['pi_page' => $p])); ?>" style="text-decoration:none; min-width:30px; text-align:center; padding:5px 10px; border-radius:5px; font-size:12.5px; font-weight:bold; background: <?php echo $p === $pi_page ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $p === $pi_page ? '#fff' : '#4e73df'; ?>;"><?php echo $p; ?></a>
+        <?php endfor; ?>
+    </div>
+    <?php endif; ?>
 </div>
 
 <!-- جدول سجل الحركات والدفعات السابقة -->
-<div style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
+<div id="section-payments" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
     <div style="background: #f8f9fc; padding: 12px 15px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #1cc88a;">
         <i class="fas fa-history"></i> سجل المدفوعات النقدية المسددة للمورد
     </div>
@@ -1042,10 +1265,62 @@ $statement_closing_balance = $statement_running_balance;
     </div>
 </div>
 
+<!-- شريط التنقّل الأسبوعي لكشف حساب المورد (سبت -> خميس)، مستقل عن فلتر الفواتير/المدفوعات أعلاه -->
+<div class="no-print" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; padding: 12px 20px; margin-bottom: 12px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['stmt_ref' => $stmt_prev_week_ref, 'stmt_all' => null])); ?>#statement-print-area" style="text-decoration:none; background:#f1f3f9; color:#4e73df; padding:7px 14px; border-radius:5px; font-weight:bold; font-size:13px;">
+        <i class="fas fa-chevron-right"></i> الأسبوع السابق
+    </a>
+    <div style="font-weight:bold; color:#333; font-size:13.5px;">
+        <?php if ($stmt_view_all): ?>
+            كل الفترات
+        <?php else: ?>
+            من <span style="font-family:monospace; color:#2e59d9;"><?php echo htmlspecialchars($stmt_week_start); ?></span> (سبت)
+            إلى <span style="font-family:monospace; color:#2e59d9;"><?php echo htmlspecialchars($stmt_week_end); ?></span> (خميس)
+        <?php endif; ?>
+    </div>
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['stmt_ref' => $stmt_next_week_ref, 'stmt_all' => null])); ?>#statement-print-area" style="text-decoration:none; background:#f1f3f9; color:#4e73df; padding:7px 14px; border-radius:5px; font-weight:bold; font-size:13px;">
+        الأسبوع التالي <i class="fas fa-chevron-left"></i>
+    </a>
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['stmt_ref' => date('Y-m-d'), 'stmt_all' => null])); ?>#statement-print-area" style="text-decoration:none; background:#eafaf1; color:#1a8f5f; padding:7px 14px; border-radius:5px; font-weight:bold; font-size:13px;">
+        الأسبوع الحالي
+    </a>
+    <form method="GET" action="#statement-print-area" style="display:flex; align-items:center; gap:6px;">
+        <?php foreach ($_GET as $k => $v) { if ($k !== 'stmt_ref' && $k !== 'stmt_all') echo '<input type="hidden" name="' . htmlspecialchars($k) . '" value="' . htmlspecialchars($v) . '">'; } ?>
+        <label style="font-size:12.5px; color:#555;">الانتقال إلى أسبوع يحتوي تاريخ:</label>
+        <input type="date" name="stmt_ref" value="<?php echo htmlspecialchars($stmt_ref_date); ?>" style="padding:6px; border:1px solid #ccc; border-radius:4px; font-family:monospace; font-size:12.5px;">
+        <button type="submit" style="background:#4e73df; color:white; border:none; padding:6px 14px; border-radius:5px; cursor:pointer; font-size:12.5px; font-weight:bold;">اذهب</button>
+    </form>
+    <a href="?<?php echo http_build_query(array_merge($_GET, ['stmt_all' => $stmt_view_all ? null : '1'])); ?>#statement-print-area" style="text-decoration:none; margin-right:auto; background:<?php echo $stmt_view_all ? '#4e73df' : '#f1f3f9'; ?>; color:<?php echo $stmt_view_all ? '#fff' : '#4e73df'; ?>; padding:7px 14px; border-radius:5px; font-weight:bold; font-size:13px;">
+        <?php echo $stmt_view_all ? 'العودة للعرض الأسبوعي' : 'عرض كل الفترات'; ?>
+    </a>
+</div>
+
+<!-- بطاقات إحصاء الأسبوع المعروض في كشف الحساب -->
+<div class="no-print" style="display:grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap:12px; margin-bottom:15px;">
+    <div style="background:#eaf1fc; border-right:4px solid #4e73df; padding:12px 15px; border-radius:6px;">
+        <div style="color:#2c4e9c; font-size:12.5px; font-weight:bold;">عدد المنتجات (قطع مشتراة)</div>
+        <div style="font-size:19px; font-weight:bold; color:#4e73df; font-family:monospace; margin-top:4px;"><?php echo rtrim(rtrim(number_format($stmt_week_purch['products_qty'], 2), '0'), '.'); ?></div>
+        <div style="font-size:11.5px; color:#2c4e9c; margin-top:2px;"><?php echo intval($stmt_week_purch['products_count']); ?> صنف مختلف</div>
+    </div>
+    <div style="background:#fdecea; border-right:4px solid #e6a817; padding:12px 15px; border-radius:6px;">
+        <div style="color:#96751c; font-size:12.5px; font-weight:bold;">عدد المرتجع (قطع)</div>
+        <div style="font-size:19px; font-weight:bold; color:#e6a817; font-family:monospace; margin-top:4px;"><?php echo rtrim(rtrim(number_format($stmt_week_ret['returns_qty'], 2), '0'), '.'); ?></div>
+        <div style="font-size:11.5px; color:#96751c; margin-top:2px;"><?php echo intval($stmt_week_ret['returns_products_count']); ?> صنف مختلف</div>
+    </div>
+    <div style="background:#eafaf1; border-right:4px solid #1cc88a; padding:12px 15px; border-radius:6px;">
+        <div style="color:#1a8f5f; font-size:12.5px; font-weight:bold;">القيمة الإجمالية للمنتجات</div>
+        <div style="font-size:19px; font-weight:bold; color:#1cc88a; font-family:monospace; margin-top:4px;">$<?php echo number_format($stmt_week_purch['products_value'], 2); ?></div>
+    </div>
+    <div style="background:#fdecea; border-right:4px solid #e74a3b; padding:12px 15px; border-radius:6px;">
+        <div style="color:#a33636; font-size:12.5px; font-weight:bold;">القيمة الإجمالية للمرتجع</div>
+        <div style="font-size:19px; font-weight:bold; color:#e74a3b; font-family:monospace; margin-top:4px;">$<?php echo number_format($stmt_week_ret['returns_value'], 2); ?></div>
+    </div>
+</div>
+
 <!-- كشف حساب المورد -->
 <div id="statement-print-area" style="background: #fff; border: 1px solid #e3e6f0; border-radius: 8px; overflow: hidden; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08); margin-bottom: 30px;">
     <div style="background: #f8f9fc; padding: 15px 20px; border-bottom: 1px solid #e3e6f0; font-weight: bold; color: #4e73df; display: flex; justify-content: space-between; align-items: center;">
-        <span><i class="fas fa-file-invoice"></i> كشف حساب المورد<?php if (!empty($filter_start) || !empty($filter_end)): ?> (<?php echo htmlspecialchars($filter_start ?: 'البداية'); ?> إلى <?php echo htmlspecialchars($filter_end ?: 'اليوم'); ?>)<?php endif; ?></span>
+        <span><i class="fas fa-file-invoice"></i> كشف حساب المورد<?php if (!$stmt_view_all): ?> (<?php echo htmlspecialchars($stmt_week_start); ?> إلى <?php echo htmlspecialchars($stmt_week_end); ?>)<?php endif; ?></span>
         <button onclick="window.print()" class="no-print" style="background: #4e73df; color: white; border: none; padding: 6px 16px; border-radius: 5px; cursor: pointer; font-weight: bold; font-size: 13px;">
             <i class="fas fa-print"></i> طباعة الكشف
         </button>
@@ -1080,6 +1355,12 @@ $statement_closing_balance = $statement_running_balance;
                 <?php endif; ?>
             </tbody>
             <tfoot>
+                <tr style="background: #fbfbfd; border-top: 1px solid #e3e6f0;">
+                    <td colspan="2" style="padding: 10px 15px; font-weight: bold; color: #555; text-align: left;">مجموع الفترة المعروضة:</td>
+                    <td style="padding: 10px 15px; font-weight: bold; font-family: monospace; color: #e74a3b;">$<?php echo number_format($statement_total_due, 2); ?></td>
+                    <td style="padding: 10px 15px; font-weight: bold; font-family: monospace; color: #1cc88a;">$<?php echo number_format($statement_total_settled, 2); ?></td>
+                    <td></td>
+                </tr>
                 <tr style="background: #f8f9fc; border-top: 2px solid #e3e6f0;">
                     <td colspan="4" style="padding: 12px 15px; font-weight: bold; color: #333; text-align: left;">الرصيد الختامي:</td>
                     <td style="padding: 12px 15px; font-weight: bold; font-family: monospace; color: #2e59d9;">$<?php echo number_format($statement_closing_balance, 2); ?></td>
@@ -1112,8 +1393,34 @@ $statement_closing_balance = $statement_running_balance;
 
             <div style="margin-bottom: 12px;">
                 <label style="display: block; margin-bottom: 4px; font-weight: 500;">المبلغ المدفوع (USD):</label>
-                <input type="number" step="0.0001" name="amount_usd" required placeholder="0.00" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                <input type="number" step="0.0001" name="amount_usd" id="pay_amount_usd" required placeholder="0.00" oninput="updateFxEstimate()" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
             </div>
+
+            <?php if ($fx_historical_rate > 0.0001 && abs($fx_today_rate - $fx_historical_rate) > 0.01): ?>
+            <div id="fxEstimateBox" style="background:#fff8e6; border:1px solid #f6dfa3; border-radius:6px; padding:10px 12px; margin-bottom:12px; font-size:12.5px; color:#856404;">
+                <div><i class="fas fa-exchange-alt"></i> متوسط سعر شراء دَين هذا المورد الحالي: <b><?php echo number_format($fx_historical_rate, 2); ?></b> | سعر صرف اليوم: <b><?php echo number_format($fx_today_rate, 2); ?></b></div>
+                <div id="fxEstimateResult" style="margin-top:4px; font-weight:bold;">أدخل المبلغ أعلاه لمعرفة فرق الصرف التقديري لو دفعت اليوم.</div>
+                <div style="font-size:10.5px; color:#a3730f; margin-top:3px;">تقدير بسعر اليوم — القيد الفعلي سيستخدم سعر تاريخ الدفعة المختار أدناه بالضبط.</div>
+            </div>
+            <script>
+                function updateFxEstimate() {
+                    var amt = parseFloat(document.getElementById('pay_amount_usd').value) || 0;
+                    var hist = <?php echo json_encode($fx_historical_rate); ?>;
+                    var today = <?php echo json_encode($fx_today_rate); ?>;
+                    var diff = amt * (today - hist);
+                    var el = document.getElementById('fxEstimateResult');
+                    if (amt <= 0) { el.textContent = 'أدخل المبلغ أعلاه لمعرفة فرق الصرف التقديري لو دفعت اليوم.'; el.style.color = '#856404'; return; }
+                    if (Math.abs(diff) < 0.5) { el.textContent = 'لا يوجد فرق صرف يُذكر بسعر اليوم.'; el.style.color = '#856404'; return; }
+                    if (diff > 0) {
+                        el.textContent = 'خسارة صرف تقديرية: ' + diff.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ل.س';
+                        el.style.color = '#e74a3b';
+                    } else {
+                        el.textContent = 'ربح صرف تقديري: ' + Math.abs(diff).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2}) + ' ل.س';
+                        el.style.color = '#1cc88a';
+                    }
+                }
+            </script>
+            <?php endif; ?>
 
             <div style="margin-bottom: 12px;">
                 <label style="display: block; margin-bottom: 4px; font-weight: 500;">تاريخ الدفعة:</label>

@@ -493,10 +493,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                         $shipping_cash_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                         if ($shipping_expense_id3 && $shipping_cash_id3) {
                             $ship_entry_num3 = "JE-" . $new_invoice_number . "-SHIP";
-                            $ship_desc3 = "تكلفة شحن فاتورة مبيعات رقم: " . $new_invoice_number;
-                            $insertShip3 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols3, $ship_entry_num3, $new_invoice_date, $ship_desc3) {
+                            $ship_desc3 = "تكلفة شحن فاتورة مبيعات رقم: " . $new_invoice_number . " (مُعدَّلة)";
+                            // تصحيح جوهري (نفس نمط الإصلاح الموثَّق أعلاه للقيد الرئيسي بالضبط، ونفس إصلاح
+                            // مسار "تعديل الشحن فقط" في مكان آخر بهذا الملف): هذا القيد يُرحَّل مباشرة على
+                            // "الصندوق الرئيسي" (وليس عبر ذمم وسيطة كالقيد الرئيسي أعلاه)، فتاريخه يُحدِّد
+                            // مباشرة أي يوم يظهر فيه هذا الخروج النقدي بالإقفال اليومي — يجب أن يكون تاريخ
+                            // التعديل الفعلي (الآن)، لا تاريخ الفاتورة الأصلي القديم الذي قد يسبقه بأيام.
+                            $ship_entry_date3 = date('Y-m-d');
+                            $insertShip3 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols3, $ship_entry_num3, $ship_entry_date3, $ship_desc3) {
                                 $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
-                                $vals = [$account_id, $new_invoice_date, $ship_desc3, $debit_amt, $credit_amt];
+                                $vals = [$account_id, $ship_entry_date3, $ship_desc3, $debit_amt, $credit_amt];
                                 if (in_array('entry_number', $existing_cols3)) { $cols_to_insert[] = 'entry_number'; $vals[] = $ship_entry_num3; }
                                 if (in_array('currency_code', $existing_cols3)) { $cols_to_insert[] = 'currency_code'; $vals[] = 'SYP'; }
                                 if (in_array('source_module', $existing_cols3)) { $cols_to_insert[] = 'source_module'; $vals[] = 'Sales'; }
@@ -548,9 +554,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                         $shipping_cash_id = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                         if ($shipping_expense_id && $shipping_cash_id) {
                             $ship_desc = "تكلفة شحن فاتورة مبيعات رقم: " . $old_invoice_number . " (مُعدَّلة)";
-                            $insertShippingLine2 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols2, $ship_entry_num, $inv_date, $ship_desc) {
+                            // تصحيح جوهري: نفس مبدأ إصلاح "قيد التحصيل" أدناه بالضبط — النقد يخرج فعلياً من
+                            // الصندوق لحظة إجراء هذا التعديل، لا لحظة إصدار الفاتورة الأصلية القديمة. كان
+                            // القيد يُرحَّل بتاريخ الفاتورة ($inv_date)، فيظهر كأن الشحن دفعه الصندوق يوم
+                            // الفاتورة نفسها حتى لو أُضيف/عُدِّل فعلياً بعد أسبوع — يُشوِّه "الإقفال اليومي"
+                            // لليومين معاً (ناقص ليوم الفاتورة القديم، زائد ليوم التعديل الحقيقي).
+                            $ship_entry_date = date('Y-m-d');
+                            $insertShippingLine2 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols2, $ship_entry_num, $ship_entry_date, $ship_desc) {
                                 $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
-                                $vals = [$account_id, $inv_date, $ship_desc, $debit_amt, $credit_amt];
+                                $vals = [$account_id, $ship_entry_date, $ship_desc, $debit_amt, $credit_amt];
                                 if (in_array('entry_number', $existing_cols2)) { $cols_to_insert[] = 'entry_number'; $vals[] = $ship_entry_num; }
                                 if (in_array('currency_code', $existing_cols2)) { $cols_to_insert[] = 'currency_code'; $vals[] = 'SYP'; }
                                 if (in_array('source_module', $existing_cols2)) { $cols_to_insert[] = 'source_module'; $vals[] = 'Sales'; }
@@ -1090,6 +1102,9 @@ $office_products_val = floatval($office_products_sales['val']);
 // ============================================================
 $list_status = $_GET['list_status'] ?? '';
 if (!in_array($list_status, ['Delivered', 'Pending', 'Deferred'])) { $list_status = ''; }
+// فلتر "نوع التسليم" (شحن / توصيل) — منفصل تماماً عن "حالة التسليم" (list_status) أعلاه
+$list_delivery_type = $_GET['list_delivery_type'] ?? '';
+if (!in_array($list_delivery_type, ['شحن', 'توصيل'])) { $list_delivery_type = ''; }
 $list_search = trim($_GET['list_search'] ?? '');
 $list_source = $_GET['list_source'] ?? '';
 if ($list_source !== 'office') { $list_source = ''; }
@@ -1106,8 +1121,17 @@ if ($list_status !== '') {
     $list_where[] = "s.delivery_status = ?";
     $list_params[] = $list_status;
 }
+if ($list_delivery_type !== '') {
+    $list_where[] = "s.delivery_type = ?";
+    $list_params[] = $list_delivery_type;
+}
 if ($list_search !== '') {
-    $list_where[] = "(s.customer_name LIKE ? OR s.invoice_number LIKE ?)";
+    // البحث الآن يشمل أيضاً اسم أي منتج ضمن أصناف الفاتورة، فتظهر كل الفواتير التي تحتوي ذلك المنتج
+    $list_where[] = "(s.customer_name LIKE ? OR s.invoice_number LIKE ? OR EXISTS (
+        SELECT 1 FROM sale_items si3 INNER JOIN products p3 ON si3.product_id = p3.id
+        WHERE si3.sale_id = s.id AND p3.product_name LIKE ?
+    ))";
+    $list_params[] = "%{$list_search}%";
     $list_params[] = "%{$list_search}%";
     $list_params[] = "%{$list_search}%";
 }
@@ -1115,6 +1139,27 @@ if ($list_source === 'office') {
     // فقط الفواتير التي تحتوي صنفاً واحداً على الأقل بلا مورد محدَّد (منتجات المكتب)
     $list_where[] = "EXISTS (SELECT 1 FROM sale_items si2 INNER JOIN products p2 ON si2.product_id = p2.id WHERE si2.sale_id = s.id AND p2.supplier_id IS NULL)";
 }
+
+// فلتر "مرتجع بالكامل" مستقل تماماً عن حالة/نوع التسليم — نفس شرط الشارة المعروضة بالجدول (كل صنف
+// أُرجِع بالكامل، بلا أي رصيد متبقٍ قابل للإرجاع، مع إرجاع فعلي واحد على الأقل). افتراضياً (list_returned
+// فارغ) تُستبعَد هذه الفواتير من كل عرض عادي كي لا "تلوّث" نتائج فلاتر حالة/نوع التسليم؛ وعند اختيار
+// "مرتجع بالكامل فقط" تُعرَض هي حصراً.
+$list_returned = $_GET['list_returned'] ?? '';
+if (!in_array($list_returned, ['only'])) { $list_returned = ''; }
+$fully_returned_sql = "(
+    NOT EXISTS (
+        SELECT 1 FROM sale_items si4
+        WHERE si4.sale_id = s.id
+        AND (si4.quantity - COALESCE((SELECT SUM(sri4.quantity) FROM sales_return_items sri4 WHERE sri4.sale_item_id = si4.id), 0)) > 0
+    )
+    AND EXISTS (
+        SELECT 1 FROM sale_items si5
+        WHERE si5.sale_id = s.id
+        AND COALESCE((SELECT SUM(sri5.quantity) FROM sales_return_items sri5 WHERE sri5.sale_item_id = si5.id), 0) > 0
+    )
+)";
+$list_where[] = ($list_returned === 'only') ? $fully_returned_sql : ("NOT " . $fully_returned_sql);
+
 $list_where_sql = 'WHERE ' . implode(' AND ', $list_where);
 
 $stmt_count = $conn->prepare("SELECT COUNT(*) FROM sales s {$list_where_sql}");
@@ -1196,6 +1241,8 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
         <h3 style="margin: 0; color: #4e73df; font-size: 16px;"><i class="fas fa-boxes"></i> عدد القطع حسب الفترة والحالة</h3>
         <form method="GET" action="" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
             <?php if ($list_status !== ''): ?><input type="hidden" name="list_status" value="<?php echo htmlspecialchars($list_status); ?>"><?php endif; ?>
+            <?php if ($list_delivery_type !== ''): ?><input type="hidden" name="list_delivery_type" value="<?php echo htmlspecialchars($list_delivery_type); ?>"><?php endif; ?>
+            <?php if ($list_returned !== ''): ?><input type="hidden" name="list_returned" value="<?php echo htmlspecialchars($list_returned); ?>"><?php endif; ?>
             <a href="?<?php echo http_build_query(array_merge($_GET, ['qf_period' => 'today', 'qf_from' => null, 'qf_to' => null, 'list_page' => 1])); ?>" style="text-decoration: none;">
                 <span style="padding: 7px 14px; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; background: <?php echo $qf_period === 'today' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $qf_period === 'today' ? '#fff' : '#4e73df'; ?>;">اليوم</span>
             </a>
@@ -1228,6 +1275,15 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                 $qs['list_page'] = 1;
                 return '?' . http_build_query($qs);
             };
+            $mk_returned_link = function () use ($list_returned) {
+                global $_GET;
+                $qs = $_GET;
+                $qs['list_returned'] = $list_returned === 'only' ? '' : 'only';
+                $qs['list_page'] = 1;
+                return '?' . http_build_query($qs);
+            };
+            // عدد الفواتير المرتجعة بالكامل (بغض النظر عن فلتر الفترة أعلاه) — لعرضه كرقم توضيحي بالبطاقة
+            $fully_returned_count = intval($conn->query("SELECT COUNT(*) FROM sales s WHERE {$fully_returned_sql}")->fetchColumn());
         ?>
         <a href="<?php echo $mk_status_link(''); ?>" style="text-decoration: none;">
             <div style="background: #eef1fc; border-right: 4px solid #2e59d9; padding: 15px; border-radius: 6px; <?php echo $list_status === '' ? 'box-shadow: 0 0 0 2px #2e59d9 inset;' : ''; ?>">
@@ -1257,11 +1313,13 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                 <div style="font-size: 13px; color: #2c4e9c; font-family: monospace; margin-top: 3px;"><?php echo number_format($amt_deferred, 2); ?> ل.س</div>
             </div>
         </a>
-        <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
-            <div style="color: #a33636; font-size: 13px; font-weight: bold;">قطع مرتجعة</div>
-            <div style="font-size: 22px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($qty_returned, 2), '0'), '.'); ?> <span style="font-size: 12px; font-weight: normal;">قطعة</span></div>
-            <div style="font-size: 13px; color: #a33636; font-family: monospace; margin-top: 3px;"><?php echo number_format($amt_returned, 2); ?> ل.س</div>
-        </div>
+        <a href="<?php echo $mk_returned_link(); ?>" style="text-decoration: none;">
+            <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px; <?php echo $list_returned === 'only' ? 'box-shadow: 0 0 0 2px #e74a3b inset;' : ''; ?>">
+                <div style="color: #a33636; font-size: 13px; font-weight: bold;">قطع مرتجعة <span style="font-weight: normal; font-size: 11px;">(<?php echo $fully_returned_count; ?> فاتورة مرتجعة بالكامل)</span></div>
+                <div style="font-size: 22px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($qty_returned, 2), '0'), '.'); ?> <span style="font-size: 12px; font-weight: normal;">قطعة</span></div>
+                <div style="font-size: 13px; color: #a33636; font-family: monospace; margin-top: 3px;"><?php echo number_format($amt_returned, 2); ?> ل.س</div>
+            </div>
+        </a>
         <a href="<?php echo $mk_source_link(); ?>" style="text-decoration: none;">
             <div style="background: #f3eefc; border-right: 4px solid #8b5cf6; padding: 15px; border-radius: 6px; <?php echo $list_source === 'office' ? 'box-shadow: 0 0 0 2px #8b5cf6 inset;' : ''; ?>">
                 <div style="color: #5b3a99; font-size: 13px; font-weight: bold;" title="أصناف supplier_id فارغ — جرد مكتبي مباشر بلا مورد">مبيعات منتجات المكتب (بلا مورد)</div>
@@ -1271,7 +1329,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
         </a>
     </div>
     <p style="color: #999; font-size: 12px; margin: 12px 0 0 0;">
-        اضغط أي بطاقة لتصفية جدول الفواتير أدناه بنفس الحالة والفترة تلقائياً. القطع المرتجعة محسوبة بتاريخ المرتجع نفسه (لا رابط تصفية لها لأنها ليست حالة تسليم). الإجمالي الكلي (قطعاً ومبلغاً) = تم التسليم + قيد الانتظار + مؤجلة، ولا يشمل المرتجعة.
+        اضغط أي بطاقة لتصفية جدول الفواتير أدناه بنفس الحالة والفترة تلقائياً. بطاقة "قطع مرتجعة" أصبحت فلتراً مستقلاً بذاته: الفواتير المرتجعة بالكامل <strong>مُستبعَدة دائماً</strong> من كل عرض عادي (ولا تتأثر بأي فلتر حالة/نوع تسليم)، واضغط عليها لعرضها حصراً. الإجمالي الكلي (قطعاً ومبلغاً) = تم التسليم + قيد الانتظار + مؤجلة، ولا يشمل المرتجعة.
     </p>
 </div>
 
@@ -1282,6 +1340,8 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
             <?php foreach (['qf_period', 'qf_from', 'qf_to'] as $preserve_key): if (isset($_GET[$preserve_key])): ?>
                 <input type="hidden" name="<?php echo $preserve_key; ?>" value="<?php echo htmlspecialchars($_GET[$preserve_key]); ?>">
             <?php endif; endforeach; ?>
+            <?php if ($list_returned !== ''): ?><input type="hidden" name="list_returned" value="<?php echo htmlspecialchars($list_returned); ?>"><?php endif; ?>
+            <?php if ($list_source !== ''): ?><input type="hidden" name="list_source" value="<?php echo htmlspecialchars($list_source); ?>"><?php endif; ?>
             <label style="font-size: 13px; font-weight: bold; color: #555;">حالة التسليم:</label>
             <select name="list_status" onchange="this.form.submit()" style="padding: 7px 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px;">
                 <option value="" <?php echo $list_status === '' ? 'selected' : ''; ?>>-- الكل --</option>
@@ -1289,10 +1349,16 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                 <option value="Pending" <?php echo $list_status === 'Pending' ? 'selected' : ''; ?>>قيد الانتظار فقط</option>
                 <option value="Deferred" <?php echo $list_status === 'Deferred' ? 'selected' : ''; ?>>مؤجلة فقط</option>
             </select>
-            <input type="text" name="list_search" value="<?php echo htmlspecialchars($list_search); ?>" placeholder="بحث باسم العميل أو رقم الفاتورة..." style="padding: 7px 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px; min-width: 220px;">
+            <label style="font-size: 13px; font-weight: bold; color: #555;">نوع التسليم:</label>
+            <select name="list_delivery_type" onchange="this.form.submit()" style="padding: 7px 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px;">
+                <option value="" <?php echo $list_delivery_type === '' ? 'selected' : ''; ?>>-- الكل --</option>
+                <option value="شحن" <?php echo $list_delivery_type === 'شحن' ? 'selected' : ''; ?>>شحن فقط</option>
+                <option value="توصيل" <?php echo $list_delivery_type === 'توصيل' ? 'selected' : ''; ?>>توصيل فقط</option>
+            </select>
+            <input type="text" name="list_search" value="<?php echo htmlspecialchars($list_search); ?>" placeholder="بحث باسم العميل، رقم الفاتورة، أو اسم منتج..." style="padding: 7px 10px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px; min-width: 220px;">
             <button type="submit" style="background: #4e73df; color: white; border: none; padding: 7px 14px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold;"><i class="fas fa-search"></i> بحث</button>
             <span style="font-size: 12.5px; color: #999;"><i class="fas fa-calendar"></i> <?php echo htmlspecialchars($qf_from); ?> إلى <?php echo htmlspecialchars($qf_to); ?></span>
-            <?php if ($list_status !== '' || $qf_period !== 'today' || $list_search !== '' || $list_source !== ''): ?>
+            <?php if ($list_status !== '' || $list_delivery_type !== '' || $list_returned !== '' || $qf_period !== 'today' || $list_search !== '' || $list_source !== ''): ?>
                 <a href="?" style="font-size: 12.5px; color: #e74a3b; text-decoration: none;"><i class="fas fa-times"></i> إلغاء كل الفلاتر</a>
             <?php endif; ?>
         </form>
@@ -1306,6 +1372,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                     <th style="padding: 10px 12px;">اسم العميل</th>
                     <th style="padding: 10px 12px; max-width: 220px;">الأصناف (الكمية)</th>
                     <th style="padding: 10px 12px; white-space: nowrap;">المندوب</th>
+                    <th style="padding: 10px 12px; color: #6f42c1; white-space: nowrap;" title="نسبة عمولة المندوب من إجمالي الفاتورة">نسبة المندوب</th>
                     <th style="padding: 10px 12px; color: #2e59d9; white-space: nowrap;">الإجمالي (SYP)</th>
                     <th style="padding: 10px 12px; color: #e74a3b; white-space: nowrap;">الإجمالي (USD)</th>
                     <th style="padding: 10px 12px; color: #6f42c1; white-space: nowrap;">الشحن</th>
@@ -1387,6 +1454,14 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                                 <?php endif; ?>
                             </td>
                             <td style="padding: 9px 12px; color: #555; white-space: nowrap;"><?php echo htmlspecialchars($sale['rep_name'] ?: 'بدون مندوب'); ?></td>
+                            <td style="padding: 9px 12px; color: #6f42c1; white-space: nowrap; font-family: monospace; font-weight: bold;">
+                                <?php
+                                    $sale_comm_pct = (!empty($sale['rep_name']) && floatval($sale['total_amount_syp']) > 0)
+                                        ? (floatval($sale['total_commissions']) / floatval($sale['total_amount_syp'])) * 100
+                                        : null;
+                                    echo $sale_comm_pct !== null ? number_format($sale_comm_pct, 2) . '%' : '<span style="color:#aaa; font-weight:normal;">-</span>';
+                                ?>
+                            </td>
                             <?php
                                 $sale_returned_syp = $returns_by_sale[$sale['id']] ?? 0;
                                 $sale_discounted_syp = $discounts_by_sale[$sale['id']] ?? 0;
@@ -1444,8 +1519,8 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="12" style="padding: 30px; text-align: center; color: #777;">
-                            <?php echo ($list_status !== '' || $qf_period !== 'today') ? 'لا توجد فواتير مطابقة للفلاتر المحددة.' : 'لا توجد فواتير مبيعات مسجلة اليوم.'; ?>
+                        <td colspan="13" style="padding: 30px; text-align: center; color: #777;">
+                            <?php echo ($list_status !== '' || $list_delivery_type !== '' || $list_returned !== '' || $qf_period !== 'today') ? 'لا توجد فواتير مطابقة للفلاتر المحددة.' : 'لا توجد فواتير مبيعات مسجلة اليوم.'; ?>
                         </td>
                     </tr>
                 <?php endif; ?>

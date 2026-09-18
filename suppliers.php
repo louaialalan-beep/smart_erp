@@ -149,6 +149,9 @@ $today_str2 = date('Y-m-d');
 if ($sf_period === 'week') {
     $sf_from = date('Y-m-d', strtotime('monday this week'));
     $sf_to = date('Y-m-d', strtotime('sunday this week'));
+} elseif ($sf_period === 'all') {
+    $sf_from = '2000-01-01';
+    $sf_to = '2100-12-31';
 } elseif ($sf_period === 'custom' && !empty($_GET['sf_from']) && !empty($_GET['sf_to'])) {
     $sf_from = $_GET['sf_from'];
     $sf_to = $_GET['sf_to'];
@@ -215,7 +218,22 @@ $sf_total_opening_balance = floatval($stmt_sf_opening->fetchColumn());
 // الرصيد الافتتاحي) — ما كان يجعل "صافي الحساب" هنا يختلف عن الملف التفصيلي لنفس المورد. الآن مطابق
 // تماماً لنفس منهج supplier_view.php: فواتير الشراء غير النقدية (purchase_invoice_items) + رصيد تكميلي
 // للكميات القديمة غير المُغطاة بفواتير، ناقص مرتجعات الفواتير غير النقدية، زائد الرصيد الافتتاحي.
+//
+// تصحيح إضافي: الجدول أدناه كان يتجاهل فلتر الفترة تماماً (يعرض دائماً أرقاماً تراكمية منذ البداية)
+// رغم أن بطاقات الملخص أعلاه تحترمه — الآن يُجلَب كل من الرقم "ضمن الفترة المحددة" (period_*) والرقم
+// "التراكمي حتى الآن" (*_lifetime) معاً لكل مورد، فيعرض الجدول أعمدة الحركة (مشتريات/مدفوعات/مردودات)
+// ضمن الفترة المحددة فعلياً، مع الحفاظ على عمود "الرصيد المستحق الفعلي الآن" التراكمي كمرجع دائم.
 $sql = "SELECT s.*, 
+        (SELECT COALESCE(SUM(pii.total_cost_usd), 0)
+            FROM purchase_invoice_items pii
+            INNER JOIN purchase_invoices pi ON pii.purchase_invoice_id = pi.id
+            WHERE pi.supplier_id = s.id AND pi.payment_status != 'Paid' AND pi.invoice_date BETWEEN ? AND ?) AS period_purchases,
+        (SELECT COALESCE(SUM(sp.amount_usd), 0) FROM supplier_payments sp WHERE sp.supplier_id = s.id AND sp.payment_date BETWEEN ? AND ?) AS period_payments,
+        (SELECT COALESCE(SUM(pr.total_amount_usd), 0)
+            FROM purchase_returns pr
+            INNER JOIN purchase_invoices pi3 ON pr.purchase_invoice_id = pi3.id
+            WHERE pi3.supplier_id = s.id AND pi3.payment_status != 'Paid' AND pr.return_date BETWEEN ? AND ?) AS period_purchase_returns,
+        (SELECT COALESCE(SUM(sd.amount_usd), 0) FROM supplier_discounts sd WHERE sd.supplier_id = s.id AND sd.discount_date BETWEEN ? AND ?) AS period_discounts_logged,
         (
             (SELECT COALESCE(SUM(pii.total_cost_usd), 0)
                 FROM purchase_invoice_items pii
@@ -235,7 +253,9 @@ $sql = "SELECT s.*,
         (SELECT COALESCE(SUM(sd.amount_usd), 0) FROM supplier_discounts sd WHERE sd.supplier_id = s.id) AS total_discounts_logged
         FROM suppliers s 
         ORDER BY s.id DESC";
-$suppliers = $conn->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+$stmt_suppliers = $conn->prepare($sql);
+$stmt_suppliers->execute([$sf_from, $sf_to, $sf_from, $sf_to, $sf_from, $sf_to, $sf_from, $sf_to]);
+$suppliers = $stmt_suppliers->fetchAll(PDO::FETCH_ASSOC);
 
 // إجمالي صافي أرصدة كل الموردين مجتمعين — يُحسب مسبقاً هنا لعرضه كبطاقة، بنفس معادلة صافي الحساب
 // المستخدمة لكل مورد على حدة أدناه في الجدول. هذا الرقم هو ما يجب أن يطابق "ذمم الموردين" في
@@ -245,13 +265,17 @@ $grand_total_purchases_col = 0;
 $grand_total_payments_col = 0;
 $grand_total_returns_col = 0;
 $grand_total_opening_col = 0;
+$grand_total_period_net_col = 0;
 foreach ($suppliers as $sup_pre) {
     $pre_opening = floatval($sup_pre['opening_balance_usd'] ?? 0);
     $pre_returns = floatval($sup_pre['returns_discounts']) + floatval($sup_pre['total_purchase_returns']) + floatval($sup_pre['total_discounts_logged']);
     $grand_total_net_balance += $sup_pre['total_purchases'] - $sup_pre['total_payments'] - $pre_returns + $pre_opening;
-    $grand_total_purchases_col += floatval($sup_pre['total_purchases']);
-    $grand_total_payments_col += floatval($sup_pre['total_payments']);
-    $grand_total_returns_col += $pre_returns;
+
+    $pre_period_returns = floatval($sup_pre['period_purchase_returns']) + floatval($sup_pre['period_discounts_logged']);
+    $grand_total_purchases_col += floatval($sup_pre['period_purchases']);
+    $grand_total_payments_col += floatval($sup_pre['period_payments']);
+    $grand_total_returns_col += $pre_period_returns;
+    $grand_total_period_net_col += floatval($sup_pre['period_purchases']) - floatval($sup_pre['period_payments']) - $pre_period_returns;
     $grand_total_opening_col += $pre_opening;
 }
 ?>
@@ -280,6 +304,9 @@ foreach ($suppliers as $sup_pre) {
     <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 15px;">
         <h3 style="margin: 0; color: #4e73df; font-size: 16px;"><i class="fas fa-chart-line"></i> حركة الموردين حسب الفترة (كل الموردين مجتمعين)</h3>
         <form method="GET" action="" style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <a href="?sf_period=all" style="text-decoration: none;">
+                <span style="padding: 7px 14px; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; background: <?php echo $sf_period === 'all' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $sf_period === 'all' ? '#fff' : '#4e73df'; ?>;">الكل (كل الأوقات)</span>
+            </a>
             <a href="?sf_period=today" style="text-decoration: none;">
                 <span style="padding: 7px 14px; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; background: <?php echo $sf_period === 'today' ? '#4e73df' : '#f1f3f9'; ?>; color: <?php echo $sf_period === 'today' ? '#fff' : '#4e73df'; ?>;">اليوم</span>
             </a>
@@ -323,7 +350,7 @@ foreach ($suppliers as $sup_pre) {
             <div style="font-size: 22px; font-weight: bold; color: #2e59d9; font-family: monospace; margin-top: 5px;">$<?php echo number_format($grand_total_net_balance, 2); ?></div>
         </div>
     </div>
-    <p style="color: #999; font-size: 12px; margin: 12px 0 0 0;">هذه أرقام <strong>حركة الفترة المحددة فقط</strong> (فواتير/دفعات/مرتجعات بتاريخ ضمن الفترة) لكل الموردين مجتمعين — وليست الرصيد التراكمي المستحق حالياً، والذي يظهر بشكل صحيح لكل مورد على حدة في عمود "صافي الحساب" بالجدول أدناه.</p>
+    <p style="color: #999; font-size: 12px; margin: 12px 0 0 0;">هذه أرقام <strong>حركة الفترة المحددة فقط</strong> (فواتير/دفعات/مرتجعات بتاريخ ضمن الفترة) لكل الموردين مجتمعين — وتُطابق الآن نفس الفترة المعروضة في أعمدة الجدول أدناه. عمود "الرصيد المستحق الفعلي الآن" يبقى وحده تراكمياً دائماً (بلا فلتر) لأنه يمثّل الذمة الحقيقية المستحقة حالياً.</p>
 </div>
 
 <!-- جدول الموردين الرئيسي -->
@@ -336,11 +363,12 @@ foreach ($suppliers as $sup_pre) {
                     <th style="padding: 12px 15px;">رقم الهاتف</th>
                     <th style="padding: 12px 15px;">العملة</th>
                     <th style="padding: 12px 15px;">شروط السداد</th>
-                    <th style="padding: 12px 15px; color: #e74a3b;">إجمالي المشتريات</th>
-                    <th style="padding: 12px 15px; color: #1cc88a;">إجمالي المدفوعات</th>
-                    <th style="padding: 12px 15px; color: #f6c23e;">المردودات / الخصم</th>
+                    <th style="padding: 12px 15px; color: #e74a3b;" title="ضمن الفترة المحددة أعلاه">المشتريات (الفترة)</th>
+                    <th style="padding: 12px 15px; color: #1cc88a;" title="ضمن الفترة المحددة أعلاه">المدفوعات (الفترة)</th>
+                    <th style="padding: 12px 15px; color: #f6c23e;" title="ضمن الفترة المحددة أعلاه">المردودات/الخصم (الفترة)</th>
+                    <th style="padding: 12px 15px; color: #2e59d9;" title="مشتريات - مدفوعات - مردودات، ضمن الفترة المحددة">صافي حركة الفترة</th>
                     <th style="padding: 12px 15px; color: #6f42c1;">الرصيد الافتتاحي</th>
-                    <th style="padding: 12px 15px; color: #2e59d9;">صافي الحساب الباقي</th>
+                    <th style="padding: 12px 15px; color: #a33636;" title="الذمة الحقيقية المستحقة الآن — تراكمي دائماً، بلا فلتر">الرصيد المستحق الفعلي الآن</th>
                     <th style="padding: 12px 15px; text-align: center;">الإجراءات</th>
                 </tr>
             </thead>
@@ -352,17 +380,20 @@ foreach ($suppliers as $sup_pre) {
                         $sup_opening_balance = floatval($sup['opening_balance_usd'] ?? 0);
                         $sup_total_returns = floatval($sup['returns_discounts']) + floatval($sup['total_purchase_returns']) + floatval($sup['total_discounts_logged']);
                         $net_balance = $sup['total_purchases'] - $sup['total_payments'] - $sup_total_returns + $sup_opening_balance;
+                        $sup_period_returns = floatval($sup['period_purchase_returns']) + floatval($sup['period_discounts_logged']);
+                        $sup_period_net = floatval($sup['period_purchases']) - floatval($sup['period_payments']) - $sup_period_returns;
                     ?>
                         <tr style="border-bottom: 1px solid #f1f1f1;">
                             <td style="padding: 12px 15px; font-weight: 600; color: #333;"><?php echo htmlspecialchars($sup['supplier_name']); ?></td>
                             <td style="padding: 12px 15px; color: #555; font-family: monospace;"><?php echo htmlspecialchars($sup['phone'] ?: 'غير متوفر'); ?></td>
                             <td style="padding: 12px 15px; font-weight: bold; color: #4e73df;"><?php echo htmlspecialchars($sup['currency']); ?></td>
                             <td style="padding: 12px 15px; color: #666; font-size: 13px;"><?php echo htmlspecialchars($sup['payment_terms']); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;">$<?php echo number_format($sup['total_purchases'], 2); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a; font-weight: bold;">$<?php echo number_format($sup['total_payments'], 2); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e; font-weight: bold;" title="خصومات يدوية: $<?php echo number_format($sup['returns_discounts'], 2); ?> + خصومات مُسجَّلة: $<?php echo number_format($sup['total_discounts_logged'], 2); ?> + مرتجعات فعلية: $<?php echo number_format($sup['total_purchase_returns'], 2); ?>">$<?php echo number_format($sup_total_returns, 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b; font-weight: bold;">$<?php echo number_format($sup['period_purchases'], 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a; font-weight: bold;">$<?php echo number_format($sup['period_payments'], 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e; font-weight: bold;">$<?php echo number_format($sup_period_returns, 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9; font-weight: bold;">$<?php echo number_format($sup_period_net, 2); ?></td>
                             <td style="padding: 12px 15px; font-family: monospace; color: #6f42c1; font-weight: bold;">$<?php echo number_format($sup_opening_balance, 2); ?></td>
-                            <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9; font-weight: bold;">$<?php echo number_format($net_balance, 2); ?></td>
+                            <td style="padding: 12px 15px; font-family: monospace; color: #a33636; font-weight: bold;" title="خصومات يدوية: $<?php echo number_format($sup['returns_discounts'], 2); ?> + خصومات مُسجَّلة: $<?php echo number_format($sup['total_discounts_logged'], 2); ?> + مرتجعات فعلية: $<?php echo number_format($sup['total_purchase_returns'], 2); ?>">$<?php echo number_format($net_balance, 2); ?></td>
                             <td style="padding: 12px 15px; text-align: center; white-space: nowrap;">
                                 <a href="supplier_view.php?id=<?php echo $sup['id']; ?>" style="background: #4e73df; color: white; padding: 5px 10px; border-radius: 4px; text-decoration: none; font-size: 12px; font-weight: bold; margin-left: 4px;">
                                     <i class="fas fa-eye"></i> الملف التفصيلي
@@ -375,7 +406,7 @@ foreach ($suppliers as $sup_pre) {
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="10" style="padding: 30px; text-align: center; color: #777;">لا توجد أي موردين مسجلين حالياً.</td>
+                        <td colspan="11" style="padding: 30px; text-align: center; color: #777;">لا توجد أي موردين مسجلين حالياً.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>
@@ -386,8 +417,9 @@ foreach ($suppliers as $sup_pre) {
                     <td style="padding: 12px 15px; font-family: monospace; color: #e74a3b;">$<?php echo number_format($grand_total_purchases_col, 2); ?></td>
                     <td style="padding: 12px 15px; font-family: monospace; color: #1cc88a;">$<?php echo number_format($grand_total_payments_col, 2); ?></td>
                     <td style="padding: 12px 15px; font-family: monospace; color: #f6c23e;">$<?php echo number_format($grand_total_returns_col, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9;">$<?php echo number_format($grand_total_period_net_col, 2); ?></td>
                     <td style="padding: 12px 15px; font-family: monospace; color: #6f42c1;">$<?php echo number_format($grand_total_opening_col, 2); ?></td>
-                    <td style="padding: 12px 15px; font-family: monospace; color: #2e59d9;">$<?php echo number_format($grand_total_net_balance, 2); ?></td>
+                    <td style="padding: 12px 15px; font-family: monospace; color: #a33636;">$<?php echo number_format($grand_total_net_balance, 2); ?></td>
                     <td></td>
                 </tr>
             </tfoot>

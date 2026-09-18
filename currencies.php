@@ -188,13 +188,13 @@ $exchange_rates_history = $rates_stmt->fetchAll(PDO::FETCH_ASSOC);
 
     <!-- قسم تسجيل سعر صرف جديد (يومي) -->
     <div class="panel-box" style="margin-bottom: 0;">
-        <h4 style="margin-top: 0; color: #1cc88a; border-bottom: 1px solid #eee; padding-bottom: 10px;">تسجيل / تحديث سعر صرف ليوم</h4>
-        <form method="POST" action="">
+        <h4 style="margin-top: 0; color: #1cc88a; border-bottom: 1px solid #eee; padding-bottom: 10px;" id="rateFormTitle">تسجيل / تحديث سعر صرف ليوم</h4>
+        <form method="POST" action="" id="rateForm">
 <?php csrfField(); ?>
             <input type="hidden" name="add_exchange_rate" value="1">
             <div style="margin-bottom: 12px;">
                 <label style="display: block; margin-bottom: 5px; font-weight: 500;">العملة:</label>
-                <select name="rate_currency_code" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                <select name="rate_currency_code" id="rateFormCurrency" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
                     <option value="">-- اختر العملة --</option>
                     <?php foreach ($currencies as $cur): ?>
                         <?php if ($cur['is_base'] == 0): // سعر الصرف للعملات الاجنبية مقابل الأساسية ?>
@@ -206,18 +206,41 @@ $exchange_rates_history = $rates_stmt->fetchAll(PDO::FETCH_ASSOC);
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;">
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: 500;">تاريخ السريان:</label>
-                    <input type="date" name="rate_date" value="<?php echo date('Y-m-d'); ?>" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
+                    <input type="date" name="rate_date" id="rateFormDate" value="<?php echo date('Y-m-d'); ?>" required style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
                 </div>
                 <div>
                     <label style="display: block; margin-bottom: 5px; font-weight: 500;">سعر الصرف:</label>
-                    <input type="number" step="0.000001" name="exchange_rate" required placeholder="0.000000" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-weight: bold;">
+                    <input type="number" step="0.000001" name="exchange_rate" id="rateFormValue" required placeholder="0.000000" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-weight: bold;">
                 </div>
             </div>
-            <button type="submit" style="background: #1cc88a; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ واختيار السعر</button>
+            <button type="submit" id="rateFormSubmit" style="background: #1cc88a; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ واختيار السعر</button>
+            <button type="button" id="rateFormCancelEdit" onclick="cancelRateEdit()" style="display:none; background: none; color: #888; border: none; padding: 8px 10px; cursor: pointer;">إلغاء التعديل</button>
         </form>
     </div>
 
 </div>
+
+<script>
+    // تعبئة النموذج أعلاه تلقائياً بقيم سطر مُختار من الأرشيف أدناه، والتمرير إليه — بديل واضح لعدم
+    // وجود عمود "تعديل" داخل جدول الأرشيف نفسه؛ نفس نموذج "تسجيل سعر جديد" يُحدِّث السعر تلقائياً إن
+    // أُعيد إرساله بنفس العملة والتاريخ (بدل إنشاء سطر مكرَّر)، فهو "التعديل" الفعلي في هذا النظام.
+    function editRate(currencyCode, rateDate, rateValue) {
+        document.getElementById('rateFormCurrency').value = currencyCode;
+        document.getElementById('rateFormDate').value = rateDate;
+        document.getElementById('rateFormValue').value = rateValue;
+        document.getElementById('rateFormTitle').textContent = 'تعديل سعر الصرف — ' + currencyCode + ' بتاريخ ' + rateDate;
+        document.getElementById('rateFormSubmit').textContent = 'حفظ التعديل';
+        document.getElementById('rateFormCancelEdit').style.display = 'inline-block';
+        document.getElementById('rateForm').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    function cancelRateEdit() {
+        document.getElementById('rateForm').reset();
+        document.getElementById('rateFormDate').value = '<?php echo date('Y-m-d'); ?>';
+        document.getElementById('rateFormTitle').textContent = 'تسجيل / تحديث سعر صرف ليوم';
+        document.getElementById('rateFormSubmit').textContent = 'حفظ واختيار السعر';
+        document.getElementById('rateFormCancelEdit').style.display = 'none';
+    }
+</script>
 
 <!-- جدول العملات المتاحة -->
 <div class="panel-box">
@@ -298,6 +321,7 @@ $exchange_rates_history = $rates_stmt->fetchAll(PDO::FETCH_ASSOC);
                     <th style="padding: 10px;">العملة</th>
                     <th style="padding: 10px;">تاريخ السريان</th>
                     <th style="padding: 10px; text-align: left;">سعر الصرف المقابل</th>
+                    <th style="padding: 10px; text-align: center;">إجراء</th>
                 </tr>
             </thead>
             <tbody>
@@ -307,11 +331,16 @@ $exchange_rates_history = $rates_stmt->fetchAll(PDO::FETCH_ASSOC);
                             <td style="padding: 10px; font-weight: bold; font-family: monospace; color: #4e73df;"><?php echo htmlspecialchars($rate['currency_code']); ?></td>
                             <td style="padding: 10px;"><?php echo htmlspecialchars($rate['rate_date']); ?></td>
                             <td style="padding: 10px; text-align: left; font-family: monospace; font-weight: bold; color: #e74a3b;"><?php echo number_format($rate['exchange_rate'], 6); ?></td>
+                            <td style="padding: 10px; text-align: center;">
+                                <button type="button" onclick="editRate('<?php echo htmlspecialchars($rate['currency_code']); ?>', '<?php echo htmlspecialchars($rate['rate_date']); ?>', '<?php echo htmlspecialchars($rate['exchange_rate']); ?>')" style="background: #eef1f9; color: #4e73df; border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: bold;">
+                                    <i class="fas fa-edit"></i> تعديل
+                                </button>
+                            </td>
                         </tr>
                     <?php endforeach; ?>
                 <?php else: ?>
                     <tr>
-                        <td colspan="3" style="padding: 20px; text-align: center; color: #777;">لا توجد أسعار صرف مسجلة في الأرشيف حالياً.</td>
+                        <td colspan="4" style="padding: 20px; text-align: center; color: #777;">لا توجد أسعار صرف مسجلة في الأرشيف حالياً.</td>
                     </tr>
                 <?php endif; ?>
             </tbody>

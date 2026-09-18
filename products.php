@@ -410,8 +410,10 @@ if (!empty($filter_supplier)) {
 }
 if ($filter_source === 'supplier') {
     $where[] = "p.supplier_id IS NOT NULL";
+    $where[] = "p.current_quantity > 0"; // عرض المتوفر في المخزون فقط عند تصفية "منتجات الموردين"
 } elseif ($filter_source === 'office') {
     $where[] = "p.supplier_id IS NULL";
+    $where[] = "p.current_quantity > 0"; // عرض المتوفر في المخزون فقط عند تصفية "منتجات المكتب / الجرد"
 }
 
 // إحصائيات "منتجات الموردين" مقابل "منتجات المكتب" (بلا مورد — بضاعة أُدخلت مباشرة كأصل جرد مكتبي)
@@ -498,6 +500,12 @@ $auto_sku = 'PRD-' . str_pad($next_sku_number, 3, '0', STR_PAD_LEFT);
         </div>
     </a>
 </div>
+
+<?php if ($filter_source === 'supplier' || $filter_source === 'office'): ?>
+    <div style="background:#fff8e6; border:1px solid #f6c23e; color:#8a6d1e; padding:8px 14px; border-radius:6px; margin-bottom:15px; font-size:13px;">
+        <i class="fas fa-filter"></i> يُعرض هنا فقط الأصناف المتوفرة حالياً بالمخزون (المخزون الحالي أكبر من صفر).
+    </div>
+<?php endif; ?>
 
 <!-- شريط البحث والفلترة الاحترافي -->
 <div style="background: #f8f9fc; padding: 20px; border-radius: 8px; margin-bottom: 20px; border: 1px solid #e3e6f0; box-shadow: 0 0.15rem 1rem 0 rgba(58, 59, 69, 0.05);">
