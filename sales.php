@@ -205,6 +205,16 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
 
             $total_usd = $exchange_rate > 0 ? ($total_syp / $exchange_rate) : 0;
 
+            // حماية من تكرار الإرسال (ضغطة مزدوجة على "حفظ"): إن وُجدت فاتورة بنفس العميل ونفس المبلغ
+            // بالضبط أُدرِجت خلال آخر 5 ثوانٍ فقط، نرفض هذا الإدراج فوراً بدل تكرار كامل الفاتورة والقيد.
+            if (isRecentDuplicateSubmission($conn, 'sales', [
+                'customer_name' => $customer_name,
+                'total_amount_syp' => $total_syp,
+                'invoice_date' => $invoice_date,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             // إدخال الفاتورة الرئيسية
             $stmt = $conn->prepare("INSERT INTO sales (invoice_number, customer_name, representative_id, exchange_rate, total_amount_syp, total_amount_usd, total_commissions, payment_status, delivery_status, invoice_date, shipping_cost_syp, delivery_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             $stmt->execute([$invoice_number, $customer_name, $representative_id, $exchange_rate, $total_syp, $total_usd, $total_comm, $payment_status, $delivery_status, $invoice_date, $shipping_cost_syp, $delivery_type]);
@@ -216,6 +226,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
             foreach ($items_data as $it) {
                 $stmt_item = $conn->prepare("INSERT INTO sale_items (sale_id, product_id, quantity, unit_price_syp, total_price_syp, cost_price_usd_at_sale, commission_per_unit) VALUES (?, ?, ?, ?, ?, ?, ?)");
                 $stmt_item->execute([$sale_id, $it['product_id'], $it['qty'], $it['price'], $it['total'], $it['cost_at_sale'], $it['comm_per_unit']]);
+                $sale_item_id = $conn->lastInsertId();
+
+                // نظام دفعات المخزون (FIFO): تُستهلَك الكمية الآن فعلياً من أقدم دفعة متاحة أولاً، وتُستبدَل
+                // لقطة التكلفة الممزوجة الأولية (cost_at_sale أعلاه) بالتكلفة الموزونة الفعلية الناتجة —
+                // فتُنسَب تكلفة كل وحدة مباعة بدقة لمصدرها ومورّدها الحقيقيين، لا لتخمين ممزوج للمنتج ككل.
+                $fifo_cost = consumeInventoryBatchesFIFO($conn, $it['product_id'], $it['qty'], $sale_item_id);
+                if ($fifo_cost > 0) {
+                    $conn->prepare("UPDATE sale_items SET cost_price_usd_at_sale = ? WHERE id = ?")->execute([$fifo_cost, $sale_item_id]);
+                }
 
                 $stmt_stock = $conn->prepare("UPDATE products SET current_quantity = current_quantity - ? WHERE id = ?");
                 $stmt_stock->execute([$it['qty'], $it['product_id']]);
@@ -323,7 +342,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_sale'])) {
                 recognizeSaleRevenue($conn, $sale_id);
             }
 
-            $conn->commit();
+            if ($conn->inTransaction()) { $conn->commit(); }
             $msg = "تم حفظ وترحيل فاتورة المبيعات والقيد المحاسبي بنجاح!";
             logAudit($conn, 'INSERT', 'فواتير المبيعات', "إنشاء فاتورة مبيعات رقم $invoice_number للعميل: $customer_name بقيمة " . number_format($total_syp, 2) . " ل.س", $sale_id);
         } catch (Exception $e) {
@@ -343,6 +362,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
     $payment_status = trim($_POST['payment_status']);
     $delivery_status = trim($_POST['delivery_status']);
     $shipping_cost_syp = floatval($_POST['shipping_cost_syp'] ?? 0);
+    // تاريخ دفع الشحن الفعلي — يختاره المستخدم صراحةً الآن، بدل افتراض "اليوم" ثابتاً دائماً.
+    $shipping_paid_date = !empty($_POST['shipping_paid_date']) ? $_POST['shipping_paid_date'] : date('Y-m-d');
     $delivery_type = trim($_POST['delivery_type'] ?? '');
     if (!in_array($delivery_type, ['شحن', 'توصيل'])) { $delivery_type = null; }
 
@@ -402,15 +423,30 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 $commissions = $_POST['commission_amount'] ?? [];
 
                 // 1) استرجاع كل الكميات القديمة للمخزون قبل حذف الأصناف القديمة
-                $stmt_old_items = $conn->prepare("SELECT product_id, quantity FROM sale_items WHERE sale_id = ?");
+                $stmt_old_items = $conn->prepare("SELECT id, product_id, quantity FROM sale_items WHERE sale_id = ?");
                 $stmt_old_items->execute([$sale_id]);
                 foreach ($stmt_old_items->fetchAll(PDO::FETCH_ASSOC) as $oi) {
                     $conn->prepare("UPDATE products SET current_quantity = current_quantity + ? WHERE id = ?")->execute([$oi['quantity'], $oi['product_id']]);
+                    // نظام دفعات المخزون: تُعاد الكمية أيضاً لدفعاتها الأصلية (لا لتحديث current_quantity
+                    // الممزوج فقط)، وإلا بقيت الدفعات القديمة "مُستهلَكة" وهمياً رغم عودة الكمية فعلياً.
+                    restoreInventoryBatchForReturn($conn, $oi['id'], $oi['quantity']);
                 }
                 $conn->prepare("DELETE FROM sale_items WHERE sale_id = ?")->execute([$sale_id]);
 
+                // تصحيح جوهري بناءً على ملاحظة صريحة من المستخدم: يجب حفظ تاريخ قيد الشحن القديم **قبل**
+                // حذفه أدناه — إن لم يتغيّر مبلغ الشحن فعلياً في هذا التعديل، سيُعاد استخدام هذا التاريخ
+                // نفسه بدل تاريخ اليوم، فلا يتأثر تاريخ الشحن إطلاقاً بتعديلات لا علاقة لها بالشحن (كتغيير
+                // نسبة عمولة أو حالة تسليم فقط) — بدل الاعتماد فقط على حقل تاريخ الشحن اليدوي.
+                $old_ship_entry_date = null;
+                try {
+                    $stmt_old_ship = $conn->prepare("SELECT entry_date FROM journal_entries WHERE entry_number = ? AND debit > 0 LIMIT 1");
+                    $stmt_old_ship->execute(["JE-" . $old_invoice_number . "-SHIP"]);
+                    $old_ship_entry_date = $stmt_old_ship->fetchColumn() ?: null;
+                } catch (Exception $e) { }
+
                 // 2) حذف كل القيود القديمة المرتبطة بهذه الفاتورة (بكل امتداداتها) وحركة عمولة المندوب القديمة
-                $conn->prepare("DELETE FROM journal_entries WHERE entry_number LIKE ?")->execute(["JE-" . $old_invoice_number . "%"]);
+                // (قيود الدفعات الجزئية المسجَّلة من ملف العميل -PARTIALPAY- تبقى: هي نقد دخل الصندوق فعلاً)
+                $conn->prepare("DELETE FROM journal_entries WHERE entry_number LIKE ? AND entry_number NOT LIKE '%-PARTIALPAY-%'")->execute(["JE-" . $old_invoice_number . "%"]);
                 $conn->prepare("DELETE FROM representative_transactions WHERE notes LIKE ? AND transaction_type IN ('commission','commission_reversal')")->execute(["%" . $old_invoice_number . "%"]);
 
                 // 3) إعادة بناء الأصناف من جديد (بنفس منطق إضافة فاتورة جديدة تماماً)
@@ -438,6 +474,12 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 foreach ($items_data as $it) {
                     $conn->prepare("INSERT INTO sale_items (sale_id, product_id, quantity, unit_price_syp, total_price_syp, cost_price_usd_at_sale, commission_per_unit) VALUES (?, ?, ?, ?, ?, ?, ?)")
                          ->execute([$sale_id, $it['product_id'], $it['qty'], $it['price'], $it['total'], $it['cost_at_sale'], $it['comm_per_unit']]);
+                    $new_sale_item_id = $conn->lastInsertId();
+                    // نظام دفعات المخزون (FIFO): استهلاك فعلي من أقدم دفعة متاحة، يستبدل لقطة التكلفة الممزوجة
+                    $fifo_cost_edit = consumeInventoryBatchesFIFO($conn, $it['product_id'], $it['qty'], $new_sale_item_id);
+                    if ($fifo_cost_edit > 0) {
+                        $conn->prepare("UPDATE sale_items SET cost_price_usd_at_sale = ? WHERE id = ?")->execute([$fifo_cost_edit, $new_sale_item_id]);
+                    }
                     $conn->prepare("UPDATE products SET current_quantity = current_quantity - ? WHERE id = ?")->execute([$it['qty'], $it['product_id']]);
                 }
 
@@ -499,7 +541,13 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                             // "الصندوق الرئيسي" (وليس عبر ذمم وسيطة كالقيد الرئيسي أعلاه)، فتاريخه يُحدِّد
                             // مباشرة أي يوم يظهر فيه هذا الخروج النقدي بالإقفال اليومي — يجب أن يكون تاريخ
                             // التعديل الفعلي (الآن)، لا تاريخ الفاتورة الأصلي القديم الذي قد يسبقه بأيام.
-                            $ship_entry_date3 = date('Y-m-d');
+                            // تصحيح جوهري نهائي: إن لم يتغيّر مبلغ الشحن فعلياً عن القيمة القديمة (خلال هذا
+                            // التعديل تحديداً — كأن تكون قد عدَّلت فقط نسبة عمولة أو حالة تسليم، لا الشحن)،
+                            // يُعاد استخدام تاريخ القيد القديم نفسه ($old_ship_entry_date) — فلا يتأثر تاريخ
+                            // الشحن إطلاقاً بأي تعديل لا علاقة له بالشحن. فقط إن تغيَّر المبلغ فعلياً، أو لم
+                            // يوجد قيد شحن قديم أصلاً، يُستخدَم التاريخ الذي اخترته صراحةً ($shipping_paid_date).
+                            $shipping_value_changed = (abs($shipping_cost_syp - $old_shipping_cost) > 0.001);
+                            $ship_entry_date3 = (!$shipping_value_changed && $old_ship_entry_date) ? $old_ship_entry_date : $shipping_paid_date;
                             $insertShip3 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols3, $ship_entry_num3, $ship_entry_date3, $ship_desc3) {
                                 $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
                                 $vals = [$account_id, $ship_entry_date3, $ship_desc3, $debit_amt, $credit_amt];
@@ -529,11 +577,26 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 if ($payment_status === 'Paid') {
                     $collect_cash_id3 = findAccountId($conn, ['صندوق', 'نقد', 'cash'], 'الصندوق الرئيسي', 'Asset');
                     $collect_recv_id3 = findAccountId($conn, ['عملاء', 'receivable'], 'ذمم العملاء', 'Asset');
-                    if ($collect_cash_id3 && $collect_recv_id3 && $total_syp > 0) {
+                    // تصحيح جوهري (خلل حقيقي مكتشَف بالبيانات الفعلية): كان يُحصَّل السعر الإجمالي الكامل
+                    // للفاتورة (total_syp) بلا خصم أي "خصم" (sale_item_discounts) مُسجَّل عليها — بينما
+                    // الاعتراف بالإيراد (tryRecognizeRevenue) يطرحه بالفعل، فيصبح المُحصَّل من الصندوق
+                    // أكبر مما دفعه العميل فعلياً بمقدار الخصم بالضبط، وتبقى "الإيرادات المؤجلة" عالقة.
+                    $stmt_prior_disc3 = $conn->prepare("SELECT COALESCE(SUM(amount_syp), 0) FROM sale_item_discounts WHERE sale_id = ?");
+                    $stmt_prior_disc3->execute([$sale_id]);
+                    $prior_discount3 = floatval($stmt_prior_disc3->fetchColumn());
+                    $net_invoice_total3 = $total_syp - $prior_discount3;
+                    // يُحصَّل فقط ما لم يُدفَع بعد: ما سُجِّل سابقاً كدفعات جزئية (ملف العميل) دخل الصندوق
+                    // فعلاً بقيوده الخاصة، فلا يُحتسَب مرة ثانية هنا.
+                    $already_paid_partial3 = floatval($old_sale['paid_amount_syp'] ?? 0);
+                    $collect_amount3 = $net_invoice_total3 - $already_paid_partial3;
+                    if ($collect_cash_id3 && $collect_recv_id3 && $collect_amount3 > 0.001) {
                         $collect_entry_num3 = "JE-" . $new_invoice_number . "-COLLECT-" . time();
-                        $collect_desc3 = "تحصيل نقدي لفاتورة رقم: " . $new_invoice_number . " (بعد تعديل كامل — بتاريخ التحصيل الفعلي)";
-                        postJournalLine($conn, $collect_cash_id3, $total_syp, 0, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
-                        postJournalLine($conn, $collect_recv_id3, 0, $total_syp, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
+                        $collect_desc3 = "تحصيل نقدي لفاتورة رقم: " . $new_invoice_number . " (بعد تعديل كامل — بتاريخ التحصيل الفعلي)" . ($prior_discount3 > 0 ? " — صافي بعد خصم: " . number_format($prior_discount3, 2) : "") . ($already_paid_partial3 > 0 ? " — بعد خصم دفعات جزئية سابقة: " . number_format($already_paid_partial3, 2) : "");
+                        postJournalLine($conn, $collect_cash_id3, $collect_amount3, 0, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
+                        postJournalLine($conn, $collect_recv_id3, 0, $collect_amount3, $collect_entry_num3, date('Y-m-d'), $collect_desc3, 'Payment Collection');
+                    }
+                    if (array_key_exists('paid_amount_syp', $old_sale)) {
+                        $conn->prepare("UPDATE sales SET paid_amount_syp = ? WHERE id = ?")->execute([$net_invoice_total3, $sale_id]);
                     }
                 }
 
@@ -559,7 +622,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                             // القيد يُرحَّل بتاريخ الفاتورة ($inv_date)، فيظهر كأن الشحن دفعه الصندوق يوم
                             // الفاتورة نفسها حتى لو أُضيف/عُدِّل فعلياً بعد أسبوع — يُشوِّه "الإقفال اليومي"
                             // لليومين معاً (ناقص ليوم الفاتورة القديم، زائد ليوم التعديل الحقيقي).
-                            $ship_entry_date = date('Y-m-d');
+                            // تصحيح إضافي: يُستخدَم الآن التاريخ الذي اختاره المستخدم صراحةً ($shipping_paid_date)
+                            // بدل فرض "اليوم" دائماً — فقد يكون الدفع الفعلي حدث بتاريخ آخر (أمس مثلاً).
+                            $ship_entry_date = $shipping_paid_date;
                             $insertShippingLine2 = function ($account_id, $debit_amt, $credit_amt) use ($conn, $existing_cols2, $ship_entry_num, $ship_entry_date, $ship_desc) {
                                 $cols_to_insert = ['account_id', 'entry_date', 'description', 'debit', 'credit'];
                                 $vals = [$account_id, $ship_entry_date, $ship_desc, $debit_amt, $credit_amt];
@@ -600,13 +665,20 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                     ");
                     $stmt_prior_ret_collect->execute([$sale_id, $sale_id]);
                     $prior_ret_collect = floatval($stmt_prior_ret_collect->fetchColumn());
-                    $collect_amount = floatval($old_sale['total_amount_syp']) - $prior_ret_collect;
+                    // تصحيح: ما سُجِّل سابقاً كدفعات جزئية (من ملف العميل) دخل الصندوق فعلاً بقيوده الخاصة —
+                    // فيُحصَّل الآن فقط الباقي، وإلا احتُسب ذلك المبلغ مرتين في الصندوق وأصبحت ذمة الفاتورة سالبة.
+                    $already_paid_partial = floatval($old_sale['paid_amount_syp'] ?? 0);
+                    $net_invoice_total = floatval($old_sale['total_amount_syp']) - $prior_ret_collect;
+                    $collect_amount = $net_invoice_total - $already_paid_partial;
 
-                    if ($collect_cash_id && $collect_recv_id && $collect_amount > 0) {
+                    if ($collect_cash_id && $collect_recv_id && $collect_amount > 0.001) {
                         $collect_entry_num = "JE-" . $old_invoice_number . "-COLLECT-" . time();
-                        $collect_desc = "تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تغيير حالة الدفع إلى نقداً)" . ($prior_ret_collect > 0 ? " — صافي بعد خصم مرتجع/خصم سابق: " . number_format($prior_ret_collect, 2) : "");
+                        $collect_desc = "تحصيل نقدي لفاتورة رقم: " . $old_invoice_number . " (تغيير حالة الدفع إلى نقداً)" . ($prior_ret_collect > 0 ? " — صافي بعد خصم مرتجع/خصم سابق: " . number_format($prior_ret_collect, 2) : "") . ($already_paid_partial > 0 ? " — بعد خصم دفعات جزئية سابقة: " . number_format($already_paid_partial, 2) : "");
                         postJournalLine($conn, $collect_cash_id, $collect_amount, 0, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
                         postJournalLine($conn, $collect_recv_id, 0, $collect_amount, $collect_entry_num, date('Y-m-d'), $collect_desc, 'Payment Collection');
+                    }
+                    if (array_key_exists('paid_amount_syp', $old_sale)) {
+                        $conn->prepare("UPDATE sales SET paid_amount_syp = ? WHERE id = ?")->execute([max(0, $net_invoice_total), $sale_id]);
                     }
                     // التحصيل يُكمِل الشرط الثاني (بعد التسليم) — نحاول الاعتراف بالإيراد الآن؛ لن يحدث
                     // شيء إن كانت الفاتورة لا تزال "قيد الانتظار" (الشرط الأول غير مكتمل بعد).
@@ -627,7 +699,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_sale'])) {
                 $audit_msg = "تعديل فاتورة رقم #{$sale_id} — العميل: {$customer_name}، حالة الدفع: {$payment_status}، حالة التسليم: {$delivery_status}";
             }
 
-            $conn->commit();
+            if ($conn->inTransaction()) { $conn->commit(); }
             logAudit($conn, 'UPDATE', 'فواتير المبيعات', $audit_msg, $sale_id);
         } catch (Exception $e) {
             if ($conn->inTransaction()) { $conn->rollBack(); }
@@ -763,7 +835,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_item_discount'])) 
                 $insertDiscJournalLine($other_account_id, 0, $total_discount_amount);
             }
 
-            $conn->commit();
+            if ($conn->inTransaction()) { $conn->commit(); }
             $msg = "تم تسجيل الخصم (" . number_format($total_discount_amount, 2) . " ل.س) وترحيل القيد المحاسبي بنجاح، بلا تعديل الفاتورة الأصلية.";
             logAudit($conn, 'INSERT', 'خصومات أصناف المبيعات', "خصم بقيمة " . number_format($total_discount_amount, 2) . " ل.س على فاتورة رقم: " . $sale['invoice_number'], $disc_sale_id);
         } catch (Exception $e) {
@@ -867,6 +939,10 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
 
                 // إعادة الكمية للمخزون
                 $conn->prepare("UPDATE products SET current_quantity = current_quantity + ? WHERE id = ?")->execute([$line['qty'], $line['product_id']]);
+
+                // نظام دفعات المخزون (FIFO): تُعاد الكمية المرتجعة لدفعتها/دفعاتها الأصلية تحديداً (لا لمجرد
+                // current_quantity الممزوج) — فيبقى رصيد كل دفعة (ومورّدها) دقيقاً بعد أي مرتجع لاحقاً أيضاً.
+                restoreInventoryBatchForReturn($conn, $line['sale_item_id'], $line['qty']);
             }
 
             // عكس عمولة المندوب المتعلقة بالمرتجع (إن وُجدت)
@@ -948,7 +1024,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_return'])) {
                 }
             }
 
-            $conn->commit();
+            if ($conn->inTransaction()) { $conn->commit(); }
             logAudit($conn, 'INSERT', 'مرتجعات المبيعات', "مرتجع على فاتورة رقم " . $sale['invoice_number'] . " بقيمة " . number_format($total_return_amount, 2) . " ل.س" . ($commission_reversed > 0 ? " (عمولة معكوسة: " . number_format($commission_reversed, 2) . ")" : ""), $return_id);
             $msg = "تم تسجيل المرتجع، إعادة الكمية للمخزون، وترحيل القيد المحاسبي بنجاح!";
         } catch (Exception $e) {
@@ -1162,6 +1238,32 @@ $list_where[] = ($list_returned === 'only') ? $fully_returned_sql : ("NOT " . $f
 
 $list_where_sql = 'WHERE ' . implode(' AND ', $list_where);
 
+// ملخّص المنتج المبحوث عنه (إن كان البحث اسم منتج فعلياً، لا اسم عميل أو رقم فاتورة): عدد الفواتير التي
+// تحتوي المنتج، صافي الكمية المباعة منه (بعد طرح المرتجع)، وإجمالي ثمنها — ضمن نفس فلاتر الفترة/الحالة/
+// نوع التسليم المُطبَّقة حالياً على الجدول، لا كل تاريخ النظام.
+$product_summary = null;
+if ($list_search !== '') {
+    $stmt_prod_match = $conn->prepare("SELECT DISTINCT id, product_name FROM products WHERE product_name LIKE ? ORDER BY product_name LIMIT 5");
+    $stmt_prod_match->execute(["%{$list_search}%"]);
+    $matched_products = $stmt_prod_match->fetchAll(PDO::FETCH_ASSOC);
+
+    if (count($matched_products) > 0) {
+        $stmt_prod_summary = $conn->prepare("
+            SELECT
+                COUNT(DISTINCT s.id) AS invoices_count,
+                COALESCE(SUM(si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)), 0) AS net_qty,
+                COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.unit_price_syp), 0) AS net_value_syp
+            FROM sale_items si
+            INNER JOIN sales s ON si.sale_id = s.id
+            INNER JOIN products p ON si.product_id = p.id
+            {$list_where_sql} AND p.product_name LIKE ?
+        ");
+        $stmt_prod_summary->execute(array_merge($list_params, ["%{$list_search}%"]));
+        $product_summary = $stmt_prod_summary->fetch(PDO::FETCH_ASSOC);
+        $product_summary['matched_names'] = array_column($matched_products, 'product_name');
+    }
+}
+
 $stmt_count = $conn->prepare("SELECT COUNT(*) FROM sales s {$list_where_sql}");
 $stmt_count->execute($list_params);
 $list_total_count = intval($stmt_count->fetchColumn());
@@ -1181,11 +1283,31 @@ $stmt_sales_list->execute($list_params);
 $sales_list = $stmt_sales_list->fetchAll(PDO::FETCH_ASSOC);
 
 // جلب أصناف كل الفواتير مع الكمية المتبقية القابلة للإرجاع (لبناء نافذة المرتجع بالجافاسكريبت)
+// + معلومة فاتورة/فواتير الشراء الأصلية ومورّدها لكل صنف (عبر نظام دفعات المخزون) — بناءً على طلب صريح
+// من المستخدم لمعرفة مصدر الصنف قبل قبول مرتجعه (تفادي إرجاع صنف من مورد لا يقبل الإرجاع مثلاً).
 $items_by_sale = [];
 $stmt_all_items = $conn->query("
     SELECT si.id, si.sale_id, si.product_id, si.quantity, si.unit_price_syp, si.total_price_syp, si.commission_per_unit, p.product_name,
            COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0) AS already_returned,
-           COALESCE((SELECT SUM(sid.amount_syp) FROM sale_item_discounts sid WHERE sid.sale_item_id = si.id), 0) AS already_discounted
+           COALESCE((SELECT SUM(sid.amount_syp) FROM sale_item_discounts sid WHERE sid.sale_item_id = si.id), 0) AS already_discounted,
+           (SELECT GROUP_CONCAT(
+                DISTINCT CONCAT(
+                    CASE WHEN ib.source_type = 'Purchase' THEN COALESCE(ib.source_ref, 'بلا رقم فاتورة')
+                         WHEN ib.source_type = 'OfficeInventory' THEN 'جرد مكتبي'
+                         ELSE 'مصدر غير مؤكَّد (بيانات تراثية)' END,
+                    ' — ',
+                    COALESCE(sup.supplier_name, 'بلا مورد')
+                ) SEPARATOR ' | '
+            ) FROM sale_item_batch_consumption sibc
+              JOIN inventory_batches ib ON sibc.batch_id = ib.id
+              LEFT JOIN suppliers sup ON ib.supplier_id = sup.id
+              WHERE sibc.sale_item_id = si.id
+           ) AS purchase_source_info,
+           (SELECT GROUP_CONCAT(DISTINCT ib.source_ref SEPARATOR '||')
+            FROM sale_item_batch_consumption sibc
+            JOIN inventory_batches ib ON sibc.batch_id = ib.id
+            WHERE sibc.sale_item_id = si.id AND ib.source_type = 'Purchase' AND ib.source_ref IS NOT NULL
+           ) AS purchase_invoice_numbers
     FROM sale_items si
     LEFT JOIN products p ON si.product_id = p.id
 ");
@@ -1330,6 +1452,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
     </div>
     <p style="color: #999; font-size: 12px; margin: 12px 0 0 0;">
         اضغط أي بطاقة لتصفية جدول الفواتير أدناه بنفس الحالة والفترة تلقائياً. بطاقة "قطع مرتجعة" أصبحت فلتراً مستقلاً بذاته: الفواتير المرتجعة بالكامل <strong>مُستبعَدة دائماً</strong> من كل عرض عادي (ولا تتأثر بأي فلتر حالة/نوع تسليم)، واضغط عليها لعرضها حصراً. الإجمالي الكلي (قطعاً ومبلغاً) = تم التسليم + قيد الانتظار + مؤجلة، ولا يشمل المرتجعة.
+        <a href="returns_report.php" style="color: #4e73df; font-weight: bold; margin-right: 6px;"><i class="fas fa-undo-alt"></i> عرض كل المرتجعات (كاملة وجزئية) مع المندوب المسؤول عن كل فاتورة ←</a>
     </p>
 </div>
 
@@ -1364,6 +1487,22 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
         </form>
         <span style="font-size: 12.5px; color: #888;">إجمالي النتائج: <strong style="color: #4e73df;"><?php echo $list_total_count; ?></strong> فاتورة</span>
     </div>
+
+    <?php if ($product_summary): ?>
+    <div style="background: #eef8f2; border: 1px solid #1cc88a; border-radius: 6px; padding: 12px 16px; margin-bottom: 15px; display: flex; align-items: center; gap: 25px; flex-wrap: wrap;">
+        <div style="font-weight: bold; color: #1a8f5f; font-size: 13.5px;">
+            <i class="fas fa-box"></i> ملخّص "<?php echo htmlspecialchars($list_search); ?>"
+            <?php if (count($product_summary['matched_names']) > 1 || $product_summary['matched_names'][0] !== $list_search): ?>
+                <span style="font-weight: normal; font-size: 11.5px; color: #666;">(يشمل: <?php echo htmlspecialchars(implode('، ', $product_summary['matched_names'])); ?><?php echo count($product_summary['matched_names']) >= 5 ? '...' : ''; ?>)</span>
+            <?php endif; ?>
+        </div>
+        <div style="font-size: 13px;">عدد الفواتير: <strong style="color: #2e384d;"><?php echo intval($product_summary['invoices_count']); ?></strong></div>
+        <div style="font-size: 13px;">إجمالي القطع المباعة (صافٍ بعد المرتجع): <strong style="color: #2e384d;"><?php echo rtrim(rtrim(number_format($product_summary['net_qty'], 2), '0'), '.'); ?></strong></div>
+        <div style="font-size: 13px;">إجمالي الثمن (صافٍ بعد المرتجع): <strong style="color: #1a8f5f;"><?php echo number_format($product_summary['net_value_syp'], 2); ?> ل.س</strong></div>
+        <div style="font-size: 11px; color: #999; width: 100%;">ضمن الفترة والفلاتر الحالية (<?php echo htmlspecialchars($qf_from); ?> إلى <?php echo htmlspecialchars($qf_to); ?>) — لا كل تاريخ النظام.</div>
+    </div>
+    <?php endif; ?>
+
     <div style="overflow-x: auto;">
         <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
             <thead>
@@ -1438,7 +1577,10 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                     ?>
                         <tr style="border-bottom: 1px solid #f1f1f1;">
                             <td style="padding: 9px 12px; font-weight: bold; color: #4e73df; font-family: monospace; white-space: nowrap;"><?php echo htmlspecialchars($sale['invoice_number']); ?></td>
-                            <td style="padding: 9px 12px; font-weight: 600; color: #333; white-space: nowrap;"><?php echo htmlspecialchars($sale['customer_name']); ?></td>
+                            <td style="padding: 9px 12px; font-weight: 600; color: #333; white-space: nowrap;">
+                                <?php echo htmlspecialchars($sale['customer_name']); ?>
+                                <a href="customer_view.php?name=<?php echo urlencode($sale['customer_name']); ?>" title="فتح ملف هذا العميل (كل فواتيره)" style="color: #4e73df; text-decoration: none; font-size: 11px; margin-right: 4px;"><i class="fas fa-external-link-alt"></i></a>
+                            </td>
                             <td style="padding: 9px 12px; color: #555; font-size: 12.5px; max-width: 220px; line-height: 1.5;">
                                 <?php if (count($items_for_sale) > 0): ?>
                                     <?php
@@ -1562,7 +1704,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
             <button onclick="closeSaleModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
         </div>
 
-        <form method="POST" action="">
+        <form method="POST" action="" onsubmit="var b=this.querySelector('button[type=submit]'); if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; return true;">
 <?php csrfField(); ?>
             <input type="hidden" name="add_sale" value="1">
 
@@ -1767,6 +1909,11 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
                     <input type="number" step="0.01" min="0" name="shipping_cost_syp" id="edit_shipping_cost_syp" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
                 </div>
                 <div>
+                    <label style="display: block; margin-bottom: 4px; font-weight: 500;">تاريخ دفع الشحن الفعلي:</label>
+                    <input type="date" name="shipping_paid_date" id="edit_shipping_paid_date" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace;">
+                    <div style="font-size: 10.5px; color: #999; margin-top: 3px;">اليوم الذي خرج فيه المبلغ فعلياً من الصندوق (قد يختلف عن تاريخ الفاتورة أو تاريخ هذا التعديل)</div>
+                </div>
+                <div>
                     <label style="display: block; margin-bottom: 4px; font-weight: 500;">نوع التسليم:</label>
                     <select name="delivery_type" id="edit_delivery_type" style="width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 4px;">
                         <option value="">-- غير محدد --</option>
@@ -1827,6 +1974,8 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
         document.getElementById('edit_delivery_status').value = saleData.delivery_status;
         document.getElementById('edit_invoice_date').value = saleData.invoice_date;
         document.getElementById('edit_shipping_cost_syp').value = saleData.shipping_cost_syp || 0;
+        // افتراضي: تاريخ اليوم (قابل للتغيير يدوياً إن كان الدفع الفعلي بتاريخ آخر)
+        document.getElementById('edit_shipping_paid_date').value = new Date().toISOString().split('T')[0];
         document.getElementById('edit_delivery_type').value = saleData.delivery_type || '';
 
         var notice = document.getElementById('editReturnsNotice');
@@ -2013,8 +2162,21 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
         items.forEach(function(it) {
             if (parseFloat(it.remaining) <= 0) return;
             var tr = document.createElement('tr');
+            var sourceInfo = it.purchase_source_info || 'بلا سجل دفعة (بيانات قديمة جداً)';
+            var isUncertain = sourceInfo.indexOf('غير مؤكَّد') !== -1 || !it.purchase_source_info;
+            var sourceHtml = '<span style="font-size:11.5px; color:' + (isUncertain ? '#e74a3b; font-weight:bold;' : '#4e73df;') + '">' + sourceInfo + '</span>';
+            // روابط فعلية لفتح فاتورة/فواتير الشراء الأصلية مباشرة في صفحة المشتريات (قد يكون أكثر من
+            // فاتورة واحدة إن استُهلِك الصنف من أكثر من دفعة) — بناءً على طلب صريح من المستخدم.
+            if (it.purchase_invoice_numbers) {
+                var invNums = it.purchase_invoice_numbers.split('||');
+                var links = invNums.map(function(num) {
+                    return '<a href="Purchases.php?pf_search=' + encodeURIComponent(num) + '" target="_blank" style="color:#1a8f5f; font-weight:bold; text-decoration:underline;">' + num + ' <i class="fas fa-external-link-alt" style="font-size:9px;"></i></a>';
+                });
+                sourceHtml += '<br><span style="font-size:11px;">' + links.join('، ') + '</span>';
+            }
             tr.innerHTML =
                 '<td style="padding:8px;">' + (it.product_name || '') + '</td>' +
+                '<td style="padding:8px; max-width:180px;">' + sourceHtml + '</td>' +
                 '<td style="padding:8px; font-family:monospace;">' + it.quantity + '</td>' +
                 '<td style="padding:8px; font-family:monospace; color:#e74a3b;">' + it.remaining + '</td>' +
                 '<td style="padding:8px;"><input type="hidden" name="ret_sale_item_id[]" value="' + it.id + '">' +
@@ -2022,7 +2184,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
             tbody.appendChild(tr);
         });
         if (tbody.children.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="padding:15px; text-align:center; color:#777;">لا توجد كمية متاحة للإرجاع في هذه الفاتورة.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" style="padding:15px; text-align:center; color:#777;">لا توجد كمية متاحة للإرجاع في هذه الفاتورة.</td></tr>';
         }
         document.getElementById('returnModal').style.display = 'flex';
     }
@@ -2076,7 +2238,7 @@ $reps_list = $conn->query("SELECT * FROM representatives ORDER BY name ASC")->fe
             <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: right; margin-bottom: 15px;">
                 <thead>
                     <tr style="background: #f8f9fc; border-bottom: 1px solid #ddd;">
-                        <th style="padding: 8px;">الصنف</th><th style="padding: 8px;">الكمية الأصلية</th><th style="padding: 8px;">المتاح للإرجاع</th><th style="padding: 8px;">كمية المرتجع</th>
+                        <th style="padding: 8px;">الصنف</th><th style="padding: 8px;">مصدر الشراء (المورد)</th><th style="padding: 8px;">الكمية الأصلية</th><th style="padding: 8px;">المتاح للإرجاع</th><th style="padding: 8px;">كمية المرتجع</th>
                     </tr>
                 </thead>
                 <tbody id="returnItemsBody"></tbody>

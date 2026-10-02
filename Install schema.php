@@ -176,6 +176,44 @@ $schema = [
     INDEX idx_category_id (category_id)
 )",
 
+// ============================================================
+// نظام تتبّع دفعات المخزون (Inventory Batches / FIFO) — بناءً على طلب صريح من المستخدم: "نفس المنتج
+// أحياناً يُشترى من أكثر من مورد بأسعار مختلفة"، وهو ما يجعل حقل products.cost_price_usd (تكلفة واحدة
+// ممزوجة لكل منتج) غير كافٍ لنسب تكلفة كل وحدة مباعة لمصدرها ومورّدها الحقيقيين. كل دفعة شراء (أو جرد
+// مكتبي) تُسجَّل هنا كسطر مستقل بتكلفته ومورّده وكميته المتبقية، وكل عملية بيع تستهلك من أقدم دفعة متاحة
+// أولاً (FIFO)، فتُنسَب تكلفة كل وحدة مباعة بدقة لمصدرها الفعلي — لا لتخمين ممزوج.
+'inventory_batches' => "CREATE TABLE IF NOT EXISTS inventory_batches (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    product_id INT NOT NULL,
+    source_type VARCHAR(30) NOT NULL,
+    source_ref VARCHAR(150),
+    source_item_id INT NULL,
+    supplier_id INT NULL,
+    unit_cost_usd DECIMAL(15,4) NOT NULL,
+    quantity_received DECIMAL(15,4) NOT NULL,
+    quantity_remaining DECIMAL(15,4) NOT NULL,
+    batch_date DATE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_product_id (product_id),
+    INDEX idx_supplier_id (supplier_id),
+    INDEX idx_batch_date (batch_date),
+    INDEX idx_source_item (source_item_id)
+)",
+
+// يربط كل سطر بيع (sale_item) بالدفعة/الدفعات الفعلية (قد تكون أكثر من واحدة إن نفدت الأقدم أثناء تلبية
+// كمية واحدة) التي استُهلِكت منها تكلفته — هذا ما يجعل "COGS حسب المورد" دقيقاً ومضموناً عدم تجاوزه
+// لمشتريات ذلك المورد رياضياً، بعكس الاعتماد على تكلفة ممزوجة واحدة للمنتج بأكمله.
+'sale_item_batch_consumption' => "CREATE TABLE IF NOT EXISTS sale_item_batch_consumption (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sale_item_id INT NOT NULL,
+    batch_id INT NOT NULL,
+    quantity_consumed DECIMAL(15,4) NOT NULL,
+    unit_cost_usd DECIMAL(15,4) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_sale_item_id (sale_item_id),
+    INDEX idx_batch_id (batch_id)
+)",
+
 'purchase_invoices' => "CREATE TABLE IF NOT EXISTS purchase_invoices (
     id INT AUTO_INCREMENT PRIMARY KEY,
     invoice_number VARCHAR(50) NOT NULL,

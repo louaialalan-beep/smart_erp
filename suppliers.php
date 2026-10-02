@@ -69,7 +69,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_supplier'])) {
                 $today = date('Y-m-d');
                 $rd_rate = getExchangeRateForDate($conn, 'USD', $today);
                 $payable_acc = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
-                $discount_acc = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Expense');
+                $discount_acc = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Asset');
                 if ($payable_acc && $discount_acc) {
                     $rd_entry_num = "JE-RDADJ-" . $new_sup_id . "-" . time();
                     $rd_desc = "مردودات/خصومات أولية عند إضافة المورد: $supplier_name";
@@ -114,7 +114,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_supplier'])) {
             $rd_rate = getExchangeRateForDate($conn, 'USD', $today);
             $rd_amount_syp = abs($returns_delta) * $rd_rate;
             $payable_acc = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
-            $discount_acc = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Expense');
+            $discount_acc = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Asset');
             if ($payable_acc && $discount_acc) {
                 $rd_entry_num = "JE-RDADJ-" . $id . "-" . time();
                 $rd_desc = "تعديل يدوي لمردودات/خصومات المورد: $supplier_name — من \$" . number_format($old_returns, 2) . " إلى \$" . number_format($returns_discounts, 2);
@@ -197,8 +197,14 @@ $sf_net_movement = $sf_total_purchases - $sf_total_payments - $sf_total_returns;
 
 // تكلفة البضائع المباعة (COGS) — مُسلَّمة فعلياً، لكل الموردين مجتمعين ضمن نفس الفترة (مصروف حقيقي
 // مُرحَّل بالفعل في اليومية، محسوب بتاريخ التسليم الفعلي delivered_at وليس تاريخ إصدار الفاتورة)
+// تصحيح جوهري: كان الاستعلام يحسب si.quantity الأصلية كاملة بلا طرح أي كمية أُرجِعت لاحقاً من نفس
+// السطر (sales_return_items) — فيظهر COGS هنا أعلى من الرقم الصحيح في لوحة التحكم وfinancial_reports.php
+// كلما وُجد أي مرتجع مبيعات ضمن الفترة. الآن مطابق تماماً لنفس المنهجية المُثبَتة في كل الصفحات الأخرى.
 $stmt_sf_cogs = $conn->prepare("
-    SELECT COALESCE(SUM(si.quantity * si.cost_price_usd_at_sale), 0)
+    SELECT COALESCE(SUM(
+        (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0))
+        * si.cost_price_usd_at_sale
+    ), 0)
     FROM sale_items si
     INNER JOIN sales s ON si.sale_id = s.id
     WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?

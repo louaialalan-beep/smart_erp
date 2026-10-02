@@ -1,0 +1,148 @@
+<?php
+/**
+ * تقرير المرتجعات — يعرض كل عملية إرجاع (كاملة أو جزئية) مسجَّلة في النظام، مع المندوب المرتبط بفاتورتها
+ * الأصلية، للمساعدة على مراجعة أي نمط متكرر (مندوب معيّن ترتفع لديه نسبة المرتجعات مثلاً).
+ */
+require_once 'header.php';
+
+$filter_rep_id = intval($_GET['rep_id'] ?? 0);
+$filter_from = $_GET['from'] ?? '';
+$filter_to = $_GET['to'] ?? '';
+
+$where = [];
+$params = [];
+if ($filter_rep_id > 0) { $where[] = "s.representative_id = ?"; $params[] = $filter_rep_id; }
+if (!empty($filter_from)) { $where[] = "DATE(sr.created_at) >= ?"; $params[] = $filter_from; }
+if (!empty($filter_to)) { $where[] = "DATE(sr.created_at) <= ?"; $params[] = $filter_to; }
+$where_sql = count($where) > 0 ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+$stmt = $conn->prepare("
+    SELECT sr.id AS return_id, s.invoice_number, s.customer_name,
+           r.id AS representative_id, r.name AS representative_name,
+           sr.total_amount_syp AS return_value_syp, COALESCE(sr.total_commission_reversed, 0) AS commission_reversed,
+           s.invoice_date, sr.created_at AS return_date, s.total_amount_syp AS invoice_total_syp
+    FROM sales_returns sr
+    JOIN sales s ON sr.sale_id = s.id
+    LEFT JOIN representatives r ON s.representative_id = r.id
+    $where_sql
+    ORDER BY sr.created_at DESC
+");
+$stmt->execute($params);
+$returns = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+// ملخّص مُجمَّع حسب المندوب — يكشف أي نمط متكرر بسرعة
+$stmt_by_rep = $conn->prepare("
+    SELECT COALESCE(r.name, 'بلا مندوب') AS representative_name,
+           COUNT(*) AS returns_count,
+           COALESCE(SUM(sr.total_amount_syp), 0) AS total_returned_syp,
+           COALESCE(SUM(sr.total_commission_reversed), 0) AS total_commission_reversed
+    FROM sales_returns sr
+    JOIN sales s ON sr.sale_id = s.id
+    LEFT JOIN representatives r ON s.representative_id = r.id
+    $where_sql
+    GROUP BY representative_name
+    ORDER BY returns_count DESC
+");
+$stmt_by_rep->execute($params);
+$by_rep = $stmt_by_rep->fetchAll(PDO::FETCH_ASSOC);
+
+$reps_list = $conn->query("SELECT id, name FROM representatives ORDER BY name")->fetchAll(PDO::FETCH_ASSOC);
+?>
+
+<div style="max-width: 1200px; margin: 0 auto; padding: 20px;">
+    <h2 style="margin-bottom: 5px;"><i class="fas fa-undo-alt"></i> تقرير المرتجعات — حسب المندوب</h2>
+    <p style="color: #777; margin-top: 0;">كل عملية إرجاع (كاملة أو جزئية) في النظام، مرتبطة بمندوب فاتورتها الأصلية.</p>
+
+    <form method="GET" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 20px; background: white; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0;">
+        <label style="font-size: 13px; font-weight: bold;">المندوب:</label>
+        <select name="rep_id" style="padding: 8px; border: 1px solid #ccc; border-radius: 5px; font-size: 13px;">
+            <option value="0">-- الكل --</option>
+            <?php foreach ($reps_list as $rp): ?>
+                <option value="<?php echo $rp['id']; ?>" <?php echo $filter_rep_id == $rp['id'] ? 'selected' : ''; ?>><?php echo htmlspecialchars($rp['name']); ?></option>
+            <?php endforeach; ?>
+        </select>
+        <label style="font-size: 13px; font-weight: bold;">من:</label>
+        <input type="date" name="from" value="<?php echo htmlspecialchars($filter_from); ?>" style="padding: 8px; border: 1px solid #ccc; border-radius: 5px;">
+        <label style="font-size: 13px; font-weight: bold;">إلى:</label>
+        <input type="date" name="to" value="<?php echo htmlspecialchars($filter_to); ?>" style="padding: 8px; border: 1px solid #ccc; border-radius: 5px;">
+        <button type="submit" style="background: #4e73df; color: white; border: none; padding: 9px 20px; border-radius: 5px; font-weight: bold; cursor: pointer;">
+            <i class="fas fa-filter"></i> تطبيق
+        </button>
+        <?php if ($filter_rep_id > 0 || $filter_from || $filter_to): ?>
+            <a href="returns_report.php" style="color: #e74a3b; font-size: 12.5px; text-decoration: none;">إلغاء الفلاتر ×</a>
+        <?php endif; ?>
+    </form>
+
+    <?php if (count($by_rep) > 0): ?>
+    <div style="background: white; border-radius: 8px; border: 1px solid #e3e6f0; margin-bottom: 20px; overflow-x: auto;">
+        <div style="padding: 12px 15px; border-bottom: 1px solid #eee; font-weight: bold; color: #3a3b45; font-size: 14px;"><i class="fas fa-chart-bar"></i> ملخّص مُجمَّع حسب المندوب</div>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
+            <thead>
+                <tr style="background: #f8f9fc; border-bottom: 2px solid #e3e6f0; color: #555;">
+                    <th style="padding: 9px 15px;">المندوب</th>
+                    <th style="padding: 9px 15px;">عدد المرتجعات</th>
+                    <th style="padding: 9px 15px;">إجمالي قيمة المرتجعات</th>
+                    <th style="padding: 9px 15px;">إجمالي العمولات المُعكوسة</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($by_rep as $br): ?>
+                    <tr style="border-bottom: 1px solid #f1f1f1;">
+                        <td style="padding: 8px 15px; font-weight: 600;"><?php echo htmlspecialchars($br['representative_name']); ?></td>
+                        <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color: #e74a3b;"><?php echo intval($br['returns_count']); ?></td>
+                        <td style="padding: 8px 15px; font-family: monospace;"><?php echo number_format($br['total_returned_syp'], 2); ?> ل.س</td>
+                        <td style="padding: 8px 15px; font-family: monospace; color: #f6c23e;"><?php echo number_format($br['total_commission_reversed'], 2); ?> ل.س</td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php endif; ?>
+
+    <div style="background: white; border-radius: 8px; border: 1px solid #e3e6f0; overflow-x: auto;">
+        <div style="padding: 12px 15px; border-bottom: 1px solid #eee; font-weight: bold; color: #3a3b45; font-size: 14px;"><i class="fas fa-list"></i> التفصيل الكامل (<?php echo count($returns); ?> عملية إرجاع)</div>
+        <?php if (count($returns) > 0): ?>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
+            <thead>
+                <tr style="background: #f8f9fc; border-bottom: 2px solid #e3e6f0; color: #555;">
+                    <th style="padding: 9px 15px;">تاريخ الإرجاع</th>
+                    <th style="padding: 9px 15px;">رقم الفاتورة</th>
+                    <th style="padding: 9px 15px;">العميل</th>
+                    <th style="padding: 9px 15px;">المندوب</th>
+                    <th style="padding: 9px 15px;">قيمة المرتجع</th>
+                    <th style="padding: 9px 15px;">من إجمالي الفاتورة</th>
+                    <th style="padding: 9px 15px;">العمولة المُعكوسة</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ($returns as $r): ?>
+                    <tr style="border-bottom: 1px solid #f1f1f1;">
+                        <td style="padding: 8px 15px; font-family: monospace;"><?php echo htmlspecialchars(substr($r['return_date'], 0, 16)); ?></td>
+                        <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color: #4e73df;"><?php echo htmlspecialchars($r['invoice_number']); ?></td>
+                        <td style="padding: 8px 15px; font-weight: 600;"><?php echo htmlspecialchars($r['customer_name']); ?></td>
+                        <td style="padding: 8px 15px;">
+                            <?php if ($r['representative_name']): ?>
+                                <span style="background: #eef1f9; color: #4e73df; padding: 3px 10px; border-radius: 10px; font-size: 12px; font-weight: bold;"><?php echo htmlspecialchars($r['representative_name']); ?></span>
+                            <?php else: ?>
+                                <span style="color: #aaa; font-size: 12px;">بدون مندوب</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color: #e74a3b;"><?php echo number_format($r['return_value_syp'], 2); ?> ل.س</td>
+                        <td style="padding: 8px 15px; font-family: monospace; color: #888;">
+                            <?php echo number_format($r['invoice_total_syp'], 2); ?> ل.س
+                            <?php if (floatval($r['invoice_total_syp']) > 0): ?>
+                                <span style="font-size: 11px;">(<?php echo number_format(($r['return_value_syp'] / $r['invoice_total_syp']) * 100, 0); ?>٪)</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="padding: 8px 15px; font-family: monospace; color: #f6c23e;"><?php echo number_format($r['commission_reversed'], 2); ?> ل.س</td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+        <?php else: ?>
+            <p style="padding: 30px; text-align: center; color: #999;">لا توجد أي عملية إرجاع ضمن الفلتر المحدَّد.</p>
+        <?php endif; ?>
+    </div>
+</div>
+
+<?php require_once 'footer.php'; ?>

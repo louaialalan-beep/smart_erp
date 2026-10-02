@@ -1,6 +1,6 @@
 <?php
 $host = 'localhost';
-$db_name = 'my_new_erp_db';
+$db_name = 'vnrd_erp_db';
 $username = 'root';
 $password = '';
 

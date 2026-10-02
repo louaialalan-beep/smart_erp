@@ -173,7 +173,17 @@ $sec2_start = $_GET['sec2_start'] ?? date('Y-m-01');
 $sec2_end   = $_GET['sec2_end'] ?? date('Y-m-t');
 $sec2_revenue = 0; $sec2_expenses = 0; $sec2_payroll = 0; $sec2_commissions = 0;
 $sec2_shipping = 0; $sec2_supplier_payments = 0; $sec2_net = 0; $sec2_sp_breakdown = [];
+$sec2_cogs_syp = 0; $sec2_cogs_usd = 0; $sec2_cogs_vs_payments_diff = 0;
+$sec2_fx_loss = 0; $sec2_fx_gain = 0; $sec2_fx_unrealized = 0;
 $sec2_owner_withdrawals = 0; $sec2_net_after_withdrawals = 0; $sec2_owner_loan_outstanding = 0; $sec2_cash_available = 0;
+$sec2_cash_actual = 0;
+$sec2_cash_actual_breakdown = [];
+$sec2_absolute_net_profit = 0;
+$sec2_cash_out_operational = 0; $sec2_remaining_after_cashout = 0; $sec2_distributable_profit = 0;
+$sec2_cash_revenue_pure = 0; $sec2_cash_spent_total = 0; $sec2_pure_cash_profit = 0;
+$sec2_cashout_breakdown = [];
+$recon_owner_withdrawals_alltime = 0; $recon_inventory_usd = 0; $recon_inventory_syp = 0;
+$recon_pending_capital_usd = 0; $recon_pending_capital_syp = 0; $recon_expected_cash = 0; $recon_gap_vs_ledger = 0;
 $sec2_pending_capital_usd = 0; $sec2_pending_capital_syp = 0;
 
 try {
@@ -216,6 +226,76 @@ try {
     $stmt_s2_ship->execute([$sec2_start, $sec2_end]);
     $sec2_shipping = floatval($stmt_s2_ship->fetchColumn());
 
+    // تصحيح جوهري (بناءً على طلب صريح من المستخدم): "صافي الربح" هنا كان يُحسَب بطرح "دفعات الموردين"
+    // (حركة نقدية فعلية لسداد التزامات سابقة) بدل "تكلفة البضائع المباعة" الفعلية (COGS) — وهذا خطأ
+    // محاسبي جوهري، لأن دفعة مورد قد تخص بضاعة بيعت في فترة سابقة تماماً (أو لم تُبَع بعد إطلاقاً)، بينما
+    // COGS هو المقياس الصحيح الوحيد لتكلفة ما بيع فعلاً ضمن هذه الفترة بالذات. نفس المنهجية المُثبَتة
+    // المُطبَّقة أصلاً في dash_cogs (البطاقة الأولى) بالضبط: تُنسَب دائماً لتاريخ *التسليم الأصلي*
+    // (delivered_at)، وتُطرَح أي كمية أُرجِعت لاحقاً بغض النظر عن تاريخ الإرجاع نفسه.
+    $stmt_s2_cogs = $conn->prepare("
+        SELECT COALESCE(SUM(
+            (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0))
+            * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd) * s.exchange_rate
+        ), 0) AS cogs_syp,
+        COALESCE(SUM(
+            (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0))
+            * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd)
+        ), 0) AS cogs_usd
+        FROM sale_items si
+        INNER JOIN sales s ON si.sale_id = s.id
+        INNER JOIN products p ON si.product_id = p.id
+        WHERE s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+    ");
+    $stmt_s2_cogs->execute([$sec2_start, $sec2_end]);
+    $s2cogs = $stmt_s2_cogs->fetch(PDO::FETCH_ASSOC);
+    $sec2_cogs_syp = floatval($s2cogs['cogs_syp']);
+    $sec2_cogs_usd = floatval($s2cogs['cogs_usd']);
+
+    // إضافة جوهرية بناءً على طلب صريح من المستخدم ("راجع كل المصاريف وسجّلها"): "صافي الربح" هنا كان
+    // يتجاهل فروقات صرف العملة تماماً، رغم أنها بند حقيقي مُرحَّل فعلياً في اليومية — وكانت موجودة أصلاً
+    // في financial_reports.php ("صافي الربح الحقيقي") لكن غائبة هنا فقط، فيختلف رقم لوحة التحكم عن رقم
+    // التقرير الرسمي لنفس الفترة بالضبط بمقدار هذه الفروقات. نفس المنهجية والحسابات المُثبَتة في
+    // financial_reports.php حرفياً:
+    // (أ) فروقات محقَّقة فعلياً — تنشأ فقط لحظة سداد دفعة لمورد (خسارة إن صعد الدولار بين تاريخ نشوء
+    //     الدَين وتاريخ سداده، ربح إن انخفض) — "فرق المدفوعات للموردين" الذي طلب المستخدم احتسابه بالضبط.
+    $stmt_s2_fx_loss = $conn->prepare("
+        SELECT COALESCE(SUM(je.debit) - SUM(je.credit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE a.account_name = 'خسارة فروقات العملة' AND je.entry_date BETWEEN ? AND ?
+    ");
+    $stmt_s2_fx_loss->execute([$sec2_start, $sec2_end]);
+    $sec2_fx_loss = floatval($stmt_s2_fx_loss->fetchColumn());
+
+    $stmt_s2_fx_gain = $conn->prepare("
+        SELECT COALESCE(SUM(je.credit) - SUM(je.debit), 0)
+        FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+        WHERE a.account_name = 'أرباح فروقات العملة' AND je.entry_date BETWEEN ? AND ?
+    ");
+    $stmt_s2_fx_gain->execute([$sec2_start, $sec2_end]);
+    $sec2_fx_gain = floatval($stmt_s2_fx_gain->fetchColumn());
+
+    // (ب) فروقات غير محقَّقة (IAS 21) — إعادة تقييم كل الذمم المفتوحة للموردين (غير المسدَّدة بعد) بسعر
+    //     صرف نهاية هذه الفترة، مقارنةً بمتوسط السعر المرجَّح الذي نشأ عنده كل دَين. نفس استعلام
+    //     financial_reports.php بالضبط.
+    $sec2_fx_unrealized = 0;
+    try {
+        $s2_period_end_rate = getExchangeRateForDate($conn, 'USD', $sec2_end);
+        $stmt_s2_fx_open = $conn->prepare("
+            SELECT s.id, COALESCE(SUM(pi.total_amount_usd), 0) AS outstanding_usd,
+                COALESCE(SUM(pi.total_amount_usd * pi.exchange_rate), 0) AS weighted_syp
+            FROM suppliers s
+            INNER JOIN purchase_invoices pi ON pi.supplier_id = s.id AND pi.payment_status != 'Paid' AND pi.invoice_date <= ?
+            GROUP BY s.id
+            HAVING outstanding_usd > 0.009
+        ");
+        $stmt_s2_fx_open->execute([$sec2_end]);
+        foreach ($stmt_s2_fx_open->fetchAll(PDO::FETCH_ASSOC) as $fx_row) {
+            $out_usd = floatval($fx_row['outstanding_usd']);
+            $hist_rate = $out_usd > 0.009 ? (floatval($fx_row['weighted_syp']) / $out_usd) : $s2_period_end_rate;
+            $sec2_fx_unrealized += $out_usd * ($s2_period_end_rate - $hist_rate);
+        }
+    } catch (Exception $e) { }
+
     // تصحيح جوهري: كان هذا يُعيد حساب المبلغ بالليرة ديناميكياً (المبلغ بالدولار × سعر الصرف "الحالي"
     // المسجَّل الآن لهذا التاريخ في أرشيف العملات) — وهذا مُعرَّض للانحراف عن الحقيقة كلما عُدِّل سعر
     // تاريخي لاحقاً (كما حدث فعلاً)، حتى لو كان القيد المحاسبي الأصلي المُرحَّل صحيحاً ولم يتغيّر إطلاقاً.
@@ -253,7 +333,21 @@ try {
     }
 
     // تصحيح نهائي بعد توضيح صريح: أجور الشحن مصروف حقيقي، تُخصَم الآن من صافي هذا القسم كأي بند آخر.
-    $sec2_net = $sec2_revenue - ($sec2_expenses + $sec2_payroll + $sec2_commissions + $sec2_shipping + $sec2_supplier_payments);
+    // تصحيح جوهري: "دفعات الموردين" أُزيلت من معادلة صافي الربح (ليست مصروفاً محاسبياً، بل حركة نقدية
+    // سداد التزام) واستُبدِلت بـ COGS الفعلية — وهي البند الصحيح محاسبياً. "دفعات الموردين" ما زالت
+    // تُعرَض بجانب صافي الربح في بطاقة مستقلة (للتدفق النقدي)، وأيضاً في بطاقة "الفرق بين COGS ودفعات
+    // الموردين" أدناه لمقارنة الاثنين ببعضهما مباشرة.
+    // إضافة جوهرية: فروقات صرف العملة (محقَّقة من سداد دفعات الموردين + غير محقَّقة على الذمم المفتوحة)
+    // أصبحت تُحتسَب الآن ضمن صافي الربح — نفس معادلة financial_reports.php ("صافي الربح الحقيقي") حرفياً،
+    // فيتطابق رقم لوحة التحكم مع رقم التقرير الرسمي لنفس الفترة بالضبط.
+    $sec2_net = $sec2_revenue - ($sec2_cogs_syp + $sec2_expenses + $sec2_payroll + $sec2_commissions + $sec2_shipping
+        + $sec2_fx_loss + max(0, $sec2_fx_unrealized)) + $sec2_fx_gain + max(0, -$sec2_fx_unrealized);
+
+    // بطاقة جديدة بناءً على طلب صريح من المستخدم: الفرق بين تكلفة البضائع المباعة فعلياً (COGS) ودفعات
+    // الموردين النقدية الفعلية ضمن نفس الفترة. قيمة موجبة = بِعنا بضاعة (COGS) أكبر مما دفعنا فعلياً
+    // للموردين ضمن الفترة (الدَّين المتراكم على الموردين يتجه للارتفاع). قيمة سالبة = دفعنا للموردين أكثر
+    // من تكلفة ما بيع فعلاً ضمن الفترة (سداد ديون سابقة و/أو شراء مخزون لم يُبَع بعد).
+    $sec2_cogs_vs_payments_diff = $sec2_cogs_syp - $sec2_supplier_payments;
 
     // سحوبات المالك ضمن نفس الفترة — بند توزيع أرباح (Equity)، وليس مصروف تشغيل، فلا يُخصَم من
     // "صافي الأرباح" نفسه؛ يُعرض بجانبه في بطاقة مستقلة "صافي الربح بعد سحوبات الملّاك" فقط لمن يريد
@@ -289,6 +383,217 @@ try {
         $loan_repaid = floatval($stmt_loan_repaid->fetchColumn());
         $sec2_owner_loan_outstanding = $loan_gross - $loan_repaid;
     } catch (Exception $e) { /* الجدول قد لا يكون أُنشئ بعد */ }
+
+    // بطاقة جديدة بناءً على طلب صريح من المستخدم: "كم يجب أن يبقى في الصندوق الآن؟" — الرصيد المتوقَّع
+    // فعلياً في الصندوق النقدي (حساب "الصندوق الرئيسي" في شجرة الحسابات)، وهو الحساب الذي تُرحَّل إليه
+    // كل حركة نقدية حقيقية في النظام (تحصيل مبيعات، دفع مصاريف، سداد موردين، صرف رواتب، سحوبات المالك،
+    // ...إلخ) — فرصيده = صافي كل هذه الحركات منذ بداية النظام حتى الآن. رصيد لحظي "الآن" دائماً (بلا
+    // فلتر فترة، تماماً كبطاقة "دين المالك المستحق" أعلاه) لأنه رصيد ميزانية عمومية تراكمي وليس حركة
+    // فترة. نفس منهجية daily_closing.php بالضبط (المصدر الرسمي المُثبَت لرصيد الصندوق).
+    $sec2_cash_actual = 0;
+    try {
+        $stmt_s2_cash = $conn->query("
+            SELECT COALESCE(SUM(je.debit) - SUM(je.credit), 0)
+            FROM journal_entries je JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+        ");
+        $sec2_cash_actual = floatval($stmt_s2_cash->fetchColumn());
+    } catch (Exception $e) { }
+
+    // تفصيل حسب المصدر (source_module) لبطاقة "كم يجب أن يبقى في الصندوق الآن" — بناءً على طلب صريح من
+    // المستخدم لمراجعة مكوّناتها بنداً بنداً، بدلاً من محاولة اشتقاقها من الإيرادات ناقص بنود محاسبية
+    // فترة محدودة (وهو خطأ منهجي: هذا رصيد تراكمي منذ اليوم الأول، لا حركة فترة). صافي (مدين−دائن) لكل
+    // فئة، تراكمياً منذ أول قيد وحتى اليوم — موجب = صافي دخول نقد لهذه الفئة، سالب = صافي خروج.
+    $sec2_cash_actual_breakdown = [];
+    try {
+        $stmt_s2_cash_detail = $conn->prepare("
+            SELECT COALESCE(je.source_module, 'غير مُصنَّف') AS src,
+                   COALESCE(SUM(je.debit) - SUM(je.credit), 0) AS net_amt, COUNT(*) AS cnt
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+            GROUP BY COALESCE(je.source_module, 'غير مُصنَّف')
+            ORDER BY ABS(net_amt) DESC
+        ");
+        $stmt_s2_cash_detail->execute();
+        $sec2_cash_actual_breakdown = $stmt_s2_cash_detail->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { }
+
+    // بطاقة جديدة بناءً على طلب صريح من المستخدم: "صافي الربح المطلق" — الرقم الوحيد غير القابل للجدل،
+    // لأنه لا يعتمد على تعداد يدوي لأسماء حسابات مصاريف محدَّدة (كما تفعل dash_cogs/sec2/financial_reports.php
+    // أعلاه، وهي عُرضة لنسيان حساب جديد يُضاف لاحقاً) — بل يجمع مباشرة كل حساب من نوع Revenue وكل حساب من
+    // نوع Expense في شجرة الحسابات بأكملها، بلا استثناء واحد، تراكمياً منذ أول قيد في النظام وحتى اليوم.
+    // نفس منهجية "الأرباح المحتجزة" (Retained Earnings) في الميزانية العمومية بـfinancial_statements.php
+    // بالضبط — وهي المعادلة المحاسبية الأساسية: الأصول = الخصوم + حقوق الملكية (وصافي الربح ضمنها).
+    // بند لحظي "الآن" دائماً (بلا فلتر فترة إطلاقاً)، لأن "المطلق" يعني منذ اليوم الأول للنظام، لا فترة محدَّدة.
+    $sec2_absolute_net_profit = 0;
+    try {
+        $stmt_s2_absolute = $conn->prepare("
+            SELECT
+                COALESCE(SUM(CASE WHEN a.account_type = 'Revenue' THEN je.credit - je.debit ELSE 0 END), 0) AS rev,
+                COALESCE(SUM(CASE WHEN a.account_type = 'Expense' THEN je.debit - je.credit ELSE 0 END), 0) AS exp
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_type IN ('Revenue', 'Expense') AND je.entry_date <= ?
+        ");
+        $stmt_s2_absolute->execute([date('Y-m-d')]);
+        $s2abs = $stmt_s2_absolute->fetch(PDO::FETCH_ASSOC);
+        $sec2_absolute_net_profit = floatval($s2abs['rev']) - floatval($s2abs['exp']);
+    } catch (Exception $e) { }
+
+    // ============================================================
+    // قسم جديد بناءً على طلب صريح من المستخدم: "ربح يوزَّع على الشركاء" — بعد توضيحه الصريح على نقطتين:
+    // (أ) "الإيرادات" هنا = نفس رقم الإيرادات المحاسبي المعروض أعلاه ($sec2_revenue: فواتير مُسلَّمة
+    //     ومُحصَّلة بالكامل)، وليس مجرد النقد الداخل للصندوق.
+    // (ب) "كل شيء خرج من الصندوق" = مصاريف التشغيل الفعلية فقط (رواتب، عمولات مدفوعة فعلياً، شحن،
+    //     مصاريف تشغيلية) — باستثناء سحوبات المالك وسداد قروضه (نفس التصحيح الأصلي).
+    //
+    // === تصحيح جوهري لاحق (بعد اكتشاف المستخدم رقماً سالباً ضخماً غير منطقي) ===
+    // السبب الحقيقي لم يكن الرصيد الافتتاحي وحده، بل **ازدواج حساب** أعمّ: كانت هذه البطاقة تشمل أيضاً
+    // "دفعات الموردين" (source_module = 'Supplier Payment') وأي شراء نقدي مباشر (source_module = 'Purchase')
+    // — أي **كل** النقد الخارج لشراء بضاعة، سواء دُفِع فوراً أو سُدِّد لاحقاً كدَين متراكم (رصيد افتتاحي
+    // أو فواتير قديمة قبل هذه الفترة). ثم كانت الخطوة التالية تطرح COGS **مرة أخرى** — فتكلفة البضاعة
+    // كانت تُخصَم مرتين: مرة ضمن "الخارج من الصندوق" (كامل قيمة الشراء/السداد)، ومرة أخرى كـCOGS (تكلفة
+    // الجزء المباع فقط منها). هذا ما ضخَّم الرقم سلباً بشكل غير منطقي، لا علاقة له بتوقيت الرصيد الافتتاحي
+    // تحديداً بل بأي دفعة مورد مهما كان مصدرها. الحل: استبعاد كل حركة شراء/سداد موردين من "الخارج من
+    // الصندوق" هنا كلياً — فتكلفة البضاعة تُمثَّل بـCOGS فقط (المطابقة الصحيحة محاسبياً لما بِيع فعلياً
+    // هذه الفترة)، لا بقيمة الشراء أو السداد النقدي الخام (الذي قد يشمل مخزوناً لم يُبَع بعد، أو ديوناً
+    // من فترات سابقة تماماً).
+    // ثم: المتبقي = الإيرادات − كل شيء خرج من الصندوق (تشغيلي، بلا شراء/سداد موردين)
+    //     ربح يوزَّع على الشركاء = المتبقي − ثمن البضائع المباعة (COGS)
+    // ============================================================
+    $sec2_cash_out_operational = 0;
+    try {
+        $stmt_s2_cashout = $conn->prepare("
+            SELECT COALESCE(SUM(je.credit), 0)
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+              AND je.entry_date BETWEEN ? AND ?
+              AND (je.source_module IS NULL OR (
+                    je.source_module NOT IN ('Owner Withdrawal', 'Owner Loan Repayment')
+                    AND je.source_module NOT LIKE 'Purchase%'
+                    AND je.source_module NOT LIKE 'Supplier%'
+              ))
+        ");
+        $stmt_s2_cashout->execute([$sec2_start, $sec2_end]);
+        $sec2_cash_out_operational = floatval($stmt_s2_cashout->fetchColumn());
+    } catch (Exception $e) { }
+    $sec2_remaining_after_cashout = $sec2_revenue - $sec2_cash_out_operational;
+    $sec2_distributable_profit = $sec2_remaining_after_cashout - $sec2_cogs_syp;
+
+    // ============================================================
+    // بطاقة جديدة بناءً على تصحيح صريح من المستخدم لتعريف "الربح": "الربح = الإيرادات − ما تم صرفه
+    // فعلياً"، حيث "الإيرادات" = فقط النقد الذي دخل الصندوق فعلياً من فواتير بِيعت وسُلِّمت (لا الاستحقاق
+    // المحاسبي، ولا أي تقييم لمخزون أو مبيعات معلَّقة). هذا أبسط تعريف ممكن للربح — تدفق نقدي صافٍ بحت
+    // لهذا الصندوق تحديداً، بلا COGS منفصل وبلا استبعاد شراء/موردين (كل ما صُرِف فعلياً يُطرَح كاملاً،
+    // بما فيه شراء البضاعة نفسها) — الاستثناء الوحيد: سحوبات المالك وسداد قروضه (لأنها توزيع/إقراض، لا
+    // "صرف" على تشغيل العمل).
+    // الإيرادات (نقدي): كل دخول فعلي لحساب "الصندوق الرئيسي" مصدره 'Sales' تحديداً (تحصيل فاتورة بيع،
+    // سواء فوراً أو لاحقاً كتحصيل ذمة عميل) — يستثني تلقائياً الجانب الدائن لنفس المصدر (تكلفة الشحن،
+    // وهي خروج لا دخول) لأن الفلتر هنا على je.debit > 0 حصراً.
+    // ============================================================
+    $sec2_cash_revenue_pure = 0;
+    try {
+        $stmt_s2_cash_rev = $conn->prepare("
+            SELECT COALESCE(SUM(je.debit), 0)
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+              AND je.entry_date BETWEEN ? AND ?
+              AND je.source_module = 'Sales'
+              AND je.debit > 0
+        ");
+        $stmt_s2_cash_rev->execute([$sec2_start, $sec2_end]);
+        $sec2_cash_revenue_pure = floatval($stmt_s2_cash_rev->fetchColumn());
+    } catch (Exception $e) { }
+
+    $sec2_cash_spent_total = 0;
+    try {
+        $stmt_s2_cash_spent = $conn->prepare("
+            SELECT COALESCE(SUM(je.credit), 0)
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+              AND je.entry_date BETWEEN ? AND ?
+              AND (je.source_module IS NULL OR je.source_module NOT IN ('Owner Withdrawal', 'Owner Loan Repayment'))
+        ");
+        $stmt_s2_cash_spent->execute([$sec2_start, $sec2_end]);
+        $sec2_cash_spent_total = floatval($stmt_s2_cash_spent->fetchColumn());
+    } catch (Exception $e) { }
+    $sec2_pure_cash_profit = $sec2_cash_revenue_pure - $sec2_cash_spent_total;
+
+    // تفصيل حسب المصدر (source_module) لبطاقة "كل شيء خرج من الصندوق" — بناءً على طلب صريح من المستخدم
+    // ("فصل لي ماهي")، لعرض مكوّنات الرقم شفافياً بدل رقم مجمَّع لا يمكن التحقق منه، ولاكتشاف أي مصدر غير
+    // متوقَّع (كإرجاع نقدي لعميل، أو حساب لم يُستبعَد بعد) يُفسِّر أي فرق يراه المستخدم غير منطقي.
+    $sec2_cashout_breakdown = [];
+    try {
+        $stmt_s2_cashout_detail = $conn->prepare("
+            SELECT COALESCE(je.source_module, 'غير مُصنَّف') AS src, COALESCE(SUM(je.credit), 0) AS amt, COUNT(*) AS cnt
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE a.account_name = 'الصندوق الرئيسي'
+              AND je.entry_date BETWEEN ? AND ?
+              AND (je.source_module IS NULL OR (
+                    je.source_module NOT IN ('Owner Withdrawal', 'Owner Loan Repayment')
+                    AND je.source_module NOT LIKE 'Purchase%'
+                    AND je.source_module NOT LIKE 'Supplier%'
+              ))
+              AND je.credit > 0
+            GROUP BY COALESCE(je.source_module, 'غير مُصنَّف')
+            ORDER BY amt DESC
+        ");
+        $stmt_s2_cashout_detail->execute([$sec2_start, $sec2_end]);
+        $sec2_cashout_breakdown = $stmt_s2_cashout_detail->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { }
+
+    // ============================================================
+    // قسم جديد بناءً على طلب صريح من المستخدم: "أين ذهبت هذه الأرباح؟" — تسوية كاملة بين "صافي الربح
+    // المطلق" (منذ بداية النظام) ورصيد "الصندوق الآن"، توضح إلى أين تحوَّل كل جزء من الربح: هل بقي
+    // نقداً، أم تحوَّل لمخزون (بضاعة لم تُبَع بعد)، أم لرأس مال منتجات مباعة لم تُسلَّم بعد، أم سُحِب من
+    // المالك، أم أُقرِض له. كل بند هنا "الآن" دائماً (بلا فلتر فترة، منذ اليوم الأول) لأنه تسوية ميزانية
+    // عمومية شاملة، لا حركة فترة محدَّدة.
+    // المعادلة: الصندوق المتوقَّع = صافي الربح المطلق − سحوبات المالك (كل التاريخ) − دين المالك المستحق
+    //           − قيمة المخزون الحالي (بالتكلفة) − رأس مال المنتجات المباعة قيد التسليم (كل التاريخ)
+    // إن تساوى هذا مع "كم يجب أن يبقى في الصندوق الآن" (رصيد اليومية الفعلي)، فالنظام المحاسبي متّسق
+    // داخلياً بالكامل. أي فرق متبقٍّ بعدها بينه وبين **النقد الفعلي المعدود يدوياً** هو عجز/زيادة حقيقية
+    // خارج نطاق أي حساب برمجي — يتطلب تتبعاً يدوياً يوماً بيوم عبر الإقفال اليومي.
+    // ============================================================
+    $recon_owner_withdrawals_alltime = 0;
+    try {
+        $stmt_recon_ow = $conn->query("SELECT COALESCE(SUM(amount_syp), 0) FROM owner_withdrawals WHERE withdrawal_type = 'سحب نهائي'");
+        $recon_owner_withdrawals_alltime = floatval($stmt_recon_ow->fetchColumn());
+    } catch (Exception $e) { }
+
+    $recon_inventory_usd = 0; $recon_inventory_syp = 0;
+    try {
+        $stmt_recon_inv = $conn->query("SELECT COALESCE(SUM(current_quantity * cost_price_usd), 0) FROM products");
+        $recon_inventory_usd = floatval($stmt_recon_inv->fetchColumn());
+        $recon_rate_today = getExchangeRateForDate($conn, 'USD', date('Y-m-d'));
+        $recon_inventory_syp = $recon_inventory_usd * $recon_rate_today;
+    } catch (Exception $e) { }
+
+    // رأس مال المنتجات المباعة قيد التسليم — رصيد لحظي "الآن" بلا فلتر فترة (كل فاتورة Pending حالياً،
+    // بغض النظر متى صدرت)، بخلاف $sec2_pending_capital_* أعلاه المحصورة بفترة sec2 فقط.
+    $recon_pending_capital_usd = 0; $recon_pending_capital_syp = 0;
+    try {
+        $stmt_recon_pending = $conn->query("
+            SELECT
+                COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd)), 0) AS cap_usd,
+                COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd) * s.exchange_rate), 0) AS cap_syp
+            FROM sale_items si
+            INNER JOIN sales s ON si.sale_id = s.id
+            INNER JOIN products p ON si.product_id = p.id
+            WHERE s.delivery_status = 'Pending'
+        ");
+        $rp = $stmt_recon_pending->fetch(PDO::FETCH_ASSOC);
+        $recon_pending_capital_usd = floatval($rp['cap_usd']);
+        $recon_pending_capital_syp = floatval($rp['cap_syp']);
+    } catch (Exception $e) { }
+
+    $recon_expected_cash = $sec2_absolute_net_profit - $recon_owner_withdrawals_alltime - $sec2_owner_loan_outstanding
+        - $recon_inventory_syp - $recon_pending_capital_syp;
+    $recon_gap_vs_ledger = $sec2_cash_actual - $recon_expected_cash;
 
     // بطاقة عملية إضافية: "كم تبقّى فعلياً متاحاً" — تطرح السحوبات النهائية (تخفض الربح فعلاً) وأيضاً
     // القرض المستحق حالياً (لا يخفض الربح محاسبياً، لكنه نقد خرج فعلياً من الصندوق ولم يُسترَد بعد).
@@ -358,7 +663,11 @@ try {
             COALESCE(SUM(
                 (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0))
                 * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd) * s.exchange_rate
-            ), 0) AS cogs_syp
+            ), 0) AS cogs_syp,
+            COALESCE(SUM(
+                (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0))
+                * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd)
+            ), 0) AS cogs_usd
         FROM sale_items si
         INNER JOIN sales s ON si.sale_id = s.id
         INNER JOIN products p ON si.product_id = p.id
@@ -369,8 +678,12 @@ try {
     $stmt_s3_sales->execute([$sec3_start, $sec3_end]);
     $s3s = $stmt_s3_sales->fetch(PDO::FETCH_ASSOC);
     $sec3_sold_qty = floatval($s3s['pieces_sold']);
-    $sec3_sold_value_syp = floatval($s3s['revenue_syp']);
-    $sec3_sold_value_usd = floatval($s3s['revenue_usd']);
+    // تصحيح جوهري بناءً على طلب صريح من المستخدم: كانت هذه البطاقة تعرض سعر البيع (الإيراد) تحت مُسمّى
+    // "القيمة" — وهو مُضلِّل لبطاقة الغرض منها إظهار رأس المال المرتبط بالبضاعة، لا ربحية البيع (المعروضة
+    // أصلاً بشكل صحيح في بطاقة "مكسب الجرد المكتبي" المستقلة أدناها). الآن تعرض تكلفة رأس المال الفعلية
+    // (COGS) بدل سعر البيع.
+    $sec3_sold_value_syp = floatval($s3s['cogs_syp']);
+    $sec3_sold_value_usd = floatval($s3s['cogs_usd']);
     $sec3_profit_syp = floatval($s3s['revenue_syp']) - floatval($s3s['cogs_syp']);
 
     $stmt_s3_delivered = $conn->prepare("
@@ -381,10 +694,13 @@ try {
     $stmt_s3_delivered->execute([$sec3_start, $sec3_end]);
     $sec3_delivered_qty = floatval($stmt_s3_delivered->fetchColumn());
 
+    // تصحيح جوهري بناءً على طلب صريح من المستخدم ("يجب أن يعرض قيمة رأس مال البضائع"): كان الاستعلام
+    // يستخدم si.total_price_syp (سعر البيع/الإيراد) بدل تكلفة رأس المال الفعلية — يُضخِّم الرقم المعروض
+    // بمقدار هامش الربح المتوقَّع على هذه القطع، لا رأس المال المستثمَر فيها فعلياً كما توحي التسمية.
     $stmt_s3_pending = $conn->prepare("
         SELECT COALESCE(SUM(si.quantity), 0) AS qty,
-               COALESCE(SUM(si.total_price_syp), 0) AS value_syp,
-               COALESCE(SUM(si.total_price_syp / NULLIF(s.exchange_rate, 0)), 0) AS value_usd
+               COALESCE(SUM(si.quantity * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd) * s.exchange_rate), 0) AS value_syp,
+               COALESCE(SUM(si.quantity * COALESCE(si.cost_price_usd_at_sale, p.cost_price_usd)), 0) AS value_usd
         FROM sale_items si INNER JOIN sales s ON si.sale_id = s.id INNER JOIN products p ON si.product_id = p.id
         WHERE p.supplier_id IS NULL AND s.delivery_status = 'Pending' AND s.invoice_date BETWEEN ? AND ?
     ");
@@ -429,29 +745,19 @@ try {
 // ============================================================
 // قسم مستقل خامس: "نظرة عامة شاملة على النظام" — يجمع كل وحدات البرنامج (المنتجات/المخزون، المبيعات،
 // المشتريات، الموردون، المندوبون، المصاريف) في مكان واحد — إجابة مباشرة على "أريد كل معلومات وإحصائيات
-// البرنامج من لوحة التحكم". الآن بفلتر أسبوعي مستقل (سبت -> خميس) خاص به فقط، منفصل تماماً عن الفلتر
-// الأول وفلتري sec2/sec3 أعلاه — يُطبَّق على مؤشرات "الحركة" (مبيعات/مشتريات/مصاريف ضمن الفترة)، بينما
+// البرنامج من لوحة التحكم". بفلتر "من - إلى" مستقل خاص به فقط، منفصل تماماً عن الفلتر الأول وفلتري
+// sec2/sec3 أعلاه — يُطبَّق على مؤشرات "الحركة" (مبيعات/مشتريات/مصاريف ضمن الفترة)، بينما
 // تبقى أرصدة "اللحظة الحالية" (المخزون الآن، صافي مستحق الموردين، صافي ذمة المندوبين) دائماً حية بلا فلتر
 // لأنها أرصدة تراكمية وليست حركة فترة.
 // ============================================================
-$ov_has_filter_param = isset($_GET['ov_ref']) || isset($_GET['ov_all']);
-$ov_view_all = $ov_has_filter_param ? (isset($_GET['ov_all']) && $_GET['ov_all'] == '1') : true;
-$ov_ref_date = $_GET['ov_ref'] ?? date('Y-m-d');
-try {
-    $ov_ref_dt = new DateTime($ov_ref_date);
-} catch (Exception $e) {
-    $ov_ref_dt = new DateTime();
-}
-$ov_dow = (int)$ov_ref_dt->format('N'); // 1=اثنين ... 7=أحد
-$ov_days_since_saturday = ($ov_dow - 6 + 7) % 7; // السبت = 6
-$ov_week_start_dt = (clone $ov_ref_dt)->modify("-{$ov_days_since_saturday} days");
-$ov_week_end_dt = (clone $ov_week_start_dt)->modify("+5 days");
-$ov_week_start = $ov_week_start_dt->format('Y-m-d');
-$ov_week_end = $ov_week_end_dt->format('Y-m-d');
-$ov_prev_week_ref = (clone $ov_week_start_dt)->modify('-1 day')->format('Y-m-d');
-$ov_next_week_ref = (clone $ov_week_end_dt)->modify('+1 day')->format('Y-m-d');
-$ov_from = $ov_view_all ? '2000-01-01' : $ov_week_start;
-$ov_to   = $ov_view_all ? '2100-12-31' : $ov_week_end;
+// تصحيح جوهري بناءً على طلب صريح من المستخدم: "كل قسم له فلتر خاص بتاريخ من إلى" — استُبدِل التنقّل
+// الأسبوعي (سبت->خميس) + مفتاح "عرض كل الأوقات" بفلتر "من - إلى" بسيط ومستقل، بنفس نمط sec2/sec3
+// تماماً (قيمة افتراضية: الشهر الحالي بالكامل). يُطبَّق هذا الفلتر على قسم "نظرة عامة شاملة على النظام"
+// وقسمَي "مؤشرات مالية إضافية" و"صافي حركة الموردين" اللذين يشاركانه نفس المتغيرات ($ov_from/$ov_to).
+$ov_start = $_GET['ov_start'] ?? date('Y-m-01');
+$ov_end   = $_GET['ov_end'] ?? date('Y-m-t');
+$ov_from = $ov_start;
+$ov_to   = $ov_end;
 
 $ov_office_items = [];
 $ov2_pending_items = [];
@@ -641,8 +947,29 @@ try {
 // قسم مستقل سابع: صافي حركة الفترة لكل مورد على حدة (نفس مفهوم عمود "صافي حركة الفترة" في
 // suppliers.php)، ضمن نفس الفترة الأسبوعية/الكلية المختارة أعلاه لقسم "نظرة عامة شاملة على النظام".
 // ============================================================
+// فلتر مستقل جديد بناءً على طلب صريح من المستخدم: "تكلفة البضائع المباعة (COGS) — مُسلَّمة (الفترة)"
+// لكل مورد، بنفس مبدأ الفلتر الأول بالضبط (يومي / أسبوعي يبدأ السبت وينتهي الخميس) — مستقل تماماً عن
+// فلتر "نظرة عامة شاملة" (ov_from/ov_to) أعلاه، بأسماء GET منفصلة (smv_*) لتفادي أي تعارض بينهما.
+$smv_filter_type = $_GET['smv_filter_type'] ?? 'daily';
+if ($smv_filter_type === 'weekly') {
+    $smv_dow = intval(date('w'));
+    $smv_days_since_saturday = ($smv_dow + 1) % 7;
+    $smv_start = date('Y-m-d', strtotime("-{$smv_days_since_saturday} days"));
+    $smv_end = date('Y-m-d', strtotime($smv_start . ' +5 days'));
+} elseif ($smv_filter_type === 'monthly') {
+    $smv_start = date('Y-m-01');
+    $smv_end = date('Y-m-t');
+} else {
+    $smv_filter_type = 'daily';
+    $smv_start = $today_str;
+    $smv_end = $today_str;
+}
+
 $ov_supplier_rows = [];
 try {
+    // تصحيح بناءً على طلب صريح من المستخدم: كل أعمدة الجدول توحَّدت الآن على فلتر smv نفسه (يومي/أسبوعي
+    // سبت-خميس) بدل الاعتماد على فلتر "نظرة عامة شاملة" (ov_from/ov_to) المنفصل سابقاً — عمود واحد فقط
+    // لكل الجدول، لا فلترين مختلفين بجانب بعضهما كما كان سابقاً.
     $stmt_ov_sup = $conn->prepare("
         SELECT s.id, s.supplier_name,
             COALESCE((SELECT SUM(pi.total_amount_usd) FROM purchase_invoices pi WHERE pi.supplier_id = s.id AND pi.payment_status != 'Paid' AND pi.invoice_date BETWEEN ? AND ?), 0) AS period_purchases,
@@ -651,18 +978,143 @@ try {
             COALESCE((SELECT SUM(sd.amount_usd) FROM supplier_discounts sd WHERE sd.supplier_id = s.id AND sd.discount_date BETWEEN ? AND ?), 0) AS period_discounts
         FROM suppliers s
     ");
-    $stmt_ov_sup->execute([$ov_from, $ov_to, $ov_from, $ov_to, $ov_from, $ov_to, $ov_from, $ov_to]);
-    foreach ($stmt_ov_sup->fetchAll(PDO::FETCH_ASSOC) as $row) {
+    $stmt_ov_sup->execute([$smv_start, $smv_end, $smv_start, $smv_end, $smv_start, $smv_end, $smv_start, $smv_end]);
+    $ov_supplier_rows_raw = $stmt_ov_sup->fetchAll(PDO::FETCH_ASSOC);
+
+    // إجمالي المشتريات لكل الموردين ضمن نفس فترة smv، لحساب نسبة شراء كل مورد من الإجمالي
+    $total_period_purchases = 0;
+    foreach ($ov_supplier_rows_raw as $row) { $total_period_purchases += floatval($row['period_purchases']); }
+
+    // COGS مُسلَّمة لكل مورد ضمن فترة smv (يومي/أسبوعي سبت-خميس) — نفس المنهجية الهجينة الدقيقة
+    // المُطبَّقة في supplier_view.php: تُقرَأ من استهلاك الدفعات الفعلي (مورّد الدفعة الحقيقي) حيثما
+    // وُجد سجل، مع رجوع تلقائي للمنهجية القديمة (تكلفة ممزوجة) فقط للمبيعات السابقة لتفعيل نظام الدفعات.
+    $stmt_smv_cogs = $conn->prepare("
+        SELECT COALESCE(SUM(v), 0) FROM (
+            SELECT sibc.quantity_consumed * sibc.unit_cost_usd AS v
+            FROM sale_item_batch_consumption sibc
+            JOIN inventory_batches ib ON sibc.batch_id = ib.id
+            JOIN sale_items si ON sibc.sale_item_id = si.id
+            JOIN sales s ON si.sale_id = s.id
+            WHERE ib.supplier_id = ? AND s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+            UNION ALL
+            SELECT (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.cost_price_usd_at_sale AS v
+            FROM sale_items si
+            JOIN sales s ON si.sale_id = s.id
+            JOIN products p ON si.product_id = p.id
+            WHERE p.supplier_id = ? AND s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+              AND NOT EXISTS (SELECT 1 FROM sale_item_batch_consumption sibc2 WHERE sibc2.sale_item_id = si.id)
+        ) t
+    ");
+
+    foreach ($ov_supplier_rows_raw as $row) {
         $p_purch = floatval($row['period_purchases']);
         $p_pay = floatval($row['period_payments']);
         $p_ret = floatval($row['period_returns']) + floatval($row['period_discounts']);
         $p_net = $p_purch - $p_pay - $p_ret;
-        // نعرض فقط الموردين الذين لديهم حركة فعلية ضمن الفترة (تفادياً لتعداد طويل بلا فائدة)
-        if (abs($p_purch) > 0.009 || abs($p_pay) > 0.009 || abs($p_ret) > 0.009) {
-            $ov_supplier_rows[] = ['id' => intval($row['id']), 'name' => $row['supplier_name'], 'purchases' => $p_purch, 'payments' => $p_pay, 'returns' => $p_ret, 'net' => $p_net];
+        $p_purchase_share_pct = $total_period_purchases > 0 ? ($p_purch / $total_period_purchases) * 100 : 0;
+
+        $stmt_smv_cogs->execute([$row['id'], $smv_start, $smv_end, $row['id'], $smv_start, $smv_end]);
+        $p_cogs_delivered = floatval($stmt_smv_cogs->fetchColumn());
+
+        // نعرض المورد إن كانت له حركة فعلية ضمن فترة smv (مشتريات/دفعات/مردودات أو COGS)
+        if (abs($p_purch) > 0.009 || abs($p_pay) > 0.009 || abs($p_ret) > 0.009 || abs($p_cogs_delivered) > 0.009) {
+            $ov_supplier_rows[] = ['id' => intval($row['id']), 'name' => $row['supplier_name'], 'purchases' => $p_purch, 'payments' => $p_pay, 'returns' => $p_ret, 'net' => $p_net, 'purchase_share_pct' => $p_purchase_share_pct, 'cogs_delivered' => $p_cogs_delivered];
         }
     }
     usort($ov_supplier_rows, function ($a, $b) { return abs($b['net']) <=> abs($a['net']); });
+} catch (Exception $e) { }
+
+// جدول المندوبين — بناءً على طلب صريح من المستخدم: فلتر مستقل تماماً عن فلتر smv الخاص بالموردين، بنفس
+// المبدأ (يومي / أسبوعي سبت-خميس)، بأسماء GET منفصلة (rmv_*) لتفادي أي تعارض مع smv أو أي فلتر آخر.
+$rmv_filter_type = $_GET['rmv_filter_type'] ?? 'daily';
+if ($rmv_filter_type === 'weekly') {
+    $rmv_dow = intval(date('w'));
+    $rmv_days_since_saturday = ($rmv_dow + 1) % 7;
+    $rmv_start = date('Y-m-d', strtotime("-{$rmv_days_since_saturday} days"));
+    $rmv_end = date('Y-m-d', strtotime($rmv_start . ' +5 days'));
+} elseif ($rmv_filter_type === 'monthly') {
+    $rmv_start = date('Y-m-01');
+    $rmv_end = date('Y-m-t');
+} else {
+    $rmv_filter_type = 'daily';
+    $rmv_start = $today_str;
+    $rmv_end = $today_str;
+}
+
+// اسم المندوب، صافي رصيده المستحق (تراكمي كامل، كما في representative_profile.php)، نسبته من إجمالي
+// مبيعات النظام خلال فترة rmv (صافٍ إلى صافٍ)، عدد القطع الصافية التي باعها خلال الفترة، وعدد فواتيره
+// التي عليها مرتجع خلال الفترة.
+$ov_rep_rows = [];
+try {
+    $total_period_sales_value = 0;
+    $stmt_total_period_sales = $conn->prepare("
+        SELECT COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.unit_price_syp), 0)
+        FROM sale_items si INNER JOIN sales s ON si.sale_id = s.id
+        WHERE (s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?)
+           OR (s.delivery_status != 'Delivered' AND s.invoice_date BETWEEN ? AND ?)
+    ");
+    $stmt_total_period_sales->execute([$rmv_start, $rmv_end, $rmv_start, $rmv_end]);
+    $total_period_sales_value = floatval($stmt_total_period_sales->fetchColumn());
+
+    $stmt_rep_rows = $conn->prepare("
+        SELECT r.id, r.name,
+            COALESCE((SELECT SUM(rt.amount) FROM representative_transactions rt WHERE rt.representative_id = r.id AND rt.transaction_type = 'deduction'), 0) AS total_deductions,
+            COALESCE((SELECT SUM(rp.amount_syp) FROM representative_payments rp WHERE rp.representative_id = r.id), 0) AS total_payments,
+            (SELECT COALESCE(SUM(s.total_commissions), 0) - COALESCE((
+                SELECT SUM(sr.total_commission_reversed) FROM sales_returns sr INNER JOIN sales s2 ON sr.sale_id = s2.id
+                WHERE s2.representative_id = r.id AND s2.delivery_status = 'Delivered'
+             ), 0)
+             FROM sales s WHERE s.representative_id = r.id AND s.delivery_status = 'Delivered'
+            ) AS total_earned_commissions,
+            (SELECT COALESCE(SUM(si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)), 0)
+             FROM sale_items si INNER JOIN sales s2 ON si.sale_id = s2.id
+             WHERE s2.representative_id = r.id
+               AND ((s2.delivery_status = 'Delivered' AND COALESCE(s2.delivered_at, s2.invoice_date) BETWEEN ? AND ?)
+                    OR (s2.delivery_status != 'Delivered' AND s2.invoice_date BETWEEN ? AND ?))
+            ) AS period_net_qty,
+            (SELECT COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.unit_price_syp), 0)
+             FROM sale_items si INNER JOIN sales s3 ON si.sale_id = s3.id
+             WHERE s3.representative_id = r.id
+               AND ((s3.delivery_status = 'Delivered' AND COALESCE(s3.delivered_at, s3.invoice_date) BETWEEN ? AND ?)
+                    OR (s3.delivery_status != 'Delivered' AND s3.invoice_date BETWEEN ? AND ?))
+            ) AS period_net_value,
+            (SELECT COUNT(DISTINCT sr.sale_id) FROM sales_returns sr INNER JOIN sales s4 ON sr.sale_id = s4.id
+             WHERE s4.representative_id = r.id AND DATE(sr.created_at) BETWEEN ? AND ?
+            ) AS period_returned_invoices_count
+        FROM representatives r
+    ");
+    $stmt_rep_rows->execute([
+        $rmv_start, $rmv_end, $rmv_start, $rmv_end,
+        $rmv_start, $rmv_end, $rmv_start, $rmv_end,
+        $rmv_start, $rmv_end,
+    ]);
+    foreach ($stmt_rep_rows->fetchAll(PDO::FETCH_ASSOC) as $rr) {
+        // صافي الرصيد المستحق التراكمي الكامل — يُقرَأ مباشرة من القيود (استحقاق - مرتجعات) مطروحاً منه
+        // الدفعات والخصومات، بنفس صيغة representative_profile.php بالضبط
+        $rep_net_balance = floatval($rr['total_earned_commissions']) - floatval($rr['total_payments']) - floatval($rr['total_deductions']);
+        $rep_share_pct = $total_period_sales_value > 0 ? (floatval($rr['period_net_value']) / $total_period_sales_value) * 100 : 0;
+
+        if (abs($rep_net_balance) > 0.009 || floatval($rr['period_net_qty']) > 0.009 || intval($rr['period_returned_invoices_count']) > 0) {
+            $ov_rep_rows[] = [
+                'id' => intval($rr['id']),
+                'name' => $rr['name'],
+                'net_balance' => $rep_net_balance,
+                'share_pct' => $rep_share_pct,
+                'net_qty' => floatval($rr['period_net_qty']),
+                'returned_invoices_count' => intval($rr['period_returned_invoices_count']),
+            ];
+        }
+    }
+    usort($ov_rep_rows, function ($a, $b) { return $b['net_qty'] <=> $a['net_qty']; });
+
+    // إجمالي صف أسفل الجدول — بناءً على طلب صريح من المستخدم
+    $ov_rep_totals = ['net_balance' => 0, 'share_pct' => 0, 'net_qty' => 0, 'returned_invoices_count' => 0];
+    foreach ($ov_rep_rows as $rr) {
+        $ov_rep_totals['net_balance'] += $rr['net_balance'];
+        $ov_rep_totals['share_pct'] += $rr['share_pct'];
+        $ov_rep_totals['net_qty'] += $rr['net_qty'];
+        $ov_rep_totals['returned_invoices_count'] += $rr['returned_invoices_count'];
+    }
 } catch (Exception $e) { }
 ?>
 
@@ -680,6 +1132,7 @@ try {
         <a href="#section-overview" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">نظرة عامة شاملة</a>
         <a href="#section-financial-extra" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">مؤشرات مالية إضافية</a>
         <a href="#section-supplier-movement" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">حركة الموردين</a>
+        <a href="#section-rep-movement" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">المندوبون</a>
         <a href="#section-priority" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">أولوية السداد</a>
         <a href="#section-quick-actions" style="text-decoration:none; background:#eaf1fc; color:#2c4e9c; padding:5px 12px; border-radius:14px; font-size:12.5px; font-weight:bold;">إجراءات سريعة</a>
     </div>
@@ -787,17 +1240,47 @@ try {
                 <div style="font-size: 19px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_revenue, 2); ?> ل.س</div>
             </div>
             <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
-                <div style="color: #a33636; font-size: 12.5px; font-weight: bold;">إجمالي المصاريف الشاملة</div>
-                <div style="font-size: 19px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_expenses + $sec2_payroll + $sec2_commissions + $sec2_shipping + $sec2_supplier_payments, 2); ?> ل.س</div>
+                <div style="color: #a33636; font-size: 12.5px; font-weight: bold;">تكلفة البضائع المباعة (COGS)</div>
+                <div style="font-size: 19px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cogs_syp, 2); ?> ل.س</div>
+                <div style="font-size: 13px; color: #a33636; font-family: monospace; margin-top: 3px;">≈ $<?php echo number_format($sec2_cogs_usd, 2); ?></div>
+            </div>
+            <div style="background: #fdecea; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+                <div style="color: #a33636; font-size: 12.5px; font-weight: bold;">إجمالي المصاريف الشاملة (تُحتسَب في صافي الربح)</div>
+                <div style="font-size: 19px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cogs_syp + $sec2_expenses + $sec2_payroll + $sec2_commissions + $sec2_shipping + $sec2_fx_loss + max(0, $sec2_fx_unrealized), 2); ?> ل.س</div>
                 <div style="font-size: 10.5px; color: #a33636; margin-top: 4px; line-height: 1.6;">
-                    مصاريف: <?php echo number_format($sec2_expenses, 0); ?> | رواتب: <?php echo number_format($sec2_payroll, 0); ?> |
+                    COGS: <?php echo number_format($sec2_cogs_syp, 0); ?> | مصاريف: <?php echo number_format($sec2_expenses, 0); ?> | رواتب: <?php echo number_format($sec2_payroll, 0); ?> |
                     عمولات: <?php echo number_format($sec2_commissions, 0); ?> | شحن: <?php echo number_format($sec2_shipping, 0); ?> |
-                    دفعات موردين: <?php echo number_format($sec2_supplier_payments, 0); ?>
+                    فروقات عملة: <?php echo number_format($sec2_fx_loss + max(0, $sec2_fx_unrealized), 0); ?>
+                </div>
+            </div>
+            <div style="background: <?php echo ($sec2_fx_gain - $sec2_fx_loss - $sec2_fx_unrealized) >= 0 ? '#e8f8f2' : '#fdecea'; ?>; border-right: 4px solid <?php echo ($sec2_fx_gain - $sec2_fx_loss - $sec2_fx_unrealized) >= 0 ? '#1cc88a' : '#e74a3b'; ?>; padding: 15px; border-radius: 6px;">
+                <div style="color: #555; font-size: 12.5px; font-weight: bold;" title="محقَّقة: من سداد دفعات الموردين. غير محقَّقة: إعادة تقييم الذمم المفتوحة للموردين بسعر إغلاق الفترة (IAS 21)">فروقات صرف العملة (دفعات الموردين)</div>
+                <div style="font-size: 19px; font-weight: bold; color: <?php echo ($sec2_fx_gain - $sec2_fx_loss - $sec2_fx_unrealized) >= 0 ? '#1cc88a' : '#e74a3b'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_fx_gain - $sec2_fx_loss - $sec2_fx_unrealized, 2); ?> ل.س</div>
+                <div style="font-size: 10.5px; color: #888; margin-top: 4px; line-height: 1.6;">
+                    محقَّقة — خسارة: <?php echo number_format($sec2_fx_loss, 0); ?> | محقَّقة — ربح: <?php echo number_format($sec2_fx_gain, 0); ?> | غير محقَّقة: <?php echo number_format($sec2_fx_unrealized, 0); ?>
                 </div>
             </div>
             <div style="background: <?php echo $sec2_net >= 0 ? '#e8f8f2' : '#fdecea'; ?>; border-right: 4px solid <?php echo $sec2_net >= 0 ? '#1cc88a' : '#e74a3b'; ?>; padding: 15px; border-radius: 6px;">
-                <div style="color: #555; font-size: 12.5px; font-weight: bold;">صافي الأرباح</div>
+                <div style="color: #555; font-size: 12.5px; font-weight: bold;" title="= الإيرادات − COGS − مصاريف − رواتب − عمولات − شحن − فروقات عملة (خسارة محقَّقة وغير محقَّقة) + فروقات عملة (ربح محقَّق وغير محقَّق) — مطابق تماماً لـ«صافي الربح الحقيقي» في التقارير المالية">صافي الأرباح</div>
                 <div style="font-size: 21px; font-weight: bold; color: <?php echo $sec2_net >= 0 ? '#1cc88a' : '#e74a3b'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_net, 2); ?> ل.س</div>
+                <div style="font-size: 10px; color: #999; margin-top: 4px;">= الإيرادات − COGS − مصاريف − رواتب − عمولات − شحن ± فروقات عملة</div>
+                <div style="font-size: 9.5px; color: #aaa; margin-top: 3px;">مطابق لـ«صافي الربح الحقيقي» في <a href="financial_reports.php" style="color:#4e73df;">التقارير المالية</a> لنفس الفترة</div>
+            </div>
+            <div style="background: #f3eefe; border-right: 4px solid #8b5cf6; padding: 15px; border-radius: 6px;">
+                <div style="color: #5b3aa8; font-size: 12.5px; font-weight: bold;" title="حركة نقدية فعلية (سداد التزام سابق) — لا تُحتسَب ضمن صافي الربح">دفعات الموردين (نقدية فعلية)</div>
+                <div style="font-size: 19px; font-weight: bold; color: #8b5cf6; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_supplier_payments, 2); ?> ل.س</div>
+                <div style="font-size: 10px; color: #888; margin-top: 3px;">لا تُخصَم من صافي الربح — تدفق نقدي فقط</div>
+            </div>
+            <div style="background: <?php echo $sec2_cogs_vs_payments_diff >= 0 ? '#fff8e6' : '#eaf1fc'; ?>; border-right: 4px solid <?php echo $sec2_cogs_vs_payments_diff >= 0 ? '#f6c23e' : '#4e73df'; ?>; padding: 15px; border-radius: 6px;">
+                <div style="color: #555; font-size: 12.5px; font-weight: bold;" title="COGS − دفعات الموردين ضمن نفس الفترة">الفرق: تكلفة البضائع مقابل دفعات الموردين</div>
+                <div style="font-size: 21px; font-weight: bold; color: <?php echo $sec2_cogs_vs_payments_diff >= 0 ? '#96751c' : '#2c4e9c'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cogs_vs_payments_diff, 2); ?> ل.س</div>
+                <div style="font-size: 10px; color: #888; margin-top: 4px; line-height: 1.5;">
+                    <?php if ($sec2_cogs_vs_payments_diff >= 0): ?>
+                        موجب: بِيعت بضاعة (COGS) أكبر مما دُفِع فعلياً للموردين ضمن الفترة — التزام تجاه الموردين يتجه للارتفاع
+                    <?php else: ?>
+                        سالب: دُفِع للموردين أكثر من تكلفة ما بيع فعلاً ضمن الفترة — سداد ديون سابقة و/أو شراء مخزون جديد
+                    <?php endif; ?>
+                </div>
             </div>
             <div style="background: #f3eefe; border-right: 4px solid #8b5cf6; padding: 15px; border-radius: 6px;">
                 <div style="color: #5b3aa8; font-size: 12.5px; font-weight: bold;">سحوبات المالك (الفترة)</div>
@@ -824,6 +1307,212 @@ try {
                 <div style="font-size: 19px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;">$<?php echo number_format($sec2_pending_capital_usd, 2); ?></div>
                 <div style="font-size: 12px; color: #96751c; font-family: monospace; margin-top: 2px;"><?php echo number_format($sec2_pending_capital_syp, 2); ?> ل.س</div>
             </div>
+            <div style="background: <?php echo $sec2_cash_actual >= 0 ? '#eafaf1' : '#fdecea'; ?>; border-right: 4px solid <?php echo $sec2_cash_actual >= 0 ? '#1a8f5f' : '#e74a3b'; ?>; padding: 15px; border-radius: 6px;">
+                <div style="color: #1a8f5f; font-size: 12.5px; font-weight: bold;" title="رصيد حساب «الصندوق الرئيسي» في اليومية — صافي كل حركة نقدية حقيقية (تحصيل مبيعات، مصاريف، سداد موردين، رواتب، سحوبات مالك...) منذ بداية النظام حتى الآن. رصيد لحظي دائماً، لا يتغيّر بتغيير فلتر الفترة أعلاه.">كم يجب أن يبقى في الصندوق الآن</div>
+                <div style="font-size: 21px; font-weight: bold; color: <?php echo $sec2_cash_actual >= 0 ? '#1a8f5f' : '#e74a3b'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cash_actual, 2); ?> ل.س</div>
+                <div style="font-size: 10px; color: #888; margin-top: 3px;">رصيد لحظي تراكمي منذ البداية — قارنه بالنقد الفعلي في الصندوق لكشف أي عجز أو زيادة</div>
+                <div style="font-size: 9.5px; color: #aaa; margin-top: 3px;">نفس رصيد <a href="daily_closing.php" style="color:#1a8f5f;">الإقفال اليومي</a> لتاريخ اليوم</div>
+            </div>
+            <div style="background: <?php echo $sec2_absolute_net_profit >= 0 ? '#e8f8f2' : '#fdecea'; ?>; border-right: 4px solid <?php echo $sec2_absolute_net_profit >= 0 ? '#1cc88a' : '#e74a3b'; ?>; padding: 15px; border-radius: 6px;">
+                <div style="color: #555; font-size: 12.5px; font-weight: bold;" title="مجموع كل حساب Revenue ناقص كل حساب Expense في شجرة الحسابات بأكملها، تراكمياً منذ أول قيد في النظام وحتى اليوم — بلا أي فلتر فترة، وبلا تعداد يدوي لأسماء حسابات محدَّدة (فلا يُنسى أي بند جديد). نفس منهجية «الأرباح المحتجزة» في الميزانية العمومية بـfinancial_statements.php حرفياً.">صافي الربح المطلق (منذ البداية)</div>
+                <div style="font-size: 21px; font-weight: bold; color: <?php echo $sec2_absolute_net_profit >= 0 ? '#1cc88a' : '#e74a3b'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_absolute_net_profit, 2); ?> ل.س</div>
+                <div style="font-size: 10px; color: #888; margin-top: 3px;">تراكمي منذ أول يوم للنظام — لا يتأثر بفلتر الفترة أعلاه إطلاقاً</div>
+                <div style="font-size: 9.5px; color: #aaa; margin-top: 3px;">مطابق لـ«الأرباح المحتجزة» في <a href="financial_statements.php" style="color:#1cc88a;">الميزانية العمومية</a> لتاريخ اليوم</div>
+            </div>
+        </div>
+
+        <?php if (count($sec2_cash_actual_breakdown) > 0): ?>
+        <div style="margin-top:15px;">
+            <button type="button" onclick="var t=document.getElementById('sec2CashBalanceDetail'); t.style.display = t.style.display==='none' ? 'block' : 'none';" style="background:#eafaf1; color:#1a8f5f; border:none; padding:7px 14px; border-radius:5px; cursor:pointer; font-size:12.5px; font-weight:bold;">
+                <i class="fas fa-list"></i> تفصيل "كم يجب أن يبقى في الصندوق الآن" حسب المصدر — منذ اليوم الأول (<?php echo count($sec2_cash_actual_breakdown); ?> فئة)
+            </button>
+            <div id="sec2CashBalanceDetail" style="display:none; margin-top:10px; overflow-x:auto;">
+                <table style="width:100%; border-collapse:collapse; font-size:12.5px; text-align:right;">
+                    <thead>
+                        <tr style="background:#f8f9fc; border-bottom:2px solid #e3e6f0; color:#555;">
+                            <th style="padding:7px 12px;">المصدر (source_module)</th>
+                            <th style="padding:7px 12px;">عدد القيود</th>
+                            <th style="padding:7px 12px;">الصافي (مدين−دائن) — تراكمي منذ البداية</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ($sec2_cash_actual_breakdown as $cab): $cab_amt = floatval($cab['net_amt']); ?>
+                        <tr style="border-bottom:1px solid #f1f1f1;">
+                            <td style="padding:6px 12px; font-family:monospace;"><?php echo htmlspecialchars($cab['src']); ?></td>
+                            <td style="padding:6px 12px; font-family:monospace; color:#888;"><?php echo intval($cab['cnt']); ?></td>
+                            <td style="padding:6px 12px; font-family:monospace; font-weight:bold; color:<?php echo $cab_amt >= 0 ? '#1a8f5f' : '#e74a3b'; ?>;"><?php echo number_format($cab_amt, 2); ?> ل.س</td>
+                        </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                    <tfoot>
+                        <tr style="background:#f8f9fc; border-top:2px solid #e3e6f0; font-weight:bold;">
+                            <td colspan="2" style="padding:7px 12px;">الإجمالي = رصيد الصندوق الآن</td>
+                            <td style="padding:7px 12px; font-family:monospace;"><?php echo number_format($sec2_cash_actual, 2); ?> ل.س</td>
+                        </tr>
+                    </tfoot>
+                </table>
+                <p style="font-size:11px; color:#999; margin-top:6px;"><i class="fas fa-info-circle"></i> موجب = صافي نقد دخل الصندوق من هذه الفئة تراكمياً (مثل تحصيل المبيعات). سالب = صافي نقد خرج (مصاريف، رواتب، شراء بضاعة، دفعات موردين، سحوبات مالك...). هذا الجدول <b>لا يتأثر بفلتر الفترة أعلاه إطلاقاً</b> — تراكمي من أول قيد في النظام وحتى اليوم، تماماً كبطاقة "كم يجب أن يبقى في الصندوق" نفسها.</p>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <div style="margin-top: 20px; padding: 15px 18px; background: #eafaf1; border: 2px solid #1a8f5f; border-radius: 8px;">
+            <div style="font-size: 13.5px; font-weight: bold; color: #1a5c3f; margin-bottom: 4px;"><i class="fas fa-coins"></i> الربح الفعلي (نقدي بحت) — حسب تعريفك بالضبط</div>
+            <div style="font-size: 11px; color: #1a5c3f; margin-bottom: 12px; line-height: 1.6;">الربح = الإيرادات (نقد دخل الصندوق فعلياً من فواتير بِيعت وسُلِّمت فقط) − كل ما صُرِف فعلياً من الصندوق ضمن نفس الفترة. لا COGS منفصلاً، لا تقييم مخزون، لا استحقاق محاسبي — تدفق نقدي صافٍ فقط، تماماً كما طلبت.</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px;">
+                <div style="background: white; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+                    <div style="color: #2c4e9c; font-size: 12.5px; font-weight: bold;" title="نقد دخل فعلياً لحساب الصندوق مصدره 'Sales' حصراً — تحصيل فاتورة بيع، فوراً أو لاحقاً">الإيرادات (نقد دخل الصندوق فعلياً)</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cash_revenue_pure, 2); ?> ل.س</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+                    <div style="color: #a33636; font-size: 12.5px; font-weight: bold;" title="كل نقد خرج فعلياً من الصندوق ضمن الفترة — شراء بضاعة، دفعات موردين، مصاريف، رواتب، عمولات مدفوعة، شحن. الاستثناء الوحيد: سحوبات المالك وسداد قروضه">كل ما صُرِف فعلياً</div>
+                    <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cash_spent_total, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">يستثني فقط سحوبات المالك وسداد القرض</div>
+                </div>
+                <div style="background: <?php echo $sec2_pure_cash_profit >= 0 ? '#1cc88a' : '#e74a3b'; ?>; border-right: 4px solid <?php echo $sec2_pure_cash_profit >= 0 ? '#0e7a4c' : '#a33636'; ?>; padding: 15px; border-radius: 6px;">
+                    <div style="color: white; font-size: 12.5px; font-weight: bold;">= الربح الفعلي</div>
+                    <div style="font-size: 24px; font-weight: bold; color: white; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_pure_cash_profit, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: rgba(255,255,255,0.85); margin-top: 3px;">= الإيرادات النقدية − كل ما صُرِف</div>
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top: 20px; padding: 15px 18px; background: #f8f9fc; border: 1px dashed #c9cfe0; border-radius: 8px;">
+            <div style="font-size: 13px; font-weight: bold; color: #3a3b45; margin-bottom: 12px;"><i class="fas fa-handshake"></i> ربح يوزَّع على الشركاء (سلسلة حساب مستقلة، ضمن الفترة المحدَّدة أعلاه)</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px;">
+                <div style="background: white; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 6px;">
+                    <div style="color: #a33636; font-size: 12.5px; font-weight: bold;" title="رواتب، عمولات مدفوعة فعلياً، شحن، مصاريف تشغيلية — يستثني عمداً سحوبات المالك وسداد قروضه، وكذلك أي شراء بضاعة/دفعة مورد (تُمثَّلها COGS في البطاقة التالية، فلا تُحتسَب مرتين)">كل شيء خرج من الصندوق (تشغيلي، بلا شراء/موردين)</div>
+                    <div style="font-size: 19px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cash_out_operational, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">يستثني سحوبات المالك، سداد القرض، وكل شراء/دفعة مورد (تمثَّلها COGS أدناه بدلاً من ازدواج حسابها)</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #4e73df; padding: 15px; border-radius: 6px;">
+                    <div style="color: #2c4e9c; font-size: 12.5px; font-weight: bold;" title="الإيرادات − كل شيء خرج من الصندوق (تشغيلي)">المتبقي</div>
+                    <div style="font-size: 19px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_remaining_after_cashout, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">= الإيرادات − التشغيلي الخارج من الصندوق</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #a33636; padding: 15px; border-radius: 6px;">
+                    <div style="color: #a33636; font-size: 12.5px; font-weight: bold;">ثمن بضائع مباعة (COGS)</div>
+                    <div style="font-size: 19px; font-weight: bold; color: #a33636; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_cogs_syp, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">يُجنَّب من "المتبقي" لتغطية تكلفة ما بِيع</div>
+                </div>
+                <div style="background: <?php echo $sec2_distributable_profit >= 0 ? '#e8f8f2' : '#fdecea'; ?>; border-right: 4px solid <?php echo $sec2_distributable_profit >= 0 ? '#1cc88a' : '#e74a3b'; ?>; padding: 15px; border-radius: 6px;">
+                    <div style="color: #555; font-size: 12.5px; font-weight: bold;" title="= المتبقي − ثمن بضائع مباعة (COGS)">ربح يوزَّع على الشركاء</div>
+                    <div style="font-size: 22px; font-weight: bold; color: <?php echo $sec2_distributable_profit >= 0 ? '#1cc88a' : '#e74a3b'; ?>; font-family: monospace; margin-top: 5px;"><?php echo number_format($sec2_distributable_profit, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">= المتبقي − ثمن البضائع المباعة</div>
+                </div>
+            </div>
+            <p style="font-size: 11px; color: #999; margin: 12px 0 0;">
+                <i class="fas fa-info-circle"></i> هذا مؤشر عملي مبنيّ على طلبك تحديداً، وليس بنداً محاسبياً رسمياً (لن تجده في التقارير المالية). "الخارج من الصندوق" هنا يستثني عمداً كل شراء بضاعة ودفعة مورد (سواء فورية أو سداد دَين قديم/رصيد افتتاحي) — لأن COGS يمثّل تكلفة البضاعة المباعة فعلياً بدقة أكبر من قيمة الشراء أو السداد الخام (الذي قد يشمل مخزوناً لم يُبَع بعد أو ديوناً من فترات سابقة)، فتفادينا بذلك احتسابها مرتين.
+            </p>
+
+            <?php if (count($sec2_cashout_breakdown) > 0): ?>
+            <div style="margin-top:12px;">
+                <button type="button" onclick="var t=document.getElementById('sec2CashoutDetail'); t.style.display = t.style.display==='none' ? 'block' : 'none';" style="background:#eef1f9; color:#4e73df; border:none; padding:7px 14px; border-radius:5px; cursor:pointer; font-size:12.5px; font-weight:bold;">
+                    <i class="fas fa-list"></i> تفصيل "كل شيء خرج من الصندوق" حسب المصدر (<?php echo count($sec2_cashout_breakdown); ?> فئة)
+                </button>
+                <div id="sec2CashoutDetail" style="display:none; margin-top:10px; overflow-x:auto;">
+                    <table style="width:100%; border-collapse:collapse; font-size:12.5px; text-align:right;">
+                        <thead>
+                            <tr style="background:#f8f9fc; border-bottom:2px solid #e3e6f0; color:#555;">
+                                <th style="padding:7px 12px;">المصدر (source_module)</th>
+                                <th style="padding:7px 12px;">عدد القيود</th>
+                                <th style="padding:7px 12px;">المجموع (SYP)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($sec2_cashout_breakdown as $cob): ?>
+                            <tr style="border-bottom:1px solid #f1f1f1;">
+                                <td style="padding:6px 12px; font-family:monospace;"><?php echo htmlspecialchars($cob['src']); ?></td>
+                                <td style="padding:6px 12px; font-family:monospace; color:#888;"><?php echo intval($cob['cnt']); ?></td>
+                                <td style="padding:6px 12px; font-family:monospace; font-weight:bold; color:#e74a3b;"><?php echo number_format($cob['amt'], 2); ?> ل.س</td>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                        <tfoot>
+                            <tr style="background:#f8f9fc; border-top:2px solid #e3e6f0; font-weight:bold;">
+                                <td colspan="2" style="padding:7px 12px;">الإجمالي</td>
+                                <td style="padding:7px 12px; font-family:monospace;"><?php echo number_format($sec2_cash_out_operational, 2); ?> ل.س</td>
+                            </tr>
+                        </tfoot>
+                    </table>
+                    <p style="font-size:11px; color:#999; margin-top:6px;"><i class="fas fa-info-circle"></i> كل صف هنا هو مصدر القيد الفعلي (<code>source_module</code>) كما سجَّلته الوحدة التي رحَّلته — إذا رأيت فئة غير متوقَّعة هنا (كإرجاع نقدي لعميل مثلاً)، هذا بالضبط ما يفسِّر أي فرق عن توقّعك.</p>
+                </div>
+            </div>
+            <?php endif; ?>
+        </div>
+
+        <div style="margin-top: 20px; padding: 15px 18px; background: #f8f9fc; border: 1px dashed #c9cfe0; border-radius: 8px;">
+            <div style="font-size: 13px; font-weight: bold; color: #3a3b45; margin-bottom: 12px;"><i class="fas fa-route"></i> تسوية الربح مقابل الصندوق — "أين ذهبت الأرباح؟" (منذ بداية النظام، رصيد لحظي دائماً — لا يتأثر بفلتر الفترة أعلاه)</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+                <div style="background: white; border-right: 4px solid #1cc88a; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #1a8f5f; font-size: 12px; font-weight: bold;">صافي الربح المطلق</div>
+                    <div style="font-size: 17px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 4px;"><?php echo number_format($sec2_absolute_net_profit, 2); ?> ل.س</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #8b5cf6; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #5b3aa8; font-size: 12px; font-weight: bold;" title="سحوبات نهائية فقط، كل التاريخ (بلا فلتر فترة)">− سحوبات المالك (كل التاريخ)</div>
+                    <div style="font-size: 17px; font-weight: bold; color: #8b5cf6; font-family: monospace; margin-top: 4px;"><?php echo number_format($recon_owner_withdrawals_alltime, 2); ?> ل.س</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #e74a3b; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #a33636; font-size: 12px; font-weight: bold;" title="رصيد لحظي حالي">− دين المالك المستحق (الآن)</div>
+                    <div style="font-size: 17px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 4px;"><?php echo number_format($sec2_owner_loan_outstanding, 2); ?> ل.س</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #f6c23e; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #96751c; font-size: 12px; font-weight: bold;" title="بضاعة موجودة بالمخزون الآن ولم تُبَع بعد — مالها لم يُفقَد، بل تحوَّل من نقد لمخزون">− قيمة المخزون الحالي (بالتكلفة)</div>
+                    <div style="font-size: 17px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 4px;">$<?php echo number_format($recon_inventory_usd, 2); ?></div>
+                    <div style="font-size: 11px; color: #96751c; font-family: monospace; margin-top: 2px;"><?php echo number_format($recon_inventory_syp, 2); ?> ل.س</div>
+                </div>
+                <div style="background: white; border-right: 4px solid #6f42c1; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #4a2d8c; font-size: 12px; font-weight: bold;" title="بضاعة بِيعت (خرجت من المخزون) لكن لم تُسلَّم بعد — ثمنها لم يُحصَّل نقداً بعد فعلياً">− رأس مال مبيعات قيد التسليم</div>
+                    <div style="font-size: 17px; font-weight: bold; color: #6f42c1; font-family: monospace; margin-top: 4px;">$<?php echo number_format($recon_pending_capital_usd, 2); ?></div>
+                    <div style="font-size: 11px; color: #4a2d8c; font-family: monospace; margin-top: 2px;"><?php echo number_format($recon_pending_capital_syp, 2); ?> ل.س</div>
+                </div>
+                <div style="background: <?php echo abs($recon_gap_vs_ledger) < 100 ? '#e8f8f2' : '#fdecea'; ?>; border-right: 4px solid <?php echo abs($recon_gap_vs_ledger) < 100 ? '#1cc88a' : '#e74a3b'; ?>; padding: 12px 15px; border-radius: 6px;">
+                    <div style="color: #555; font-size: 12px; font-weight: bold;" title="صافي الربح المطلق − سحوبات المالك − دين المالك − قيمة المخزون − رأس مال قيد التسليم">= الصندوق المتوقَّع من التسوية</div>
+                    <div style="font-size: 18px; font-weight: bold; color: <?php echo abs($recon_gap_vs_ledger) < 100 ? '#1cc88a' : '#e74a3b'; ?>; font-family: monospace; margin-top: 4px;"><?php echo number_format($recon_expected_cash, 2); ?> ل.س</div>
+                    <div style="font-size: 10px; color: #888; margin-top: 3px;">قارنه برصيد الصندوق الفعلي أعلاه (<?php echo number_format($sec2_cash_actual, 2); ?> ل.س)</div>
+                </div>
+            </div>
+
+            <?php
+                // جدول توزيع نسبي: أين يقيم كل جزء من "صافي الربح المطلق" حالياً — يوضّح بشكل لا لبس فيه
+                // أن المخزون ورأس المال قيد التسليم "أموال مجمَّدة" (لم تُفقَد، ولا تُخصَم من الربح نفسه
+                // في أي مكان بلوحة التحكم) لا "خسارة"، تماماً كما طلب المستخدم توضيحه.
+                $recon_base = $sec2_absolute_net_profit > 0.01 ? $sec2_absolute_net_profit : 1;
+                $recon_rows = [
+                    ['label' => 'نقد فعلي في الصندوق الآن', 'value' => $sec2_cash_actual, 'color' => '#1cc88a', 'note' => 'متاح فوراً'],
+                    ['label' => 'مجمَّد في المخزون الحالي (بضاعة لم تُبَع بعد)', 'value' => $recon_inventory_syp, 'color' => '#f6c23e', 'note' => 'سيعود نقداً عند البيع'],
+                    ['label' => 'مجمَّد في مبيعات قيد التسليم (بِيعت، لم تُحصَّل بعد)', 'value' => $recon_pending_capital_syp, 'color' => '#6f42c1', 'note' => 'سيعود نقداً عند التسليم/التحصيل'],
+                    ['label' => 'سحوبات المالك (كل التاريخ)', 'value' => $recon_owner_withdrawals_alltime, 'color' => '#8b5cf6', 'note' => 'خرج نهائياً، لن يعود'],
+                    ['label' => 'دين المالك المستحق (الآن)', 'value' => $sec2_owner_loan_outstanding, 'color' => '#e74a3b', 'note' => 'سيعود عند السداد'],
+                ];
+            ?>
+            <div style="margin-top: 15px; background: white; border-radius: 6px; padding: 12px 15px; border: 1px solid #eee;">
+                <div style="font-size: 12px; font-weight: bold; color: #555; margin-bottom: 8px;">توزيع الربح المطلق (<?php echo number_format($sec2_absolute_net_profit, 2); ?> ل.س) — أين يقيم كل جزء منه الآن</div>
+                <?php foreach ($recon_rows as $rr): $pct = ($rr['value'] / $recon_base) * 100; ?>
+                <div style="margin-bottom: 8px;">
+                    <div style="display:flex; justify-content:space-between; font-size:11.5px; color:#555; margin-bottom:3px;">
+                        <span><?php echo $rr['label']; ?> <span style="color:#aaa; font-size:10px;">(<?php echo $rr['note']; ?>)</span></span>
+                        <span style="font-family:monospace; font-weight:bold;"><?php echo number_format($rr['value'], 2); ?> ل.س — <?php echo number_format($pct, 1); ?>٪</span>
+                    </div>
+                    <div style="background:#f1f1f1; border-radius:4px; height:8px; overflow:hidden;">
+                        <div style="background:<?php echo $rr['color']; ?>; width:<?php echo max(0, min(100, $pct)); ?>%; height:100%;"></div>
+                    </div>
+                </div>
+                <?php endforeach; ?>
+                <p style="font-size: 10.5px; color: #999; margin: 8px 0 0;">
+                    <i class="fas fa-info-circle"></i> المخزون ورأس مال المبيعات قيد التسليم <b>أموال مجمَّدة لا خسارة</b> — لا تُخصَم من "صافي الأرباح" ولا "صافي الربح المطلق" في أي بطاقة بلوحة التحكم، وستتحوَّل لنقد فعلي تلقائياً فور بيع المخزون أو تسليم/تحصيل المبيعات المعلَّقة.
+                </p>
+            </div>
+            <p style="font-size: 11px; color: #999; margin: 12px 0 0; line-height: 1.7;">
+                <i class="fas fa-info-circle"></i> <b>كيف تقرأ هذا القسم:</b> الفرق بين "الصندوق المتوقَّع من التسوية" هنا ورصيد "كم يجب أن يبقى في الصندوق الآن" أعلاه
+                (<?php $g = $recon_gap_vs_ledger; ?>
+                <?php if (abs($g) < 100): ?>
+                    متطابقان تقريباً (فرق <?php echo number_format(abs($g), 2); ?> ل.س فقط) — النظام المحاسبي متّسق داخلياً بالكامل.
+                <?php else: ?>
+                    <b>غير متطابقَين (فرق <?php echo number_format(abs($g), 2); ?> ل.س)</b> — يعني وجود قيد محاسبي ناقص أو مكرَّر في مكان ما (تحقق من القيود اليدوية أو التعديلات المباشرة على قاعدة البيانات).
+                <?php endif; ?>)
+                هو أول شيء تتحقق منه. <b>أما الفرق بين هذا الرقم والنقد الفعلي المعدود يدوياً في الدرج، فلا يستطيع أي حساب برمجي تفسيره</b> — إما مصروف حقيقي لم يُسجَّل في النظام إطلاقاً، أو خطأ عد، أو نقص فعلي. الطريقة الوحيدة لتحديد متى نشأ الفرق بالضبط: افتح <a href="daily_closing.php" style="color:#4e73df;">الإقفال اليومي</a> وراجعه يوماً بيوم بدءاً من 29/08/2026 (يوم بدء العمل)، وقارن الرصيد الختامي المتوقَّع لكل يوم بما كان موجوداً فعلياً في الدرج في نهايته — اليوم الذي يظهر فيه أول فرق هو مكان المشكلة بالضبط.
+            </p>
         </div>
         <p style="font-size: 11.5px; color: #999; margin: 12px 0 0;">
             <i class="fas fa-info-circle"></i> ملاحظة: "دفعات الموردين" هنا حركة نقدية فعلية (سداد التزام سابق)، وليست مصروفاً محاسبياً بالمعنى الدقيق (لا تُحتسَب في "صافي الربح" الرسمي بالقوائم المالية) — أُدرِجت هنا بناءً على طلبك لتحليل التدفق النقدي الفعلي فقط. "سحوبات المالك" أيضاً ليست مصروف تشغيل (توزيع أرباح)، ولذلك لا تُخصَم من "صافي الأرباح" نفسه — فقط من بطاقة "صافي الربح بعد سحوبات الملّاك" المستقلة.
@@ -914,9 +1603,9 @@ try {
             <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
                 <div style="color: #856404; font-size: 12px; font-weight: bold;">قطع مُسلَّمة مقابل قيد الانتظار (ضمن الفترة)</div>
                 <div style="font-size: 16px; font-weight: bold; color: #1cc88a; font-family: monospace; margin-top: 5px;">مُسلَّمة: <?php echo rtrim(rtrim(number_format($sec3_delivered_qty, 2), '0'), '.'); ?></div>
-                <div style="font-size: 12px; color: #666; font-family: monospace; margin-right: 10px;">القيمة: <?php echo number_format($sec3_sold_value_syp, 2); ?> ل.س (≈ $<?php echo number_format($sec3_sold_value_usd, 2); ?>)</div>
+                <div style="font-size: 12px; color: #666; font-family: monospace; margin-right: 10px;" title="تكلفة رأس المال (COGS)، لا سعر البيع">القيمة (تكلفة): <?php echo number_format($sec3_sold_value_syp, 2); ?> ل.س (≈ $<?php echo number_format($sec3_sold_value_usd, 2); ?>)</div>
                 <div style="font-size: 16px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 8px;">قيد الانتظار: <?php echo rtrim(rtrim(number_format($sec3_pending_qty, 2), '0'), '.'); ?></div>
-                <div style="font-size: 12px; color: #666; font-family: monospace; margin-right: 10px;">القيمة: <?php echo number_format($sec3_pending_value_syp, 2); ?> ل.س (≈ $<?php echo number_format($sec3_pending_value_usd, 2); ?>)</div>
+                <div style="font-size: 12px; color: #666; font-family: monospace; margin-right: 10px;" title="تكلفة رأس المال (COGS)، لا سعر البيع">القيمة (تكلفة): <?php echo number_format($sec3_pending_value_syp, 2); ?> ل.س (≈ $<?php echo number_format($sec3_pending_value_usd, 2); ?>)</div>
             </div>
 
         </div>
@@ -927,32 +1616,17 @@ try {
             <i class="fas fa-th-large"></i> نظرة عامة شاملة على النظام
         </h3>
 
-        <!-- شريط تنقّل أسبوعي مستقل (سبت -> خميس) خاص بهذا القسم فقط — أرصدة "الآن" (المخزون/الموردين/المندوبين) لا تتأثر به -->
-        <div class="no-print" style="background: #f8f9fc; border: 1px solid #edf0f7; border-radius: 8px; padding: 10px 15px; margin: 15px 0; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-            <a href="?<?php echo http_build_query(array_merge($_GET, ['ov_ref' => $ov_prev_week_ref, 'ov_all' => null])); ?>" style="text-decoration:none; background:#eef1f9; color:#4e73df; padding:6px 12px; border-radius:5px; font-weight:bold; font-size:12.5px;">
-                <i class="fas fa-chevron-right"></i> الأسبوع السابق
-            </a>
-            <div style="font-weight:bold; color:#333; font-size:13px;">
-                <?php if ($ov_view_all): ?>
-                    كل الأوقات
-                <?php else: ?>
-                    من <span style="font-family:monospace; color:#2e59d9;"><?php echo htmlspecialchars($ov_week_start); ?></span> (سبت)
-                    إلى <span style="font-family:monospace; color:#2e59d9;"><?php echo htmlspecialchars($ov_week_end); ?></span> (خميس)
-                <?php endif; ?>
-            </div>
-            <a href="?<?php echo http_build_query(array_merge($_GET, ['ov_ref' => $ov_next_week_ref, 'ov_all' => null])); ?>" style="text-decoration:none; background:#eef1f9; color:#4e73df; padding:6px 12px; border-radius:5px; font-weight:bold; font-size:12.5px;">
-                الأسبوع التالي <i class="fas fa-chevron-left"></i>
-            </a>
-            <a href="?<?php echo http_build_query(array_merge($_GET, ['ov_ref' => date('Y-m-d'), 'ov_all' => null])); ?>" style="text-decoration:none; background:#eafaf1; color:#1a8f5f; padding:6px 12px; border-radius:5px; font-weight:bold; font-size:12.5px;">الأسبوع الحالي</a>
-            <form method="GET" style="display:flex; align-items:center; gap:6px;">
-                <?php foreach ($_GET as $k => $v) { if ($k !== 'ov_ref' && $k !== 'ov_all') echo '<input type="hidden" name="' . htmlspecialchars($k) . '" value="' . htmlspecialchars($v) . '">'; } ?>
-                <input type="date" name="ov_ref" value="<?php echo htmlspecialchars($ov_ref_date); ?>" style="padding:6px; border:1px solid #ccc; border-radius:4px; font-family:monospace; font-size:12.5px;">
-                <button type="submit" style="background:#4e73df; color:white; border:none; padding:6px 14px; border-radius:5px; cursor:pointer; font-size:12.5px; font-weight:bold;">اذهب</button>
-            </form>
-            <a href="?<?php echo http_build_query(array_merge($_GET, ['ov_all' => $ov_view_all ? null : '1'])); ?>" style="text-decoration:none; margin-right:auto; background:<?php echo $ov_view_all ? '#4e73df' : '#f1f3f9'; ?>; color:<?php echo $ov_view_all ? '#fff' : '#4e73df'; ?>; padding:6px 14px; border-radius:5px; font-weight:bold; font-size:12.5px;">
-                <?php echo $ov_view_all ? 'العودة للعرض الأسبوعي' : 'عرض كل الأوقات'; ?>
-            </a>
-        </div>
+        <!-- فلتر مستقل بتاريخ من-إلى خاص بهذا القسم فقط (ويشترك معه قسما "مؤشرات مالية إضافية" و"صافي
+        حركة الموردين" أدناه) — أرصدة "الآن" (المخزون/الموردين/المندوبين) لا تتأثر به، فهي رصيد لحظي دائماً -->
+        <form method="GET" style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 15px 0; background: #f8f9fc; border: 1px solid #edf0f7; border-radius: 8px; padding: 10px 15px;">
+            <?php foreach ($_GET as $k => $v) { if (strpos($k, 'ov_') !== 0) echo '<input type="hidden" name="' . htmlspecialchars($k) . '" value="' . htmlspecialchars($v) . '">'; } ?>
+            <label style="font-size: 13px; font-weight: bold; color: #555;">من:</label>
+            <input type="date" name="ov_start" value="<?php echo htmlspecialchars($ov_start); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <label style="font-size: 13px; font-weight: bold; color: #555;">إلى:</label>
+            <input type="date" name="ov_end" value="<?php echo htmlspecialchars($ov_end); ?>" style="padding: 6px; border: 1px solid #ccc; border-radius: 4px; font-family: monospace; font-size: 13px;">
+            <button type="submit" style="background: #4e73df; color: white; border: none; padding: 7px 16px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold;">تطبيق</button>
+            <span style="font-size: 12.5px; color: #888; margin-right: auto;">يشمل: نظرة عامة شاملة + مؤشرات مالية إضافية + صافي حركة الموردين</span>
+        </form>
 
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 15px; margin-top: 15px;">
 
@@ -1073,10 +1747,10 @@ try {
         <p style="font-size: 11px; color: #999; margin: 12px 0 0;"><i class="fas fa-info-circle"></i> كل بطاقة تفتح صفحة الوحدة المرتبطة بها مباشرةً للاطلاع على التفاصيل الكاملة. البطاقات المُعلَّمة بـ"الآن" أرصدة لحظية لا تتأثر بالفلتر الأسبوعي أعلاه؛ المُعلَّمة بـ"الفترة" تتبع الأسبوع المختار.</p>
     </div>
 
-    <!-- مؤشرات مالية إضافية ضمن نفس الفترة الأسبوعية المختارة أعلاه -->
+    <!-- مؤشرات مالية إضافية ضمن نفس فترة "من-إلى" المختارة أعلاه في قسم النظرة الشاملة -->
     <div id="section-financial-extra" style="background: white; padding: 20px; border-radius: 8px; border: 1px solid #e3e6f0; box-shadow: 0 0.15rem 1rem 0 rgba(58,59,69,0.08); margin-bottom: 25px;">
         <h3 style="margin-top: 0; color: #3a3b45; font-size: 16px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
-            <i class="fas fa-coins"></i> مؤشرات مالية إضافية <span style="font-size:11.5px; color:#999; font-weight:normal;">(<?php echo $ov_view_all ? 'كل الأوقات' : $ov_week_start . ' إلى ' . $ov_week_end; ?>)</span>
+            <i class="fas fa-coins"></i> مؤشرات مالية إضافية <span style="font-size:11.5px; color:#999; font-weight:normal;">(<?php echo htmlspecialchars($ov_from) . ' إلى ' . htmlspecialchars($ov_to); ?>)</span>
         </h3>
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 15px; margin-top: 15px;">
             <div style="background: #fff8e6; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 6px;">
@@ -1142,14 +1816,30 @@ try {
         </div>
     </div>
 
-    <!-- صافي حركة الفترة لكل مورد على حدة، ضمن نفس الفترة المختارة أعلاه لقسم "نظرة عامة شاملة على النظام" -->
+    <!-- صافي حركة الفترة لكل مورد على حدة — فلتر واحد موحَّد لكل الأعمدة (يومي/أسبوعي سبت-خميس) -->
     <div id="section-supplier-movement" style="background: white; padding: 20px; border-radius: 8px; border: 1px solid #e3e6f0; box-shadow: 0 0.15rem 1rem 0 rgba(58,59,69,0.08); margin-bottom: 25px;">
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
             <h3 style="margin: 0; color: #3a3b45; font-size: 16px;">
-                <i class="fas fa-truck"></i> صافي حركة الفترة لكل مورد <span style="font-size:11.5px; color:#999; font-weight:normal;">(<?php echo $ov_view_all ? 'كل الأوقات' : $ov_week_start . ' إلى ' . $ov_week_end; ?>)</span>
+                <i class="fas fa-truck"></i> صافي حركة الفترة لكل مورد <span style="font-size:11.5px; color:#999; font-weight:normal;">(<?php echo htmlspecialchars($smv_start) . ' إلى ' . htmlspecialchars($smv_end); ?>)</span>
             </h3>
             <input type="text" id="ovSupplierSearch" onkeyup="filterOvSuppliers()" placeholder="بحث عن مورد..." style="padding:7px 12px; border:1px solid #ccc; border-radius:5px; font-size:13px; min-width:200px;">
         </div>
+
+        <!-- فلتر موحَّد للجدول كاملاً: يومي / أسبوعي سبت-خميس -->
+        <div style="display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
+            <span style="font-size:12.5px; color:#777; font-weight:bold;">فلتر الجدول:</span>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['smv_filter_type' => 'daily'])); ?>" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $smv_filter_type === 'daily' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $smv_filter_type === 'daily' ? '#fff' : '#e74a3b'; ?>;">يومي</span>
+            </a>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['smv_filter_type' => 'weekly'])); ?>" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $smv_filter_type === 'weekly' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $smv_filter_type === 'weekly' ? '#fff' : '#e74a3b'; ?>;">أسبوعي (سبت-خميس)</span>
+            </a>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['smv_filter_type' => 'monthly'])); ?>" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $smv_filter_type === 'monthly' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $smv_filter_type === 'monthly' ? '#fff' : '#e74a3b'; ?>;">شهري</span>
+            </a>
+            <span style="font-size:11.5px; color:#999;">(<?php echo htmlspecialchars($smv_start) . ' إلى ' . htmlspecialchars($smv_end); ?>)</span>
+        </div>
+
         <?php if (count($ov_supplier_rows) > 0): ?>
         <div style="overflow-x:auto; margin-top:12px;">
             <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
@@ -1157,9 +1847,11 @@ try {
                     <tr style="background: #f8f9fc; border-bottom: 2px solid #e3e6f0; color: #555;">
                         <th style="padding: 8px 15px;">المورد</th>
                         <th style="padding: 8px 15px; color:#e74a3b;">المشتريات (الفترة)</th>
+                        <th style="padding: 8px 15px; color:#6f42c1;" title="نسبة مشتريات هذا المورد من إجمالي مشتريات كل الموردين ضمن نفس الفترة">نسبة الشراء</th>
                         <th style="padding: 8px 15px; color:#1cc88a;">المدفوعات (الفترة)</th>
                         <th style="padding: 8px 15px; color:#f6c23e;">المردودات/الخصم (الفترة)</th>
                         <th style="padding: 8px 15px; color:#2e59d9;">صافي حركة الفترة</th>
+                        <th style="padding: 8px 15px; color:#a33636;" title="تكلفة البضائع المباعة المُسلَّمة فعلياً ضمن نفس فلتر الجدول — منسوبة لمورّد الدفعة الفعلي">COGS مُسلَّمة (<?php echo $smv_filter_type === 'daily' ? 'اليوم' : ($smv_filter_type === 'monthly' ? 'الشهر' : 'الأسبوع'); ?>)</th>
                         <th style="padding: 8px 15px; text-align:center;">إجراء</th>
                     </tr>
                 </thead>
@@ -1168,9 +1860,11 @@ try {
                         <tr style="border-bottom: 1px solid #f1f1f1;" data-name="<?php echo htmlspecialchars(mb_strtolower($osr['name'])); ?>">
                             <td style="padding: 8px 15px; font-weight: 600;"><?php echo htmlspecialchars($osr['name']); ?></td>
                             <td style="padding: 8px 15px; font-family: monospace; color:#e74a3b;">$<?php echo number_format($osr['purchases'], 2); ?></td>
+                            <td style="padding: 8px 15px; font-family: monospace; color:#6f42c1;"><?php echo number_format($osr['purchase_share_pct'], 1); ?>٪</td>
                             <td style="padding: 8px 15px; font-family: monospace; color:#1cc88a;">$<?php echo number_format($osr['payments'], 2); ?></td>
                             <td style="padding: 8px 15px; font-family: monospace; color:#f6c23e;">$<?php echo number_format($osr['returns'], 2); ?></td>
                             <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color:#2e59d9;">$<?php echo number_format($osr['net'], 2); ?></td>
+                            <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color:#a33636;">$<?php echo number_format($osr['cogs_delivered'], 2); ?></td>
                             <td style="padding: 8px 15px; text-align:center;">
                                 <a href="supplier_view.php?id=<?php echo $osr['id']; ?>" style="background:#4e73df; color:white; padding:4px 12px; border-radius:4px; text-decoration:none; font-size:12px; font-weight:bold;">التفاصيل</a>
                             </td>
@@ -1179,6 +1873,7 @@ try {
                 </tbody>
             </table>
         </div>
+        <p style="font-size: 11px; color: #999; margin: 10px 0 0;"><i class="fas fa-info-circle"></i> كل أعمدة هذا الجدول (المشتريات، نسبة الشراء، المدفوعات، المردودات، صافي الحركة، وCOGS) مرتبطة الآن بفلتر واحد موحَّد أعلاه (يومي/أسبوعي سبت-خميس).</p>
         <p id="ovSupplierNoResults" style="display:none; padding: 20px; text-align: center; color: #777;">لا يوجد مورد مطابق للبحث.</p>
         <script>
             function filterOvSuppliers() {
@@ -1197,6 +1892,88 @@ try {
             <p style="padding: 20px; text-align: center; color: #777; margin-top:10px;">لا توجد حركة مسجَّلة لأي مورد ضمن الفترة المختارة.</p>
         <?php endif; ?>
         <p style="font-size: 11px; color: #999; margin: 12px 0 0;"><i class="fas fa-info-circle"></i> يُعرض هنا فقط الموردون الذين لديهم حركة فعلية (شراء/دفع/مردود) ضمن الفترة المختارة أعلاه. للرصيد التراكمي المستحق فعلياً لكل مورد، راجع <a href="suppliers.php" style="color:#4e73df; font-weight:bold;">صفحة الموردين</a>.</p>
+    </div>
+
+    <!-- جدول المندوبين — بناءً على طلب صريح من المستخدم: فلتر مستقل تماماً عن قسم الموردين -->
+    <div id="section-rep-movement" style="background: white; padding: 20px; border-radius: 8px; border: 1px solid #e3e6f0; box-shadow: 0 0.15rem 1rem 0 rgba(58,59,69,0.08); margin-bottom: 25px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; border-bottom: 1px solid #eee; padding-bottom: 10px;">
+            <h3 style="margin: 0; color: #3a3b45; font-size: 16px;">
+                <i class="fas fa-user-tie"></i> المندوبون <span style="font-size:11.5px; color:#999; font-weight:normal;">(<?php echo htmlspecialchars($rmv_start) . ' إلى ' . htmlspecialchars($rmv_end); ?>)</span>
+            </h3>
+            <input type="text" id="ovRepSearch" onkeyup="filterOvReps()" placeholder="بحث عن مندوب..." style="padding:7px 12px; border:1px solid #ccc; border-radius:5px; font-size:13px; min-width:200px;">
+        </div>
+
+        <!-- فلتر مستقل خاص بهذا القسم وحده — بلا أي صلة بفلتر جدول الموردين -->
+        <div style="display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;">
+            <span style="font-size:12.5px; color:#777; font-weight:bold;">فلتر المندوبين:</span>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['rmv_filter_type' => 'daily'])); ?>#section-rep-movement" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $rmv_filter_type === 'daily' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $rmv_filter_type === 'daily' ? '#fff' : '#e74a3b'; ?>;">يومي</span>
+            </a>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['rmv_filter_type' => 'weekly'])); ?>#section-rep-movement" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $rmv_filter_type === 'weekly' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $rmv_filter_type === 'weekly' ? '#fff' : '#e74a3b'; ?>;">أسبوعي (سبت-خميس)</span>
+            </a>
+            <a href="?<?php echo http_build_query(array_merge($_GET, ['rmv_filter_type' => 'monthly'])); ?>#section-rep-movement" style="text-decoration: none;">
+                <span style="padding: 5px 14px; border-radius: 5px; font-size: 12.5px; font-weight: bold; background: <?php echo $rmv_filter_type === 'monthly' ? '#e74a3b' : '#f1f3f9'; ?>; color: <?php echo $rmv_filter_type === 'monthly' ? '#fff' : '#e74a3b'; ?>;">شهري</span>
+            </a>
+            <span style="font-size:11.5px; color:#999;">(<?php echo htmlspecialchars($rmv_start) . ' إلى ' . htmlspecialchars($rmv_end); ?>)</span>
+        </div>
+
+        <?php if (count($ov_rep_rows) > 0): ?>
+        <div style="overflow-x:auto; margin-top:12px;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13.5px; text-align: right;">
+                <thead>
+                    <tr style="background: #f8f9fc; border-bottom: 2px solid #e3e6f0; color: #555;">
+                        <th style="padding: 8px 15px;">المندوب</th>
+                        <th style="padding: 8px 15px; color:#f6c23e;" title="تراكمي كامل منذ البداية، لا مرتبط بفلتر الفترة">صافي الرصيد المستحق</th>
+                        <th style="padding: 8px 15px; color:#6f42c1;" title="حصته من إجمالي مبيعات النظام (كل المندوبين + بلا مندوب) خلال الفترة، صافياً بعد المرتجع من الطرفين">نسبته من إجمالي مبيعاتك</th>
+                        <th style="padding: 8px 15px; color:#4e73df;">عدد القطع المباعة (صافٍ)</th>
+                        <th style="padding: 8px 15px; color:#e74a3b;">عدد الفواتير المرتجعة</th>
+                        <th style="padding: 8px 15px; text-align:center;">إجراء</th>
+                    </tr>
+                </thead>
+                <tbody id="ovRepTbody">
+                    <?php foreach ($ov_rep_rows as $rr): ?>
+                        <tr style="border-bottom: 1px solid #f1f1f1;" data-name="<?php echo htmlspecialchars(mb_strtolower($rr['name'])); ?>">
+                            <td style="padding: 8px 15px; font-weight: 600;"><?php echo htmlspecialchars($rr['name']); ?></td>
+                            <td style="padding: 8px 15px; font-family: monospace; font-weight: bold; color:#f6c23e;"><?php echo number_format($rr['net_balance'], 2); ?> ل.س</td>
+                            <td style="padding: 8px 15px; font-family: monospace; color:#6f42c1;"><?php echo number_format($rr['share_pct'], 1); ?>٪</td>
+                            <td style="padding: 8px 15px; font-family: monospace; color:#4e73df;"><?php echo rtrim(rtrim(number_format($rr['net_qty'], 2), '0'), '.'); ?></td>
+                            <td style="padding: 8px 15px; font-family: monospace; color:<?php echo $rr['returned_invoices_count'] > 0 ? '#e74a3b' : '#888'; ?>;"><?php echo intval($rr['returned_invoices_count']); ?></td>
+                            <td style="padding: 8px 15px; text-align:center;">
+                                <a href="representative_profile.php?id=<?php echo intval($rr['id']); ?>" style="background:#4e73df; color:white; padding:4px 12px; border-radius:4px; text-decoration:none; font-size:12px; font-weight:bold;">التفاصيل</a>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+                <tfoot>
+                    <tr style="background: #f8f9fc; border-top: 2px solid #e3e6f0; font-weight: bold;">
+                        <td style="padding: 8px 15px;">الإجمالي</td>
+                        <td style="padding: 8px 15px; font-family: monospace; color:#f6c23e;"><?php echo number_format($ov_rep_totals['net_balance'], 2); ?> ل.س</td>
+                        <td style="padding: 8px 15px; font-family: monospace; color:#6f42c1;"><?php echo number_format($ov_rep_totals['share_pct'], 1); ?>٪</td>
+                        <td style="padding: 8px 15px; font-family: monospace; color:#4e73df;"><?php echo rtrim(rtrim(number_format($ov_rep_totals['net_qty'], 2), '0'), '.'); ?></td>
+                        <td style="padding: 8px 15px; font-family: monospace; color:#e74a3b;"><?php echo intval($ov_rep_totals['returned_invoices_count']); ?></td>
+                        <td style="padding: 8px 15px;"></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+        <p id="ovRepNoResults" style="display:none; padding: 20px; text-align: center; color: #777;">لا يوجد مندوب مطابق للبحث.</p>
+        <script>
+            function filterOvReps() {
+                var q = document.getElementById('ovRepSearch').value.trim().toLowerCase();
+                var rows = document.querySelectorAll('#ovRepTbody tr');
+                var visibleCount = 0;
+                rows.forEach(function (row) {
+                    var match = !q || row.getAttribute('data-name').indexOf(q) !== -1;
+                    row.style.display = match ? '' : 'none';
+                    if (match) visibleCount++;
+                });
+                document.getElementById('ovRepNoResults').style.display = visibleCount === 0 ? 'block' : 'none';
+            }
+        </script>
+        <?php else: ?>
+            <p style="padding: 20px; text-align: center; color: #777; margin-top:10px;">لا يوجد مندوب له رصيد مستحق أو حركة مبيعات ضمن الفترة المختارة.</p>
+        <?php endif; ?>
     </div>
 
     <?php if (count($supplier_priority_list) > 0): ?>

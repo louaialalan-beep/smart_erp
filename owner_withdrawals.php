@@ -61,6 +61,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_withdrawal'])) {
             ");
             $current_cash = floatval($stmt_cash_bal->fetchColumn());
 
+            // حماية من تكرار الإرسال: نفس المبلغ ونفس التاريخ ونفس النوع خلال آخر 5 ثوانٍ = رفض فوري.
+            if (isRecentDuplicateSubmission($conn, 'owner_withdrawals', [
+                'withdrawal_date' => $w_date,
+                'amount_syp' => $w_amount,
+                'withdrawal_type' => $w_type,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             $conn->prepare("INSERT INTO owner_withdrawals (withdrawal_date, amount_syp, notes, withdrawal_type) VALUES (?, ?, ?, ?)")
                  ->execute([$w_date, $w_amount, $w_notes, $w_type]);
             $withdrawal_id = $conn->lastInsertId();
@@ -345,7 +354,7 @@ try {
             <div style="background: #eaf1fc; color: #2c4e9c; padding: 8px 10px; border-radius: 5px; font-size: 12px; margin-bottom: 15px;">
                 الرصيد النقدي الحالي: <strong><?php echo number_format($current_cash_display, 2); ?> ل.س</strong>
             </div>
-            <form method="POST">
+            <form method="POST" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
                 <?php csrfField(); ?>
                 <input type="hidden" name="add_withdrawal" value="1">
                 <div style="margin-bottom: 12px;">

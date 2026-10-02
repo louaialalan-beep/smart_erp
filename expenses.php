@@ -86,6 +86,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_expense'])) {
         try {
             $conn->beginTransaction();
 
+            // حماية من تكرار الإرسال: نفس الفئة، نفس المبلغ، نفس التاريخ خلال آخر 5 ثوانٍ = رفض فوري.
+            if (isRecentDuplicateSubmission($conn, 'operational_expenses', [
+                'category' => $category,
+                'amount' => $amount,
+                'expense_date' => $expense_date,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             $stmt = $conn->prepare("INSERT INTO operational_expenses (category, amount, cost_center, expense_date, notes) VALUES (?, ?, ?, ?, ?)");
             $stmt->execute([$category, $amount, $cost_center, $expense_date, $notes]);
             $expense_id = $conn->lastInsertId();
@@ -671,7 +680,7 @@ try {
             <h3 style="margin: 0; color: #e74a3b;"><i class="fas fa-receipt"></i> تسجيل مصروف تشغيلي نقدي</h3>
             <button onclick="closeExpModal()" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
         </div>
-        <form method="POST">
+        <form method="POST" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
 <?php csrfField(); ?>
             <input type="hidden" name="add_expense" value="1">
             <div style="margin-bottom: 12px;">

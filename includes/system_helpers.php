@@ -30,6 +30,45 @@ if (!function_exists('getPeriodLockErrorMessage')) {
     }
 }
 
+if (!function_exists('isRecentDuplicateSubmission')) {
+    /**
+     * حماية باك-إند من تكرار الإرسال (Double Submission): تتحقق مما إذا كان قد أُدرِج صف مطابق تماماً
+     * لنفس الحقول المفتاحية (مبلغ + عميل/مورد/موظف + ...) في نفس الجدول خلال آخر $seconds ثوانٍ فقط.
+     * تُستدعى مباشرة قبل أي INSERT لحركة مالية جديدة (فاتورة بيع، فاتورة شراء، مصروف، دفعة مورد، سحب
+     * مالك، دفعة مندوب، سلفة/مسيّر رواتب). $conditions مصفوفة ['عمود' => قيمة] لكل الحقول المفتاحية التي
+     * يجب أن تتطابق بالضبط لاعتبار الصف تكراراً — لا تُدرِج عمود created_at أو id ضمنها.
+     * تعيد true فوراً إذا وُجِد تكرار (يجب حينها إيقاف العملية ورفضها)، أو false للسماح بالمتابعة.
+     */
+    function isRecentDuplicateSubmission($conn, $table, array $conditions, $seconds = 5) {
+        if (empty($conditions)) return false;
+        try {
+            $where = [];
+            $params = [];
+            foreach ($conditions as $col => $val) {
+                $where[] = "`$col` = ?";
+                $params[] = $val;
+            }
+            $params[] = $seconds;
+            $sql = "SELECT COUNT(*) FROM `$table` WHERE " . implode(' AND ', $where)
+                 . " AND created_at >= (NOW() - INTERVAL ? SECOND)";
+            $stmt = $conn->prepare($sql);
+            $stmt->execute($params);
+            return $stmt->fetchColumn() > 0;
+        } catch (Exception $e) {
+            // في حال تعذّر التحقق (مثلاً عمود created_at غير موجود بعد في جدول قديم)، لا نمنع العملية
+            // بصمت لسبب تقني غير متعلق بالتكرار الفعلي — أفضل من حجب عملية مشروعة بالخطأ.
+            return false;
+        }
+    }
+}
+
+if (!function_exists('getDuplicateSubmissionErrorMessage')) {
+    /** رسالة موحّدة تُعرض للمستخدم عند رفض عملية بسبب اكتشاف تكرار إرسال فوري (ضغطة مزدوجة على الحفظ). */
+    function getDuplicateSubmissionErrorMessage() {
+        return "تنبيه: تم رصد عملية مطابقة تماماً أُدخِلت للتو (خلال الثواني القليلة الماضية). إن كنت تقصد إدخال عمليتين منفصلتين بنفس القيم فعلاً، انتظر قليلاً ثم أعد المحاولة. إن كانت ضغطة مزدوجة غير مقصودة على زر الحفظ، لا حاجة لأي إجراء — العملية الأولى مُسجَّلة بالفعل ولم تُكرَّر.";
+    }
+}
+
 if (!function_exists('getCurrentUserName')) {
     /**
      * اسم المستخدم الحالي من الجلسة، مع محاولة عدة مفاتيح شائعة لأن اسم المتغير الفعلي في header.php غير موحّد،
@@ -174,10 +213,22 @@ if (!function_exists('findOrCreateAccount')) {
             foreach (['name', 'account_name', 'title', 'name_ar', 'acc_name'] as $c) {
                 if (in_array($c, $cols)) { $name_col = $c; break; }
             }
+            // === تصحيح جذري (خلل حقيقي مكتشَف بالبيانات الفعلية): كان البحث يطابق أي حساب يحتوي إحدى
+            // الكلمات المفتاحية في اسمه بغض النظر عن نوعه (account_type) — فكلمة عامة كـ"بضاعة" قد
+            // تطابق بالخطأ حساب ذمم مورد (Liability) اسمه يحوي هذه الكلمة، بدل إنشاء/استخدام حساب
+            // "المخزون" (Asset) المقصود فعلياً. النتيجة: قيود جرد مكتبي بأكملها تُرحَّل بصمت لحساب مورد
+            // غير ذي صلة إطلاقاً، فيُلوِّث رصيده وتقاريره دون أي تنبيه. الآن يُضاف شرط account_type لنفس
+            // استعلام البحث أيضاً (لا فقط عند الإنشاء) متى ما مُرِّر — فلا يُطابَق إلا حساب من النوع
+            // الصحيح فعلاً، حتى لو تشابه اسمه اتفاقاً مع حساب من نوع آخر تماماً.
             if ($name_col && count($keywords) > 0) {
                 $conditions = implode(' OR ', array_fill(0, count($keywords), "`{$name_col}` LIKE ?"));
                 $params = array_map(fn($k) => "%{$k}%", $keywords);
-                $stmt = $conn->prepare("SELECT id FROM accounts WHERE {$conditions} ORDER BY id ASC LIMIT 1");
+                $type_clause = '';
+                if ($account_type !== null && in_array('account_type', $cols)) {
+                    $type_clause = " AND account_type = ?";
+                    $params[] = $account_type;
+                }
+                $stmt = $conn->prepare("SELECT id FROM accounts WHERE ({$conditions}){$type_clause} ORDER BY id ASC LIMIT 1");
                 $stmt->execute($params);
                 $acc_id = $stmt->fetchColumn();
                 if ($acc_id) return $acc_id;
@@ -367,6 +418,23 @@ if (!function_exists('deferSaleRevenue')) {
             $conn->exec("UPDATE sales SET delivered_at = NULL WHERE id = " . intval($sale_id));
         } catch (Exception $e) { /* يُتجاهل إن كان العمود غير موجود بعد لأي سبب */ }
 
+        // تصحيح جوهري (خلل حقيقي مكتشَف بالبيانات الفعلية): إن كان قد سُجِّل مرتجع (جزئي أو كامل) على
+        // هذه الفاتورة بينما كانت لا تزال "مُسلَّمة" — فمعالج المرتجع نفسه سبق أن عكس جزءاً أو كل COGS
+        // (وربما العمولة) بقيده المستقل الخاص به (JE-RET-*). عكس القيد الأصلي بكامل مبلغه هنا، بلا خصم
+        // ما عكسه المرتجع مسبقاً، يُنتج **عكساً مزدوجاً**: COGS ينتهي برصيد سالب غير منطقي، والمخزون
+        // يُعاد له نفس القيمة مرتين رغم استرجاعها فعلياً مرة واحدة فقط عبر المرتجع. نفس مبدأ التصحيح
+        // المُطبَّق أصلاً في recognizeSaleRevenue بالضبط: نحسب "صافي ما تبقّى" بعد خصم كل مرتجع سابق، ولا
+        // نعكس إلا هذا الصافي فقط.
+        $stmt_prior_returns_cogs = $conn->prepare("
+            SELECT COALESCE(SUM(je.credit), 0)
+            FROM journal_entries je
+            JOIN accounts a ON je.account_id = a.id
+            WHERE je.entry_number IN (SELECT CONCAT('JE-RET-', sr.id) FROM sales_returns sr WHERE sr.sale_id = ?)
+              AND a.account_type = 'Expense'
+        ");
+        $stmt_prior_returns_cogs->execute([$sale_id]);
+        $already_reversed_cogs = floatval($stmt_prior_returns_cogs->fetchColumn());
+
         $today = date('Y-m-d');
         foreach (['-COGS', '-COMM', '-RECLASS'] as $suffix) {
             $entry_num = "JE-" . $sale['invoice_number'] . $suffix;
@@ -383,8 +451,256 @@ if (!function_exists('deferSaleRevenue')) {
 
             $desc = "عكس تلقائي عند إلغاء تأكيد تسليم فاتورة: " . $sale['invoice_number'];
             foreach ($lines as $line) {
-                postJournalLine($conn, $line['account_id'], floatval($line['credit']), floatval($line['debit']), $undo_num, $today, $desc, 'Delivery Reversal');
+                $undo_debit = floatval($line['credit']);
+                $undo_credit = floatval($line['debit']);
+                // تخصيص خصم صافي المرتجعات على قيد -COGS تحديداً فقط: نقلّص كلا الطرفين بنفس المقدار
+                // (المُعكوس مسبقاً عبر المرتجع) حتى يبقى القيد متوازناً بعد التصحيح.
+                if ($suffix === '-COGS' && $already_reversed_cogs > 0) {
+                    if ($undo_debit > 0) { $undo_debit = max(0, $undo_debit - $already_reversed_cogs); }
+                    if ($undo_credit > 0) { $undo_credit = max(0, $undo_credit - $already_reversed_cogs); }
+                }
+                if ($undo_debit == 0 && $undo_credit == 0) continue; // لا شيء متبقٍّ ليُعكَس لهذا السطر
+                postJournalLine($conn, $line['account_id'], $undo_debit, $undo_credit, $undo_num, $today, $desc, 'Delivery Reversal');
             }
         }
+    }
+}
+
+// ================================================================================
+// نظام تتبّع دفعات المخزون (Inventory Batches — FIFO حقيقي بمصدر ومورّد لكل وحدة)
+// بُني بناءً على طلب صريح من المستخدم بعد اكتشاف أن "تكلفة البضاعة المباعة" لمورد معيّن قد تتجاوز
+// إجمالي ما اشتُري منه فعلياً — سبب ذلك: نفس المنتج يُشترى أحياناً من أكثر من مورد بأسعار مختلفة، بينما
+// النظام كان يحتفظ بتكلفة واحدة "ممزوجة" فقط (products.cost_price_usd) لا تُميِّز مصدر كل وحدة.
+// من الآن: كل دفعة شراء (أو جرد مكتبي) دفعة مستقلة بتكلفتها ومورّدها وكميتها المتبقية، وكل بيع يستهلك
+// من أقدم دفعة متاحة أولاً (FIFO) — فتُنسَب تكلفة كل وحدة مباعة بدقة لمصدرها الحقيقي دائماً.
+// ================================================================================
+
+if (!function_exists('ensureInventoryBatchTables')) {
+    /**
+     * ينشئ جدولَي الدفعات واستهلاكها إن لم يكونا موجودين بعد — آمن للاستدعاء المتكرر من أي ملف.
+     * تصحيح جوهري: أوامر DDL (CREATE TABLE / ALTER TABLE) تُنفِّذ التزاماً ضمنياً (implicit commit) في
+     * MySQL حتى لو كان الجدول موجوداً بالفعل — فاستدعاء هذه الدالة مراراً من داخل حلقة ضمن معاملة صريحة
+     * (كما في سكربت الترحيل) كان يُنهي تلك المعاملة بصمت في منتصف الحلقة، فيفشل rollBack() لاحقاً بخطأ
+     * "there is no active transaction" بدل إظهار الخطأ الحقيقي. الآن تُنفَّذ أوامر DDL **مرة واحدة فقط**
+     * لكل طلب صفحة (متغيّر ثابت static)، بغض النظر عن عدد مرات استدعاء هذه الدالة.
+     */
+    function ensureInventoryBatchTables($conn) {
+        static $already_ensured = false;
+        if ($already_ensured) return;
+        $already_ensured = true;
+        try {
+            $conn->exec("CREATE TABLE IF NOT EXISTS inventory_batches (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                product_id INT NOT NULL,
+                source_type VARCHAR(30) NOT NULL,
+                source_ref VARCHAR(150),
+                source_item_id INT NULL,
+                supplier_id INT NULL,
+                unit_cost_usd DECIMAL(15,4) NOT NULL,
+                quantity_received DECIMAL(15,4) NOT NULL,
+                quantity_remaining DECIMAL(15,4) NOT NULL,
+                batch_date DATE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_product_id (product_id),
+                INDEX idx_supplier_id (supplier_id),
+                INDEX idx_batch_date (batch_date),
+                INDEX idx_source_item (source_item_id)
+            )");
+            $conn->exec("CREATE TABLE IF NOT EXISTS sale_item_batch_consumption (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                sale_item_id INT NOT NULL,
+                batch_id INT NOT NULL,
+                quantity_consumed DECIMAL(15,4) NOT NULL,
+                unit_cost_usd DECIMAL(15,4) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_sale_item_id (sale_item_id),
+                INDEX idx_batch_id (batch_id)
+            )");
+            // ترحيل آمن: إن كان الجدول قد أُنشئ سابقاً (قبل إضافة عمود الربط الدقيق source_item_id)، يُضاف
+            // الآن دون أي خطأ إن كان موجوداً بالفعل.
+            try {
+                $ib_cols = $conn->query("SHOW COLUMNS FROM inventory_batches")->fetchAll(PDO::FETCH_COLUMN);
+                if (!in_array('source_item_id', $ib_cols)) {
+                    $conn->exec("ALTER TABLE inventory_batches ADD COLUMN source_item_id INT NULL, ADD INDEX idx_source_item (source_item_id)");
+                }
+            } catch (Exception $e) { /* يُتجاهل إن تعذّر */ }
+        } catch (Exception $e) { /* تُعتَمد على وجود صلاحية CREATE TABLE؛ تُتجاهل بصمت إن تعذّر */ }
+    }
+}
+
+if (!function_exists('createInventoryBatch')) {
+    /**
+     * يُسجِّل دفعة مخزون جديدة (من فاتورة شراء أو جرد مكتبي). يُستدعى فور أي إدخال كمية جديدة للمخزون.
+     * $source_type: 'Purchase' أو 'OfficeInventory'. $supplier_id يُترَك NULL للجرد المكتبي.
+     * $source_item_id: معرّف السطر المصدر (purchase_invoice_items.id مثلاً) — يسمح بتحديث هذه الدفعة
+     * بدقة لاحقاً إن عُدِّلت الفاتورة الأصلية، بدل خلق دفعة مكرِّرة أو ترك القديمة عالقة بلا تحديث.
+     */
+    function createInventoryBatch($conn, $product_id, $source_type, $source_ref, $supplier_id, $unit_cost_usd, $quantity, $batch_date, $source_item_id = null) {
+        ensureInventoryBatchTables($conn);
+        if ($quantity <= 0) return null;
+        $stmt = $conn->prepare("
+            INSERT INTO inventory_batches (product_id, source_type, source_ref, source_item_id, supplier_id, unit_cost_usd, quantity_received, quantity_remaining, batch_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ");
+        $stmt->execute([$product_id, $source_type, $source_ref, $source_item_id, $supplier_id, $unit_cost_usd, $quantity, $quantity, $batch_date]);
+        return $conn->lastInsertId();
+    }
+}
+
+if (!function_exists('updateInventoryBatchForEditedPurchase')) {
+    /**
+     * يُحدِّث دفعة مخزون قائمة عند تعديل فاتورة شراء (بدل إنشاء دفعة مكرِّرة أو ترك القديمة بتكلفة/كمية
+     * خاطئة). يُطابِق الدفعة عبر source_item_id (معرّف سطر فاتورة الشراء الأصلي) — إن لم توجد دفعة مطابقة
+     * (فاتورة قديمة سابقة لتفعيل هذا النظام)، يُنشئ دفعة جديدة بدل الفشل بصمت.
+     * $new_quantity الكمية الجديدة الكاملة للسطر (لا الفرق) — تُحدَّث quantity_received لها، وتُعدَّل
+     * quantity_remaining بنفس مقدار الفرق فقط (حفاظاً على ما استُهلِك منها فعلياً عبر مبيعات سابقة).
+     */
+    function updateInventoryBatchForEditedPurchase($conn, $purchase_invoice_item_id, $product_id, $supplier_id, $new_unit_cost_usd, $new_quantity, $batch_date, $source_ref) {
+        ensureInventoryBatchTables($conn);
+        $stmt = $conn->prepare("SELECT id, quantity_received, quantity_remaining FROM inventory_batches WHERE source_type = 'Purchase' AND source_item_id = ?");
+        $stmt->execute([$purchase_invoice_item_id]);
+        $batch = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$batch) {
+            // لا دفعة مرتبطة (فاتورة أُنشئت قبل تفعيل نظام الدفعات) — تُنشأ الآن بدل تجاهل التعديل بصمت.
+            createInventoryBatch($conn, $product_id, 'Purchase', $source_ref, $supplier_id, $new_unit_cost_usd, $new_quantity, $batch_date, $purchase_invoice_item_id);
+            return;
+        }
+
+        $qty_delta = $new_quantity - floatval($batch['quantity_received']);
+        $new_remaining = max(0, floatval($batch['quantity_remaining']) + $qty_delta);
+        $conn->prepare("
+            UPDATE inventory_batches
+            SET product_id = ?, supplier_id = ?, unit_cost_usd = ?, quantity_received = ?, quantity_remaining = ?, batch_date = ?
+            WHERE id = ?
+        ")->execute([$product_id, $supplier_id, $new_unit_cost_usd, $new_quantity, $new_remaining, $batch_date, $batch['id']]);
+    }
+}
+
+if (!function_exists('consumeInventoryBatchesFIFO')) {
+    /**
+     * يستهلك كمية معيّنة من منتج عبر دفعاته المتاحة بترتيب الأقدم أولاً (FIFO)، ويُسجِّل كل استهلاك
+     * (قد يمتد لأكثر من دفعة واحدة إن نفدت الأقدم أثناء تلبية الكمية). يُعيد التكلفة الموزونة للوحدة
+     * (لتخزينها في sale_items.cost_price_usd_at_sale كما كان سابقاً — توافقاً كاملاً مع كل تقرير قائم
+     * يقرأ هذا الحقل، بلا الحاجة لتعديل أي تقرير آخر). إن لم تكفِ الدفعات المسجَّلة (بيانات قبل تفعيل هذا
+     * النظام، أو نقص فعلي)، يُستكمَل الفارق من `products.cost_price_usd` الحالي كـ"دفعة تراثية" (Legacy)
+     * بلا مورّد محدَّد — فلا ينكسر أي بيع قديم، ويبقى التقرير الجديد يعمل جنباً لجنب مع البيانات السابقة.
+     */
+    function consumeInventoryBatchesFIFO($conn, $product_id, $quantity_needed, $sale_item_id) {
+        ensureInventoryBatchTables($conn);
+        $quantity_needed = floatval($quantity_needed);
+        if ($quantity_needed <= 0) return 0;
+
+        $stmt = $conn->prepare("
+            SELECT id, quantity_remaining, unit_cost_usd
+            FROM inventory_batches
+            WHERE product_id = ? AND quantity_remaining > 0
+            ORDER BY batch_date ASC, id ASC
+            FOR UPDATE
+        ");
+        try { $stmt->execute([$product_id]); }
+        catch (Exception $e) { $stmt = $conn->prepare("SELECT id, quantity_remaining, unit_cost_usd FROM inventory_batches WHERE product_id = ? AND quantity_remaining > 0 ORDER BY batch_date ASC, id ASC"); $stmt->execute([$product_id]); }
+        $batches = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $remaining_to_consume = $quantity_needed;
+        $total_cost = 0;
+        foreach ($batches as $batch) {
+            if ($remaining_to_consume <= 0.00001) break;
+            $take = min($remaining_to_consume, floatval($batch['quantity_remaining']));
+            if ($take <= 0) continue;
+
+            $conn->prepare("UPDATE inventory_batches SET quantity_remaining = quantity_remaining - ? WHERE id = ?")
+                 ->execute([$take, $batch['id']]);
+            $conn->prepare("INSERT INTO sale_item_batch_consumption (sale_item_id, batch_id, quantity_consumed, unit_cost_usd) VALUES (?, ?, ?, ?)")
+                 ->execute([$sale_item_id, $batch['id'], $take, $batch['unit_cost_usd']]);
+
+            $total_cost += $take * floatval($batch['unit_cost_usd']);
+            $remaining_to_consume -= $take;
+        }
+
+        // فارق غير مُغطّى بأي دفعة مسجَّلة (بيانات تراثية قبل هذا النظام، أو نقص فعلي في تسجيل الشراء) —
+        // يُستكمَل من التكلفة الحالية الممزوجة القديمة، ويُسجَّل كـ"دفعة تراثية" افتراضية بلا مورّد، حتى
+        // يبقى مجموع الكمية المُستهلَكة والتكلفة الموزونة صحيحاً دائماً مهما كانت حالة البيانات القديمة.
+        if ($remaining_to_consume > 0.00001) {
+            $stmt_p = $conn->prepare("SELECT cost_price_usd FROM products WHERE id = ?");
+            $stmt_p->execute([$product_id]);
+            $legacy_cost = floatval($stmt_p->fetchColumn());
+            $legacy_batch_id = createInventoryBatch($conn, $product_id, 'Legacy', 'رصيد سابق قبل تفعيل نظام الدفعات', null, $legacy_cost, $remaining_to_consume, date('Y-m-d'));
+            if ($legacy_batch_id) {
+                $conn->prepare("UPDATE inventory_batches SET quantity_remaining = 0 WHERE id = ?")->execute([$legacy_batch_id]);
+                $conn->prepare("INSERT INTO sale_item_batch_consumption (sale_item_id, batch_id, quantity_consumed, unit_cost_usd) VALUES (?, ?, ?, ?)")
+                     ->execute([$sale_item_id, $legacy_batch_id, $remaining_to_consume, $legacy_cost]);
+                $total_cost += $remaining_to_consume * $legacy_cost;
+            }
+        }
+
+        return $quantity_needed > 0 ? ($total_cost / $quantity_needed) : 0;
+    }
+}
+
+if (!function_exists('reduceInventoryBatchForPurchaseReturn')) {
+    /**
+     * يُنقِص دفعة مخزون عند إرجاع كمية منها لمورّد (لا استهلاك بيع، بل تصحيح دائم لما استُلِم فعلياً من
+     * تلك الدفعة). يُطابِق الدفعة عبر source_item_id (معرّف سطر فاتورة الشراء الأصلي). يُنقِص كلاً من
+     * الكمية المستلمة والمتبقية بنفس المقدار — بخلاف بيع عادي، هذه الكمية لن تعود للمخزون مطلقاً.
+     */
+    function reduceInventoryBatchForPurchaseReturn($conn, $purchase_invoice_item_id, $quantity_returned) {
+        ensureInventoryBatchTables($conn);
+        $quantity_returned = floatval($quantity_returned);
+        if ($quantity_returned <= 0) return;
+        $stmt = $conn->prepare("SELECT id, quantity_received, quantity_remaining FROM inventory_batches WHERE source_type = 'Purchase' AND source_item_id = ?");
+        $stmt->execute([$purchase_invoice_item_id]);
+        $batch = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$batch) return; // لا دفعة مرتبطة (فاتورة سابقة لتفعيل هذا النظام) — لا شيء لتصحيحه هنا
+
+        $new_received = max(0, floatval($batch['quantity_received']) - $quantity_returned);
+        $new_remaining = max(0, floatval($batch['quantity_remaining']) - $quantity_returned);
+        $conn->prepare("UPDATE inventory_batches SET quantity_received = ?, quantity_remaining = ? WHERE id = ?")
+             ->execute([$new_received, $new_remaining, $batch['id']]);
+    }
+}
+
+if (!function_exists('restoreInventoryBatchForReturn')) {
+    /**
+     * يعكس استهلاك دفعات مخزون لسطر بيع معيّن عند إرجاع كمية منه — يُعيد الكمية للدفعة/الدفعات التي
+     * استُهلِكت منها أصلاً، بترتيب عكسي (الأحدث استهلاكاً أولاً LIFO-reversal، الأقرب تقنياً لواقع أي
+     * إرجاع فعلي). يُعيد أيضاً التكلفة الموزونة للكمية المُرجَعة تحديداً (لاستخدامها في قيد عكس COGS).
+     */
+    function restoreInventoryBatchForReturn($conn, $sale_item_id, $quantity_returned) {
+        ensureInventoryBatchTables($conn);
+        $quantity_returned = floatval($quantity_returned);
+        if ($quantity_returned <= 0) return 0;
+
+        $stmt = $conn->prepare("
+            SELECT id, batch_id, quantity_consumed, unit_cost_usd
+            FROM sale_item_batch_consumption
+            WHERE sale_item_id = ?
+            ORDER BY id DESC
+        ");
+        $stmt->execute([$sale_item_id]);
+        $consumptions = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $remaining_to_restore = $quantity_returned;
+        $total_cost = 0;
+        foreach ($consumptions as $c) {
+            if ($remaining_to_restore <= 0.00001) break;
+            $restore_qty = min($remaining_to_restore, floatval($c['quantity_consumed']));
+            if ($restore_qty <= 0) continue;
+
+            $conn->prepare("UPDATE inventory_batches SET quantity_remaining = quantity_remaining + ? WHERE id = ?")
+                 ->execute([$restore_qty, $c['batch_id']]);
+
+            if ($restore_qty >= floatval($c['quantity_consumed']) - 0.00001) {
+                $conn->prepare("DELETE FROM sale_item_batch_consumption WHERE id = ?")->execute([$c['id']]);
+            } else {
+                $conn->prepare("UPDATE sale_item_batch_consumption SET quantity_consumed = quantity_consumed - ? WHERE id = ?")
+                     ->execute([$restore_qty, $c['id']]);
+            }
+
+            $total_cost += $restore_qty * floatval($c['unit_cost_usd']);
+            $remaining_to_restore -= $restore_qty;
+        }
+
+        return $quantity_returned > 0 ? ($total_cost / $quantity_returned) : 0;
     }
 }

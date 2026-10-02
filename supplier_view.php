@@ -153,6 +153,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_payment'])) {
         try {
             $conn->beginTransaction();
 
+            // حماية من تكرار الإرسال: نفس المورد ونفس المبلغ بالدولار بالضبط خلال آخر 5 ثوانٍ = رفض فوري.
+            if (isRecentDuplicateSubmission($conn, 'supplier_payments', [
+                'supplier_id' => $supplier_id,
+                'amount_usd' => $amount_usd,
+                'payment_date' => $payment_date,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             $stmt = $conn->prepare("INSERT INTO supplier_payments (supplier_id, amount_usd, payment_date, notes) VALUES (?, ?, ?, ?)");
             $stmt->execute([$supplier_id, $amount_usd, $payment_date, $notes]);
             $payment_id = $conn->lastInsertId();
@@ -295,7 +304,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_discount'])) {
             $existing_cols_d = $stmt_cols_d->fetchAll(PDO::FETCH_COLUMN);
 
             $debit_id_d  = findOrCreateAccount($conn, ['مورد', 'payable'], 'ذمم الموردين', 'Liability');
-            $credit_id_d = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Expense');
+            $credit_id_d = findOrCreateAccount($conn, ['خصومات مكتسبة', 'خصم موردين'], 'خصومات مكتسبة من الموردين', 'Asset');
 
             if ($debit_id_d && $credit_id_d) {
                 $entry_num_d = "JE-SDISC-" . $discount_id;
@@ -641,26 +650,52 @@ $item_stats['total_pieces_returned'] = floatval($returned_stats['total_pieces_re
 $item_stats['total_pieces_returned_value'] = floatval($returned_stats['total_pieces_returned_value']);
 
 // (2) تكلفة البضائع المباعة (COGS) — للأصناف المُسلَّمة فعلياً حصراً (مصروف حقيقي مُرحَّل بالفعل)
+// تصحيح جوهري نهائي (بعد اكتشاف أن نفس المنتج قد يُشترى من أكثر من مورد بأسعار مختلفة): لم يعد الاستعلام
+// يعتمد على products.supplier_id (حقل واحد قابل للتغيير لكل منتج، لا يُميِّز مصدر كل وحدة تحديداً) — بل
+// على inventory_batches.supplier_id (مورّد الدفعة الفعلي التي استُهلِكت منها كل وحدة مباعة بترتيب FIFO).
+// هذا يضمن رياضياً ألا تتجاوز COGS لأي مورد إجمالي ما اشتُري منه فعلياً أبداً، مهما تعدَّدت مصادر المنتج.
+// رجوع تلقائي للمنهجية القديمة (بمنتج ثابت المورد) فقط للبيانات السابقة لتفعيل نظام الدفعات (لا سجل
+// استهلاك دفعات لها إطلاقاً)، حتى لا ينقطع أي رقم تاريخي بسبب هذا التحديث.
 $stmt_cogs_delivered = $conn->prepare("
-    SELECT COALESCE(SUM(si.quantity * si.cost_price_usd_at_sale), 0)
-    FROM sale_items si
-    INNER JOIN sales s ON si.sale_id = s.id
-    INNER JOIN products p ON si.product_id = p.id
-    WHERE p.supplier_id = ? AND s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+    SELECT COALESCE(SUM(v), 0) FROM (
+        SELECT sibc.quantity_consumed * sibc.unit_cost_usd AS v
+        FROM sale_item_batch_consumption sibc
+        JOIN inventory_batches ib ON sibc.batch_id = ib.id
+        JOIN sale_items si ON sibc.sale_item_id = si.id
+        JOIN sales s ON si.sale_id = s.id
+        WHERE ib.supplier_id = ? AND s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+        UNION ALL
+        SELECT (si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.cost_price_usd_at_sale AS v
+        FROM sale_items si
+        JOIN sales s ON si.sale_id = s.id
+        JOIN products p ON si.product_id = p.id
+        WHERE p.supplier_id = ? AND s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?
+          AND NOT EXISTS (SELECT 1 FROM sale_item_batch_consumption sibc2 WHERE sibc2.sale_item_id = si.id)
+    ) t
 ");
-$stmt_cogs_delivered->execute([$supplier_id, $stat_from, $stat_to]);
+$stmt_cogs_delivered->execute([$supplier_id, $stat_from, $stat_to, $supplier_id, $stat_from, $stat_to]);
 $cogs_delivered = floatval($stmt_cogs_delivered->fetchColumn());
 
 // (3) تكلفة البضائع المباعة (COGS) قيد الانتظار — أصناف بِيعت لكن لم تُسلَّم بعد (تقديرية، لم تُرحَّل
-// كمصروف حقيقي بعد في اليومية، تُعرَض فقط للاطلاع المسبق)
+// كمصروف حقيقي بعد في اليومية، تُعرَض فقط للاطلاع المسبق) — نفس منهجية الدفعات الهجينة أعلاه بالضبط.
 $stmt_cogs_pending = $conn->prepare("
-    SELECT COALESCE(SUM(si.quantity * si.cost_price_usd_at_sale), 0)
-    FROM sale_items si
-    INNER JOIN sales s ON si.sale_id = s.id
-    INNER JOIN products p ON si.product_id = p.id
-    WHERE p.supplier_id = ? AND s.delivery_status IN ('Pending', 'Deferred') AND s.invoice_date BETWEEN ? AND ?
+    SELECT COALESCE(SUM(v), 0) FROM (
+        SELECT sibc.quantity_consumed * sibc.unit_cost_usd AS v
+        FROM sale_item_batch_consumption sibc
+        JOIN inventory_batches ib ON sibc.batch_id = ib.id
+        JOIN sale_items si ON sibc.sale_item_id = si.id
+        JOIN sales s ON si.sale_id = s.id
+        WHERE ib.supplier_id = ? AND s.delivery_status IN ('Pending', 'Deferred') AND s.invoice_date BETWEEN ? AND ?
+        UNION ALL
+        SELECT si.quantity * si.cost_price_usd_at_sale AS v
+        FROM sale_items si
+        JOIN sales s ON si.sale_id = s.id
+        JOIN products p ON si.product_id = p.id
+        WHERE p.supplier_id = ? AND s.delivery_status IN ('Pending', 'Deferred') AND s.invoice_date BETWEEN ? AND ?
+          AND NOT EXISTS (SELECT 1 FROM sale_item_batch_consumption sibc2 WHERE sibc2.sale_item_id = si.id)
+    ) t
 ");
-$stmt_cogs_pending->execute([$supplier_id, $stat_from, $stat_to]);
+$stmt_cogs_pending->execute([$supplier_id, $stat_from, $stat_to, $supplier_id, $stat_from, $stat_to]);
 $cogs_pending = floatval($stmt_cogs_pending->fetchColumn());
 
 // جلب قائمة المنتجات المرتبطة بهذا المورد — مع ترقيم صفحات (10 لكل صفحة) وفلتر "المتوفر بالمخزون فقط"
@@ -1387,7 +1422,7 @@ $stmt_week_ret = $stmt_week_ret_q->fetch(PDO::FETCH_ASSOC);
             <button onclick="togglePaymentModal(false)" style="background: none; border: none; font-size: 20px; cursor: pointer; color: #888;">&times;</button>
         </div>
 
-        <form method="POST" action="">
+        <form method="POST" action="" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
 <?php csrfField(); ?>
             <input type="hidden" name="add_payment" value="1">
 

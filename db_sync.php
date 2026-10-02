@@ -5,7 +5,7 @@
  */
 
 $host = 'localhost';
-$db   = 'my_new_erp_db'; // اسم قاعدة البيانات الخاصة بك
+$db   = 'vnrd_erp_db'; // اسم قاعدة البيانات الخاصة بك
 $user = 'root';
 $pass = '';
 $charset = 'utf8mb4';

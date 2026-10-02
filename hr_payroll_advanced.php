@@ -147,6 +147,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_advance'])) {
             $conn->beginTransaction();
             $monthly_installment = round($total_amount / $installments_count, 2);
 
+            // حماية من تكرار الإرسال: نفس الموظف ونفس المبلغ ونفس عدد الأقساط خلال آخر 5 ثوانٍ = رفض فوري.
+            if (isRecentDuplicateSubmission($conn, 'employee_advances', [
+                'employee_id' => $employee_id,
+                'total_amount' => $total_amount,
+                'installments_count' => $installments_count,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             $stmt = $conn->prepare("INSERT INTO employee_advances (employee_id, total_amount, installments_count, monthly_installment, start_month, notes) VALUES (?, ?, ?, ?, ?, ?)");
             $stmt->execute([$employee_id, $total_amount, $installments_count, $monthly_installment, $start_month, $notes]);
             $advance_id = $conn->lastInsertId();
@@ -1032,7 +1041,7 @@ $total_penalties_shown = array_sum(array_map(fn($v) => $v['item_type'] === 'pena
 <div id="advanceModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
     <div style="background: white; width: 450px; padding: 25px; border-radius: 8px;">
         <h3 style="margin-top: 0; color: #f6c23e;">منح سلفة مقسطة</h3>
-        <form method="POST">
+        <form method="POST" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
 <?php csrfField(); ?>
             <input type="hidden" name="add_advance" value="1">
             <div style="margin-bottom: 10px;">

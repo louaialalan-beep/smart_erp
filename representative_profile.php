@@ -53,6 +53,15 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_payment'])) {
         try {
             $conn->beginTransaction();
 
+            // حماية من تكرار الإرسال: نفس المندوب ونفس المبلغ ونفس التاريخ خلال آخر 5 ثوانٍ = رفض فوري.
+            if (isRecentDuplicateSubmission($conn, 'representative_payments', [
+                'representative_id' => $rep_id,
+                'amount_syp' => $amount_syp,
+                'payment_date' => $payment_date,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
             $stmt = $conn->prepare("INSERT INTO representative_payments (representative_id, amount_syp, notes, payment_date) VALUES (?, ?, ?, ?)");
             $stmt->execute([$rep_id, $amount_syp, $notes, $payment_date]);
             $payment_id = $conn->lastInsertId();
@@ -170,6 +179,58 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_payment'])) {
     }
 }
 
+// 1ج. معالجة تسجيل خصم/جزاء يُطرَح من رصيد عمولة المندوب المستحقة (خطأ، تأخير، مخالفة...) — بناءً على
+// طلب صريح من المستخدم. يُخفِّض الخصم الالتزام تجاه المندوب فعلياً (مدين "عمولات المندوبين المستحقة")،
+// ويُقابَل بدائن على حساب "جزاءات وخصومات المندوبين" (Revenue) — نفس منهجية "جزاءات وخصومات الموظفين"
+// المُعتمَدة أصلاً في النظام لهذا النوع تحديداً من الحركات، للاتساق الكامل معها.
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_deduction'])) {
+    requireRole($conn, ['admin', 'accountant']);
+    $ded_amount = filter_var($_POST['deduction_amount_syp'] ?? 0, FILTER_VALIDATE_FLOAT);
+    $ded_date   = $_POST['deduction_date'] ?? date('Y-m-d');
+    $ded_reason = trim($_POST['deduction_reason'] ?? '');
+
+    if ($ded_amount <= 0) {
+        $error = "مبلغ الخصم غير صالح.";
+    } elseif (empty($ded_reason)) {
+        $error = "سبب الخصم مطلوب (خطأ، تأخير، مخالفة...) — للتوثيق ولظهوره في كشف حساب المندوب.";
+    } elseif (isDateInClosedPeriod($conn, $ded_date)) {
+        $error = getPeriodLockErrorMessage($ded_date);
+    } else {
+        try {
+            $conn->beginTransaction();
+
+            if (isRecentDuplicateSubmission($conn, 'representative_transactions', [
+                'representative_id' => $rep_id,
+                'amount' => $ded_amount,
+                'transaction_date' => $ded_date,
+            ])) {
+                throw new Exception(getDuplicateSubmissionErrorMessage());
+            }
+
+            $stmt = $conn->prepare("INSERT INTO representative_transactions (representative_id, transaction_type, amount, notes, transaction_date) VALUES (?, 'deduction', ?, ?, ?)");
+            $stmt->execute([$rep_id, $ded_amount, $ded_reason, $ded_date]);
+            $deduction_id = $conn->lastInsertId();
+
+            $debit_account_id  = findOrCreateAccount($conn, ['عمولات', 'مندوب'], 'عمولات المندوبين المستحقة', 'Liability');
+            $credit_account_id = findOrCreateAccount($conn, ['جزاءات وخصومات المندوبين', 'جزاءات مندوب'], 'جزاءات وخصومات المندوبين', 'Revenue');
+
+            if ($debit_account_id && $credit_account_id) {
+                $entry_num = "JE-RDED-" . $deduction_id;
+                $journal_desc = "خصم/جزاء من عمولة المندوب: " . $rep['name'] . " — السبب: " . $ded_reason;
+                postJournalLine($conn, $debit_account_id, $ded_amount, 0, $entry_num, $ded_date, $journal_desc, 'Representative Deduction');
+                postJournalLine($conn, $credit_account_id, 0, $ded_amount, $entry_num, $ded_date, $journal_desc, 'Representative Deduction');
+            }
+
+            $conn->commit();
+            $msg = "تم تسجيل الخصم وترحيل القيد المحاسبي بنجاح!";
+            logAudit($conn, 'INSERT', 'خصومات المندوبين', "خصم بقيمة " . number_format($ded_amount, 2) . " ل.س من المندوب: " . $rep['name'] . " — " . $ded_reason, $deduction_id);
+        } catch (Exception $e) {
+            if ($conn->inTransaction()) { $conn->rollBack(); }
+            $error = "خطأ أثناء تسجيل الخصم: " . $e->getMessage();
+        }
+    }
+}
+
 // 2. معالجة تغيير حالة التسليم سريعاً (لتفعيل قاعدة الترحيل الذكي للعمولات)
 // تصحيح أمني: تحوَّل من رابط GET (عرضة لهجوم CSRF عبر مجرد النقر على رابط خارجي) إلى نموذج POST محمي بالرمز السري
 // القيم يجب أن تطابق تعريف ENUM الفعلي في جدول sales: 'Delivered' / 'Pending' / 'Deferred'
@@ -221,8 +282,52 @@ $stmt_pay = $conn->prepare("SELECT COALESCE(SUM(amount_syp), 0) FROM representat
 $stmt_pay->execute([$rep_id]);
 $total_payments_made = $stmt_pay->fetchColumn();
 
-// صافي الرصيد / الذمة لصالح المندوب (العمولات المحققة ناقص الدفعات المسددة)
-$net_balance = $total_earned_commissions - $total_payments_made;
+// إجمالي الخصومات/الجزاءات المُسجَّلة على المندوب
+$stmt_ded = $conn->prepare("SELECT COALESCE(SUM(amount), 0) FROM representative_transactions WHERE representative_id = ? AND transaction_type = 'deduction'");
+$stmt_ded->execute([$rep_id]);
+$total_deductions = $stmt_ded->fetchColumn();
+
+// صافي الرصيد / الذمة لصالح المندوب (العمولات المحققة ناقص الدفعات المسددة وناقص أي خصومات/جزاءات)
+$net_balance = $total_earned_commissions - $total_payments_made - $total_deductions;
+
+// إحصائيات فترة اختيارية (نفس فكرة ملف العميل): عدد القطع الصافي التي باعها هذا المندوب، نسبتها من
+// إجمالي مبيعات النظام كله (كل المندوبين + بلا مندوب) خلال نفس الفترة (صافٍ إلى صافٍ)، والقطع المُرجَعة
+// من مبيعاته ونسبتها. لا تؤثر على أي بطاقة أخرى في الصفحة.
+$period_from = trim($_GET['period_from'] ?? '');
+$period_to = trim($_GET['period_to'] ?? '');
+if ($period_from === '' || $period_to === '') {
+    $period_from = date('Y-m-01');
+    $period_to = date('Y-m-d');
+}
+
+$stmt_rep_period = $conn->prepare("
+    SELECT
+        COALESCE(SUM(si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)), 0) AS net_qty,
+        COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.unit_price_syp), 0) AS net_value_syp,
+        COALESCE(SUM(COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)), 0) AS returned_qty,
+        COALESCE(SUM(COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0) * si.unit_price_syp), 0) AS returned_value_syp
+    FROM sale_items si
+    INNER JOIN sales s ON si.sale_id = s.id
+    WHERE s.representative_id = ?
+      AND ((s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?)
+           OR (s.delivery_status != 'Delivered' AND s.invoice_date BETWEEN ? AND ?))
+");
+$stmt_rep_period->execute([$rep_id, $period_from, $period_to, $period_from, $period_to]);
+$rep_period_stats = $stmt_rep_period->fetch(PDO::FETCH_ASSOC);
+
+$stmt_rep_total_sales = $conn->prepare("
+    SELECT COALESCE(SUM((si.quantity - COALESCE((SELECT SUM(sri.quantity) FROM sales_return_items sri WHERE sri.sale_item_id = si.id), 0)) * si.unit_price_syp), 0) AS total_value_syp
+    FROM sale_items si
+    INNER JOIN sales s ON si.sale_id = s.id
+    WHERE (s.delivery_status = 'Delivered' AND COALESCE(s.delivered_at, s.invoice_date) BETWEEN ? AND ?)
+       OR (s.delivery_status != 'Delivered' AND s.invoice_date BETWEEN ? AND ?)
+");
+$stmt_rep_total_sales->execute([$period_from, $period_to, $period_from, $period_to]);
+$rep_period_stats['system_total_value_syp'] = floatval($stmt_rep_total_sales->fetchColumn());
+$rep_period_stats['rep_share_pct'] = $rep_period_stats['system_total_value_syp'] > 0
+    ? ($rep_period_stats['net_value_syp'] / $rep_period_stats['system_total_value_syp']) * 100 : 0;
+$rep_period_stats['return_pct'] = ($rep_period_stats['net_qty'] + $rep_period_stats['returned_qty']) > 0
+    ? ($rep_period_stats['returned_qty'] / ($rep_period_stats['net_qty'] + $rep_period_stats['returned_qty'])) * 100 : 0;
 
 // === فلتر تاريخ + حالة تسليم + بحث (لفواتير المندوب وسجل دفعاته) ===
 $filter_start = $_GET['filter_start'] ?? '';
@@ -265,11 +370,11 @@ $payments_list = $stmt_payments_log->fetchAll(PDO::FETCH_ASSOC);
 // مع رصيد تراكمي. نجلب كل الحركات (بدون فلتر تاريخ) لحساب "الرصيد الافتتاحي" الصحيح لما قبل بداية
 // الفلتر، ثم نعرض فقط الحركات الواقعة ضمن الفلتر المُطبَّق أعلاه (نفس آلية كشوف الحساب البنكية).
 // ============================================================
-$stmt_ledger_earn = $conn->prepare("SELECT invoice_date AS event_date, id AS src_id, invoice_number AS ref, total_commissions AS amount FROM sales WHERE representative_id = ? AND delivery_status = 'Delivered' AND total_commissions > 0");
+$stmt_ledger_earn = $conn->prepare("SELECT invoice_date AS event_date, id AS src_id, invoice_number AS ref, total_commissions AS amount, customer_name FROM sales WHERE representative_id = ? AND delivery_status = 'Delivered' AND total_commissions > 0");
 $stmt_ledger_earn->execute([$rep_id]);
 $ledger_earn = $stmt_ledger_earn->fetchAll(PDO::FETCH_ASSOC);
 
-$stmt_ledger_rev = $conn->prepare("SELECT sr.return_date AS event_date, sr.id AS src_id, s.invoice_number AS ref, sr.total_commission_reversed AS amount FROM sales_returns sr INNER JOIN sales s ON sr.sale_id = s.id WHERE s.representative_id = ? AND sr.total_commission_reversed > 0");
+$stmt_ledger_rev = $conn->prepare("SELECT sr.return_date AS event_date, sr.id AS src_id, s.invoice_number AS ref, sr.total_commission_reversed AS amount, s.customer_name FROM sales_returns sr INNER JOIN sales s ON sr.sale_id = s.id WHERE s.representative_id = ? AND sr.total_commission_reversed > 0");
 $stmt_ledger_rev->execute([$rep_id]);
 $ledger_rev = $stmt_ledger_rev->fetchAll(PDO::FETCH_ASSOC);
 
@@ -279,13 +384,13 @@ $ledger_pay = $stmt_ledger_pay->fetchAll(PDO::FETCH_ASSOC);
 
 $statement_entries = [];
 foreach ($ledger_earn as $r) {
-    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'earn', 'label' => 'استحقاق عمولة - فاتورة ' . $r['ref'], 'due' => floatval($r['amount']), 'settled' => 0];
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'earn', 'label' => 'استحقاق عمولة - فاتورة ' . $r['ref'], 'customer_name' => $r['customer_name'], 'due' => floatval($r['amount']), 'settled' => 0];
 }
 foreach ($ledger_rev as $r) {
-    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'reversal', 'label' => 'عكس عمولة (مرتجع) - فاتورة ' . $r['ref'], 'due' => 0, 'settled' => floatval($r['amount'])];
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'reversal', 'label' => 'عكس عمولة (مرتجع) - فاتورة ' . $r['ref'], 'customer_name' => $r['customer_name'], 'due' => 0, 'settled' => floatval($r['amount'])];
 }
 foreach ($ledger_pay as $r) {
-    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'payment', 'label' => 'دفعة نقدية مسددة' . (!empty($r['ref']) ? ' - ' . $r['ref'] : ''), 'due' => 0, 'settled' => floatval($r['amount'])];
+    $statement_entries[] = ['date' => $r['event_date'], 'src_id' => (int)$r['src_id'], 'type' => 'payment', 'label' => 'دفعة نقدية مسددة' . (!empty($r['ref']) ? ' - ' . $r['ref'] : ''), 'customer_name' => '', 'due' => 0, 'settled' => floatval($r['amount'])];
 }
 
 usort($statement_entries, function ($a, $b) {
@@ -327,6 +432,9 @@ $statement_closing_balance = $statement_running_balance;
         <button onclick="openPaymentModal()" style="background: #4e73df; color: white; padding: 10px 18px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
             <i class="fas fa-money-bill-wave"></i> تسجيل دفعة نقدية
         </button>
+        <button onclick="openDeductionModal()" style="background: #e74a3b; color: white; padding: 10px 18px; border-radius: 6px; border: none; cursor: pointer; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <i class="fas fa-minus-circle"></i> تسجيل خصم/جزاء
+        </button>
         <a href="sales.php" style="background: #1cc88a; color: white; padding: 10px 18px; border-radius: 6px; text-decoration: none; font-weight: bold; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: inline-flex; align-items: center; gap: 6px;">
             <i class="fas fa-file-invoice-dollar"></i> إصدار فاتورة مبيعات جديدة
         </a>
@@ -345,7 +453,7 @@ $statement_closing_balance = $statement_running_balance;
 <?php endif; ?>
 
 <!-- لوحة المندوب (Dashboard Summary Cards) -->
-<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 25px;">
+<div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 25px;">
     <div style="background: white; border-right: 4px solid #4e73df; padding: 20px; border-radius: 8px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
         <div style="font-size: 13px; font-weight: bold; color: #4e73df; text-transform: uppercase; margin-bottom: 5px;">إجمالي العمولات المستحقة (المسلمة)</div>
         <div style="font-size: 22px; font-weight: bold; color: #2e384d; font-family: monospace;"><?php echo number_format($total_earned_commissions, 2); ?> ل.س</div>
@@ -354,9 +462,51 @@ $statement_closing_balance = $statement_running_balance;
         <div style="font-size: 13px; font-weight: bold; color: #1cc88a; text-transform: uppercase; margin-bottom: 5px;">إجمالي الدفعات المسددة للمندوب</div>
         <div style="font-size: 22px; font-weight: bold; color: #2e384d; font-family: monospace;"><?php echo number_format($total_payments_made, 2); ?> ل.س</div>
     </div>
+    <div style="background: white; border-right: 4px solid #e74a3b; padding: 20px; border-radius: 8px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
+        <div style="font-size: 13px; font-weight: bold; color: #e74a3b; text-transform: uppercase; margin-bottom: 5px;">إجمالي الخصومات والجزاءات</div>
+        <div style="font-size: 22px; font-weight: bold; color: #2e384d; font-family: monospace;"><?php echo number_format($total_deductions, 2); ?> ل.س</div>
+    </div>
     <div style="background: white; border-right: 4px solid #f6c23e; padding: 20px; border-radius: 8px; box-shadow: 0 0.15rem 1.75rem 0 rgba(58, 59, 69, 0.08);">
         <div style="font-size: 13px; font-weight: bold; color: #f6c23e; text-transform: uppercase; margin-bottom: 5px;">صافي الرصيد / الذمة المالية</div>
         <div style="font-size: 22px; font-weight: bold; color: #2e384d; font-family: monospace;"><?php echo number_format($net_balance, 2); ?> ل.س</div>
+    </div>
+</div>
+
+<form method="GET" style="display: flex; gap: 10px; align-items: center; margin-bottom: 20px; background: white; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0; flex-wrap: wrap;">
+    <input type="hidden" name="id" value="<?php echo intval($rep_id); ?>">
+    <label style="font-size: 13px; font-weight: bold; color: #555;">إحصائيات خلال الفترة من:</label>
+    <input type="date" name="period_from" value="<?php echo htmlspecialchars($period_from); ?>" style="padding: 8px; border: 1px solid #ccc; border-radius: 5px;">
+    <label style="font-size: 13px; font-weight: bold; color: #555;">إلى:</label>
+    <input type="date" name="period_to" value="<?php echo htmlspecialchars($period_to); ?>" style="padding: 8px; border: 1px solid #ccc; border-radius: 5px;">
+    <button type="submit" style="background: #1cc88a; color: white; border: none; padding: 9px 20px; border-radius: 5px; font-weight: bold; cursor: pointer;">
+        <i class="fas fa-filter"></i> تطبيق
+    </button>
+    <span style="font-size: 11.5px; color: #999;">لا تؤثر على بطاقات الملخّص أعلاه — فقط على بطاقات "خلال الفترة" أدناه.</span>
+</form>
+
+<div style="margin-bottom: 25px;">
+    <h3 style="font-size: 15px; color: #3a3b45; margin-bottom: 10px;"><i class="fas fa-chart-pie"></i> خلال الفترة (<?php echo htmlspecialchars($period_from); ?> إلى <?php echo htmlspecialchars($period_to); ?>)</h3>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px;">
+        <div style="background: white; border-right: 4px solid #4e73df; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0;">
+            <div style="color: #666; font-size: 12.5px; font-weight: bold;">عدد القطع المباعة (صافٍ)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #4e73df; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($rep_period_stats['net_qty'], 2), '0'), '.'); ?></div>
+            <div style="font-size: 11px; color: #999; margin-top: 3px;">بقيمة <?php echo number_format($rep_period_stats['net_value_syp'], 2); ?> ل.س</div>
+        </div>
+        <div style="background: white; border-right: 4px solid #6f42c1; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0;">
+            <div style="color: #666; font-size: 12.5px; font-weight: bold;">نسبته من إجمالي مبيعاتك</div>
+            <div style="font-size: 20px; font-weight: bold; color: #6f42c1; font-family: monospace; margin-top: 5px;"><?php echo number_format($rep_period_stats['rep_share_pct'], 2); ?>٪</div>
+            <div style="font-size: 11px; color: #999; margin-top: 3px;">من إجمالي <?php echo number_format($rep_period_stats['system_total_value_syp'], 2); ?> ل.س (كل المندوبين)</div>
+        </div>
+        <div style="background: <?php echo floatval($rep_period_stats['returned_qty']) > 0 ? '#fdecea' : 'white'; ?>; border-right: 4px solid #e74a3b; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0;">
+            <div style="color: #a33636; font-size: 12.5px; font-weight: bold;">القطع المُرجَعة من مبيعاته</div>
+            <div style="font-size: 20px; font-weight: bold; color: #e74a3b; font-family: monospace; margin-top: 5px;"><?php echo rtrim(rtrim(number_format($rep_period_stats['returned_qty'], 2), '0'), '.'); ?></div>
+            <div style="font-size: 11px; color: #888; margin-top: 3px;">بقيمة <?php echo number_format($rep_period_stats['returned_value_syp'], 2); ?> ل.س</div>
+        </div>
+        <div style="background: <?php echo $rep_period_stats['return_pct'] > 20 ? '#fdecea' : 'white'; ?>; border-right: 4px solid #f6c23e; padding: 15px; border-radius: 8px; border: 1px solid #e3e6f0;">
+            <div style="color: #96751c; font-size: 12.5px; font-weight: bold;">نسبة المرتجع</div>
+            <div style="font-size: 20px; font-weight: bold; color: #f6c23e; font-family: monospace; margin-top: 5px;"><?php echo number_format($rep_period_stats['return_pct'], 2); ?>٪</div>
+            <div style="font-size: 11px; color: #888; margin-top: 3px;">من إجمالي ما باعه خلال الفترة</div>
+        </div>
     </div>
 </div>
 
@@ -373,6 +523,16 @@ $statement_closing_balance = $statement_running_balance;
             <input type="date" name="filter_start" value="<?php echo htmlspecialchars($filter_start); ?>" style="padding:7px; border:1px solid #ccc; border-radius:4px;"></div>
         <div><label style="display:block; font-size:12px; font-weight:bold; margin-bottom:4px;">إلى تاريخ:</label>
             <input type="date" name="filter_end" value="<?php echo htmlspecialchars($filter_end); ?>" style="padding:7px; border:1px solid #ccc; border-radius:4px;"></div>
+        <div><label style="display:block; font-size:12px; font-weight:bold; margin-bottom:4px;">أو اختر شهراً كاملاً:</label>
+            <input type="month" onchange="
+                if (!this.value) return;
+                var parts = this.value.split('-');
+                var y = parseInt(parts[0], 10), m = parseInt(parts[1], 10);
+                var lastDay = new Date(y, m, 0).getDate();
+                document.querySelector('input[name=filter_start]').value = this.value + '-01';
+                document.querySelector('input[name=filter_end]').value = this.value + '-' + String(lastDay).padStart(2, '0');
+                this.form.submit();
+            " style="padding:7px; border:1px solid #ccc; border-radius:4px;"></div>
         <div><label style="display:block; font-size:12px; font-weight:bold; margin-bottom:4px;">حالة التسليم:</label>
             <select name="filter_delivery" style="padding:7px; border:1px solid #ccc; border-radius:4px;">
                 <option value="">-- الكل --</option>
@@ -515,6 +675,7 @@ $statement_closing_balance = $statement_running_balance;
                 <tr style="background: #fdfdfd; color: #555; border-bottom: 2px solid #e3e6f0;">
                     <th style="padding: 12px 15px;">التاريخ</th>
                     <th style="padding: 12px 15px;">البيان</th>
+                    <th style="padding: 12px 15px;">العميل</th>
                     <th style="padding: 12px 15px;">مستحق (+)</th>
                     <th style="padding: 12px 15px;">مسدد/مرتجع (-)</th>
                     <th style="padding: 12px 15px;">الرصيد التراكمي</th>
@@ -526,18 +687,19 @@ $statement_closing_balance = $statement_running_balance;
                         <tr style="border-bottom: 1px solid #f1f1f1;">
                             <td style="padding: 10px 15px; font-family: monospace; color: #666;"><?php echo htmlspecialchars($row['date']); ?></td>
                             <td style="padding: 10px 15px; color: #333;"><?php echo htmlspecialchars($row['label']); ?></td>
+                            <td style="padding: 10px 15px; color: #4e73df; font-weight: 600;"><?php echo !empty($row['customer_name']) ? htmlspecialchars($row['customer_name']) : '—'; ?></td>
                             <td style="padding: 10px 15px; font-family: monospace; color: #1cc88a;"><?php echo $row['due'] > 0 ? number_format($row['due'], 2) : '-'; ?></td>
                             <td style="padding: 10px 15px; font-family: monospace; color: #e74a3b;"><?php echo $row['settled'] > 0 ? number_format($row['settled'], 2) : '-'; ?></td>
                             <td style="padding: 10px 15px; font-family: monospace; font-weight: bold; color: #2e59d9;"><?php echo number_format($row['balance'], 2); ?></td>
                         </tr>
                     <?php endforeach; ?>
                 <?php else: ?>
-                    <tr><td colspan="5" style="padding: 25px; text-align: center; color: #777;">لا توجد حركات ضمن الفترة المحددة.</td></tr>
+                    <tr><td colspan="6" style="padding: 25px; text-align: center; color: #777;">لا توجد حركات ضمن الفترة المحددة.</td></tr>
                 <?php endif; ?>
             </tbody>
             <tfoot>
                 <tr style="background: #f8f9fc; border-top: 2px solid #e3e6f0;">
-                    <td colspan="4" style="padding: 12px 15px; font-weight: bold; color: #333; text-align: left;">الرصيد الختامي:</td>
+                    <td colspan="5" style="padding: 12px 15px; font-weight: bold; color: #333; text-align: left;">الرصيد الختامي:</td>
                     <td style="padding: 12px 15px; font-weight: bold; font-family: monospace; color: #2e59d9;"><?php echo number_format($statement_closing_balance, 2); ?> ل.س</td>
                 </tr>
             </tfoot>
@@ -561,7 +723,7 @@ $statement_closing_balance = $statement_running_balance;
             <h3 style="margin: 0; color: #4e73df;"><i class="fas fa-money-bill-wave"></i> تسجيل دفعة نقدية للمندوب</h3>
             <button onclick="closePaymentModal()" style="background: none; border: none; font-size: 22px; cursor: pointer; color: #888;">&times;</button>
         </div>
-        <form method="POST" action="">
+        <form method="POST" action="" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
 <?php csrfField(); ?>
             <input type="hidden" name="add_payment" value="1">
             <div style="margin-bottom: 12px;">
@@ -583,6 +745,43 @@ $statement_closing_balance = $statement_running_balance;
         </form>
     </div>
 </div>
+
+<div id="deductionModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 1050; justify-content: center; align-items: center;">
+    <div style="background: white; width: 450px; max-width: 95%; border-radius: 8px; padding: 25px; box-shadow: 0 5px 25px rgba(0,0,0,0.2);">
+        <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #e3e6f0; padding-bottom: 10px; margin-bottom: 15px;">
+            <h3 style="margin: 0; color: #e74a3b;"><i class="fas fa-minus-circle"></i> تسجيل خصم/جزاء من عمولة المندوب</h3>
+            <button onclick="closeDeductionModal()" style="background: none; border: none; font-size: 22px; cursor: pointer; color: #888;">&times;</button>
+        </div>
+        <form method="POST" action="" onsubmit="var b=this.querySelector('button[type=submit]'); if(b){ if(b.disabled) return false; b.disabled=true; b.innerText='جاري الحفظ...'; } return true;">
+<?php csrfField(); ?>
+            <input type="hidden" name="add_deduction" value="1">
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: bold; font-size: 13px;">مبلغ الخصم (ل.س): <span style="color: red;">*</span></label>
+                <input type="number" step="0.01" min="0.01" name="deduction_amount_syp" required placeholder="0.00..." style="width: 100%; padding: 8px; border: 1px solid #d1d3e2; border-radius: 4px; font-family: monospace;">
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: bold; font-size: 13px;">تاريخ الخصم:</label>
+                <input type="date" name="deduction_date" value="<?php echo date('Y-m-d'); ?>" style="width: 100%; padding: 8px; border: 1px solid #d1d3e2; border-radius: 4px;">
+            </div>
+            <div style="margin-bottom: 15px;">
+                <label style="display: block; margin-bottom: 4px; font-weight: bold; font-size: 13px;">سبب الخصم: <span style="color: red;">*</span></label>
+                <textarea name="deduction_reason" required placeholder="مثال: تأخير في التسليم، خطأ في فاتورة، مخالفة سياسة التوصيل..." style="width: 100%; padding: 8px; border: 1px solid #d1d3e2; border-radius: 4px; height: 65px;"></textarea>
+            </div>
+            <div style="background: #fff8e6; border: 1px solid #f6c23e; border-radius: 4px; padding: 8px 10px; margin-bottom: 15px; font-size: 11.5px; color: #96751c;">
+                <i class="fas fa-info-circle"></i> يُخصَم المبلغ فوراً من رصيد عمولات المندوب المستحقة — لا يُعدِّل أي فاتورة، فقط يُنقِص ما سيُدفَع له لاحقاً.
+            </div>
+            <div style="text-align: left; border-top: 1px solid #e3e6f0; padding-top: 15px;">
+                <button type="button" onclick="closeDeductionModal()" style="background: #e2e8f0; color: #333; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; margin-left: 8px; font-weight: bold;">إلغاء</button>
+                <button type="submit" style="background: #e74a3b; color: white; border: none; padding: 8px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;">حفظ وتسجيل الخصم</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+    function openDeductionModal() { document.getElementById('deductionModal').style.display = 'flex'; }
+    function closeDeductionModal() { document.getElementById('deductionModal').style.display = 'none'; }
+</script>
 
 <script>
     function openPaymentModal() { document.getElementById('paymentModal').style.display = 'flex'; }

@@ -110,7 +110,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
                     $amount_usd = abs($cost_delta) * $qty_on_hand;
                     $amount_syp = $amount_usd * $exchange_rate;
                     $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
-                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Expense');
+                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Asset');
                     if ($inv_acc && $adj_acc) {
                         $cc_entry_num = "JE-OFFICE-COSTFIX-" . $oi_product_id . "-" . time();
                         $cc_desc = "تصحيح تكلفة جرد مكتبي: " . $p['product_name'] . " (SKU: " . $p['sku'] . ") — من \$" . number_format($old_cost, 4) . " إلى \$" . number_format($oi_new_cost, 4) . " على كمية $qty_on_hand" . (!empty($oi_notes) ? " — $oi_notes" : "");
@@ -126,7 +126,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
                     }
                 }
 
-                $conn->commit();
+                if ($conn->inTransaction()) { $conn->commit(); }
                 logAudit($conn, 'UPDATE', 'الجرد المكتبي', "تصحيح تكلفة: " . $p['product_name'] . " من \$" . number_format($old_cost, 4) . " إلى \$" . number_format($oi_new_cost, 4), $oi_product_id);
                 $msg = "تم تصحيح التكلفة" . ($qty_on_hand > 0 ? " وترحيل قيد تسوية القيمة" : "") . " بنجاح، بلا أي تغيير في الكمية.";
             } catch (Exception $e) {
@@ -219,6 +219,9 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
             // القيد المحاسبي: مدين المخزون (يدخل أصل جديد) / دائن "أرصدة افتتاحية" (نفس الحساب المعتمد
             // أصلاً في النظام لتوثيق بضاعة موجودة فعلياً قبل تسجيلها كفاتورة شراء حقيقية) — لكن هنا
             // مرتبط بمنتج محدَّد عبر entry_number، وليس مبلغاً إجمالياً معزولاً كما كان سابقاً.
+            // نظام دفعات المخزون (FIFO): دفعة مستقلة بلا مورّد (الجرد المكتبي بطبيعته بلا مورّد مسجَّل) —
+            // بجانب (لا بدل) تحديث التكلفة الممزوجة القديمة أعلاه، لتوافق كامل مع كل تقرير قائم.
+            createInventoryBatch($conn, $oi_product_id, 'OfficeInventory', $oi_notes ?: 'جرد مكتبي', null, $oi_cost_usd, $oi_qty, $oi_date);
             $exchange_rate = getExchangeRateForDate($conn, 'USD', $oi_date);
             $amount_syp = $oi_qty * $oi_cost_usd * $exchange_rate;
             $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
@@ -230,11 +233,11 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['add_office_inventory']
                 insertJournalLine($conn, $equity_acc, 0, $amount_syp, $oi_entry_num, $oi_date, $oi_desc, 'Office Inventory', 'USD', $exchange_rate, 0, $oi_qty * $oi_cost_usd);
             }
 
-            $conn->commit();
+            if ($conn->inTransaction()) { $conn->commit(); }
             logAudit($conn, 'INSERT', 'الجرد المكتبي', "إضافة جرد مكتبي: $oi_product_name (SKU: $oi_sku) — كمية $oi_qty بتكلفة \$$oi_cost_usd للوحدة", $oi_product_id);
             $msg = "تم تسجيل الجرد المكتبي وتحديث المخزون وترحيل القيد المحاسبي بنجاح!";
         } catch (Exception $e) {
-            $conn->rollBack();
+            if ($conn->inTransaction()) { $conn->rollBack(); }
             $error = "خطأ أثناء تسجيل الجرد المكتبي: " . $e->getMessage();
         }
     }
@@ -356,7 +359,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['edit_product'])) {
                     $adj_amount_usd = abs($qty_delta) * $product_cost_usd;
                     $adj_amount_syp = $adj_amount_usd * $adj_rate;
                     $inv_acc = findOrCreateAccount($conn, ['مخزون', 'بضاعة', 'inventory'], 'المخزون', 'Asset');
-                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Expense');
+                    $adj_acc = findOrCreateAccount($conn, ['تسوية المخزون', 'فروقات جرد'], 'تسوية المخزون (جرد)', 'Asset');
                     if ($inv_acc && $adj_acc) {
                         $adj_entry_num = "JE-STOCKADJ-" . $product_id . "-" . time();
                         $adj_desc = "تسوية جرد يدوي للمنتج: $product_name (SKU: $sku) — من " . number_format($old_qty, 2) . " إلى " . number_format($current_quantity, 2);
